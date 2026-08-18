@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+*.env
+.venv/
+venv/
+*.ckpt
+*.pt
+*.pth
+*.log
+data/
+checkpoints/
+.vscode/

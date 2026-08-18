@@ -1,0 +1,6 @@
+{
+  "events": [
+    {"after_iteration": 2, "failed_rank": 1},
+    {"after_iteration": 4, "failed_rank": 5}
+  ]
+}

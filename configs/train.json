@@ -1,0 +1,12 @@
+{
+  "model_dim": 128,
+  "num_layers": 4,
+  "num_heads": 8,
+  "batch_size": 8,
+  "micro_batch_size": 2,
+  "seed": 1234,
+  "tp": 2,
+  "pp": 2,
+  "dp": 2,
+  "iterations": 6
+}
