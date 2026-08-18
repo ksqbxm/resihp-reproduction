@@ -45,13 +45,17 @@ def test_capacity_proportional_assignment_uses_replica_id_tie_order():
         (0, 0, 0),
         (0, 1, 0),
         (1, 0, 1),
-        (1, 1, 0),
+        (1, 1, 1),
         (2, 0, 1),
         (2, 1, 1),
         (3, 0, 1),
         (3, 1, 1),
     ]
-    assert result.micro_batches_per_replica == {0: 3, 1: 5}
+    assert result.micro_batches_per_replica == {0: 1, 1: 3}
+
+    # A micro-batch must flow through a single replica across every stage.
+    for placements in result.by_micro_batch.values():
+        assert len({p.replica_id for p in placements}) == 1
 
 
 def test_failed_stage_is_rerouted_to_healthy_peer():
@@ -73,10 +77,10 @@ def test_every_micro_batch_has_exactly_one_executor_per_stage():
 
 
 def test_same_inputs_are_idempotent_and_failure_signature_is_normalized():
-    result = assign(2, {3, 0}, topology())
+    result = assign(2, {2, 0}, topology())
 
-    assert result == assign(2, [0, 3], topology())
-    assert result.failure_signature == (0, 3)
+    assert result == assign(2, [0, 2], topology())
+    assert result.failure_signature == (0, 2)
 
 
 def test_memory_budget_rejects_all_targets_with_structured_reason():
@@ -84,7 +88,6 @@ def test_memory_budget_rejects_all_targets_with_structured_reason():
         assign(0, (), topology(budget=1))
 
     assert error.value.reason.code == "no_feasible_dp_target"
-    assert error.value.reason.stage_id == 0
 
 
 def test_memory_budget_boundary_is_accepted():
@@ -127,6 +130,31 @@ def test_stage_failure_is_based_on_any_failed_tp_member():
     result = assign(0, {4}, multi_tp)
 
     assert {p.replica_id for p in result.placements} == {1}
+
+
+def test_replicas_with_different_active_stage_sets_are_both_scheduled():
+    # After a PP repartition, replica 0 runs a single stage that owns every layer
+    # while replica 1 keeps two stages. Both must receive micro-batches, and each
+    # micro-batch runs only its own replica's active stages.
+    heterogeneous = DPTopology(
+        config=CONFIG,
+        stages=(
+            DPStage(0, 0, (0,), 4, 1),
+            DPStage(1, 0, (4, 5), 2, 2),
+            DPStage(1, 1, (6, 7), 2, 2),
+        ),
+        micro_batches=4,
+    )
+
+    result = assign(0, (), heterogeneous)
+
+    stages_by_replica = {}
+    for placement in result.placements:
+        stages_by_replica.setdefault(placement.replica_id, set()).add(placement.stage_id)
+    assert stages_by_replica == {0: {0}, 1: {0, 1}}
+    assert result.micro_batches_per_replica == {0: 2, 1: 2}
+    for placements in result.by_micro_batch.values():
+        assert len({p.replica_id for p in placements}) == 1
 
 
 def test_step_is_recorded_but_does_not_change_assignment():

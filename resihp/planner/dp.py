@@ -60,21 +60,20 @@ class DPAssignment:
 
     @property
     def micro_batches_per_replica(self) -> dict[int, int]:
-        counts: dict[int, int] = {}
+        per_replica: dict[int, set[int]] = {}
         for placement in self.placements:
-            counts[placement.replica_id] = counts.get(placement.replica_id, 0) + 1
-        return counts
+            per_replica.setdefault(placement.replica_id, set()).add(placement.micro_batch)
+        return {replica: len(micro_batches) for replica, micro_batches in per_replica.items()}
 
 
 @dataclass(frozen=True)
 class DPInfeasibleReason:
     code: str
     message: str
-    stage_id: int | None = None
 
 
 class InfeasibleDP(ValueError):
-    """Raised when no healthy executor can accept a logical stage workload."""
+    """Raised when no healthy DP replica can accept the micro-batch workload."""
 
     def __init__(self, reason: DPInfeasibleReason):
         super().__init__(reason.message)
@@ -127,18 +126,6 @@ def _validate_topology(topology: DPTopology) -> None:
         seen.add((stage.replica_id, stage.stage_id))
         if stage.capacity is not None:
             _integer("capacity", stage.capacity, positive=True)
-        if topology.memory_budget is not None and not memory_feasible(
-            topology.config,
-            tp_degree=stage.tp_degree,
-            stage_layers=stage.stage_layers,
-            micro_batches=topology.micro_batches,
-            sequence_length=topology.sequence_length,
-            vocab_size=topology.vocab_size,
-            memory_budget=topology.memory_budget,
-            in_flight_micro_batches=topology.in_flight_micro_batches,
-        ):
-            # Keep this as a stage-level candidate failure; another replica may fit.
-            continue
 
 
 def _stage_capacity(topology: DPTopology, stage: DPStage) -> int:
@@ -156,15 +143,15 @@ def _stage_capacity(topology: DPTopology, stage: DPStage) -> int:
     return stage.capacity if stage.capacity is not None else topology.micro_batches
 
 
-def _allocate(total: int, candidates: tuple[DPStage, ...], capacities: tuple[int, ...]) -> tuple[int, ...]:
+def _allocate(total: int, capacities: tuple[int, ...]) -> tuple[int, ...]:
     """Allocate by capacity proportion, using candidate order for all ties."""
     capacity_sum = sum(capacities)
     if capacity_sum <= 0:
-        return tuple(0 for _ in candidates)
+        return tuple(0 for _ in capacities)
     base = tuple(total * capacity // capacity_sum for capacity in capacities)
     remaining = total - sum(base)
     order = sorted(
-        range(len(candidates)),
+        range(len(capacities)),
         key=lambda index: (-(total * capacities[index] % capacity_sum), index),
     )
     result = list(base)
@@ -180,53 +167,57 @@ def assign(
 ) -> DPAssignment:
     """Assign every micro-batch exactly once to each logical PP stage.
 
-    The failure signature is cumulative. A stage with any failed TP member is
-    unavailable, and surviving peer stages are considered in replica-ID order.
-    No runtime timing or progress information participates in the result.
+    The failure signature is cumulative. Each DP replica runs its own set of
+    active PP stages (replicas may differ after a PP repartition has moved a dead
+    stage's layers elsewhere); a replica is a valid target only when none of its
+    stages have a failed TP member and every stage fits the memory budget.
+    Surviving replicas are considered in replica-ID order. Each micro-batch flows
+    through a single replica across that replica's stages, so its executor is
+    consistent along the whole pipeline. No runtime timing or progress information
+    participates in the result.
     """
     step = _integer("step", step)
     _validate_topology(active_topology)
     failures = _normalize_failure_signature(failure_signature)
     failed = set(failures)
-    stage_ids = tuple(sorted({stage.stage_id for stage in active_topology.stages}))
-    if stage_ids != tuple(range(len(stage_ids))):
-        raise ValueError("stage IDs must be contiguous starting at zero")
+
+    replicas: dict[int, dict[int, DPStage]] = {}
+    for stage in active_topology.stages:
+        replicas.setdefault(stage.replica_id, {})[stage.stage_id] = stage
+
+    candidates: list[tuple[tuple[DPStage, ...], int]] = []
+    for replica_id in sorted(replicas):
+        pipeline = tuple(stage for _, stage in sorted(replicas[replica_id].items()))
+        if any(failed.intersection(stage.ranks) for stage in pipeline):
+            continue
+        capacity = min(_stage_capacity(active_topology, stage) for stage in pipeline)
+        if capacity > 0:
+            candidates.append((pipeline, capacity))
+
+    if not candidates:
+        reason = DPInfeasibleReason(
+            code="no_feasible_dp_target",
+            message="no healthy DP replica can accept the micro-batches",
+        )
+        raise InfeasibleDP(reason)
+
+    capacities = tuple(capacity for _, capacity in candidates)
+    allocation = _allocate(active_topology.micro_batches, capacities)
 
     placements: list[DPPlacement] = []
-    for stage_id in stage_ids:
-        candidates = tuple(
-            sorted(
-                (
-                    stage
-                    for stage in active_topology.stages
-                    if stage.stage_id == stage_id
-                    and not failed.intersection(stage.ranks)
-                    and _stage_capacity(active_topology, stage) > 0
-                ),
-                key=lambda stage: (stage.replica_id, stage.ranks),
-            )
-        )
-        capacities = tuple(_stage_capacity(active_topology, stage) for stage in candidates)
-        if not candidates:
-            reason = DPInfeasibleReason(
-                code="no_feasible_dp_target",
-                message=f"no healthy executor can accept stage {stage_id} micro-batches",
-                stage_id=stage_id,
-            )
-            raise InfeasibleDP(reason)
-        allocation = _allocate(active_topology.micro_batches, candidates, capacities)
-        micro_batch = 0
-        for candidate, count in zip(candidates, allocation):
-            for _ in range(count):
+    micro_batch = 0
+    for (pipeline, _), count in zip(candidates, allocation):
+        for _ in range(count):
+            for stage in pipeline:
                 placements.append(
                     DPPlacement(
                         micro_batch=micro_batch,
-                        stage_id=stage_id,
-                        replica_id=candidate.replica_id,
-                        executor_ranks=candidate.ranks,
+                        stage_id=stage.stage_id,
+                        replica_id=stage.replica_id,
+                        executor_ranks=stage.ranks,
                     )
                 )
-                micro_batch += 1
+            micro_batch += 1
 
     placements.sort(key=lambda placement: (placement.micro_batch, placement.stage_id))
     return DPAssignment(
