@@ -125,6 +125,9 @@ def _feasible_degrees(
     for degree in _powers_of_two_between(len(ranks), min_degree):
         if config.model_dim % degree or config.num_heads % degree:
             continue
+        # Every resident term the budget checks -- including the embedding/LM-head
+        # boundary_parameters -- is sharded by ``degree``, so the whole footprint
+        # scales with k. None of it is a fixed per-rank overhead in this k_min search.
         if memory_inputs is not None and not memory_feasible(
             config,
             tp_degree=degree,

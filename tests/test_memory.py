@@ -34,7 +34,7 @@ def test_known_memory_breakdown_matches_independent_hand_calculation():
 
     # Independent constants: layer shard 1600 B; fixed embedding/head shards 320 B.
     assert result.sharded_parameters == 1600
-    assert result.replicated_parameters == 320
+    assert result.boundary_parameters == 320
     assert result.gradients == 1920
     assert result.adam_exp_avg == 1920
     assert result.adam_exp_avg_sq == 1920
@@ -56,7 +56,7 @@ def test_second_known_configuration_matches_independent_hand_calculation():
     )
 
     assert result.sharded_parameters == 1664
-    assert result.replicated_parameters == 192
+    assert result.boundary_parameters == 192
     assert result.gradients == 1856
     assert result.adam_exp_avg == 1856
     assert result.adam_exp_avg_sq == 1856
