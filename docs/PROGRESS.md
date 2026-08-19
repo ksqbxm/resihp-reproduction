@@ -227,10 +227,13 @@
 - `python -m py_compile resihp/parallel/tp.py resihp/reference.py resihp/control.py tests/test_parallel_tp.py`：通过。
 - 全量 `python -m pytest -q`：75 passed, 4 skipped——`tests/test_parallel_tp.py` 顶部 `pytest.importorskip("torch")` 在无 torch 时整体跳过；`resihp/control.py` 仍为 import 期 torch-free（`save_checkpoint`/`logical_state_digest` 均方法内惰性导入），既有 75 项无回归。
 
-待目标机（带 torch）执行的门禁：`python3 -m pytest -q tests/test_parallel_tp.py`（TP1/TP2 各以 `mp.spawn` 起 1/2 进程 Gloo），覆盖：gather 后完整 logits 与 loss 与参考 `allclose`；各 rank 本地 shard 的**梯度**与一步 AdamW 后的**参数**与参考对应切片 `allclose`（degree=1 精确一致，degree=2 容差内）；不整除 degree 被拒；`ControlPlane` 附真实状态后 ② 落盘且可重载、⑧ 摘要为真实逻辑摘要（未附状态时为空串）。通过后本节状态改为「实现完成，待审核」。
+待目标机（带 torch）执行的门禁：`python3 -m pytest -q tests/test_parallel_tp.py`，两条数值门禁跑同一 `_compare` 比对逻辑：
+- CPU/**Gloo**（`test_tp_matches_reference_within_tolerance`，TP1/TP2 各 `mp.spawn` 起 1/2 进程）：始终可跑。
+- GPU/**NCCL**（`test_tp_cuda_nccl_matches_reference`，TP1/TP2）：`torch.cuda.set_device(rank)` + `cuda:rank` + `nccl`，模型/输入/参考/shard 全上 CUDA，显式断言 `get_backend()=="nccl"`、`current_device()==rank`、`tp_logits.is_cuda`；CUDA 缺失或 GPU 少于 degree 才 `skip`，2-GPU 服务器上实跑。
+两者覆盖：gather 后完整 logits 与 loss 与参考 `allclose`；各 rank 本地 shard 的**梯度**与一步 AdamW 后的**参数**与参考对应切片 `allclose`（degree=1 精确一致，degree=2 容差内）；均记录 `max_forward/loss/grad/param_diff`。另有不整除 degree 被拒、`ControlPlane` 附真实状态后 ② 落盘且可重载、⑧ 摘要为真实逻辑摘要（未附状态时为空串）。通过后本节状态改为「实现完成，待审核」。
 
 遗留问题：
-- 数值验收为 `allclose`（容差内），非逐比特；两两组合/端到端（T15/T16）沿用同一口径与参考对照。
-- 分布式后端：门禁用 Gloo（CPU）；GPU/NCCL 验收属 T18。
+- 数值验收为 `allclose`（`rtol=1e-4, atol=1e-5`），非逐比特；两两组合/端到端（T15/T16）沿用同一口径与参考对照。
+- 分布式后端：CPU 用 Gloo、GPU 用 NCCL 均已成门禁；8 进程完整 3D/NCCL 大规模验收仍属 T16/T18。
 - TP 仅静态执行，无 degree/成员重切；gather+reshard 属 T11。
 - `ControlPlane._commit_checkpoint` 目前只能存**完整逻辑** run；分片 TP run 的 checkpoint 需 T11 的 optimizer 矩状态 gather。⑦ `_recover_state` 仍空。
