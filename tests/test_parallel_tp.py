@@ -38,6 +38,14 @@ CONFIG = TrainConfig(
 )
 VOCAB = 32
 SEQLEN = 8
+# Genuine TP all-reduce reorders FP32 accumulation, so results match the
+# single-process reference within floating-point tolerance, not bit-for-bit. The
+# default ``allclose`` atol (1e-8) is far tighter than one 2-way FP32 reduction
+# (~1e-6 absolute, and larger through several layers), so use a tolerance that
+# reflects the real reassociation error. A genuine bug is orders of magnitude
+# larger than this and still fails.
+RTOL = 1e-4
+ATOL = 1e-5
 requires_torch = pytest.mark.skipif(
     importlib.util.find_spec("torch") is None, reason="torch not installed"
 )
@@ -106,23 +114,28 @@ def _worker(rank, world_size, result_dir, port):
     def expected(full, cat_dim):
         return full if cat_dim is None else full.chunk(world_size, dim=cat_dim)[rank]
 
+    def close(a, b):
+        return torch.allclose(a, b, rtol=RTOL, atol=ATOL)
+
     grad_close = step_close = True
     max_grad_diff = max_param_diff = 0.0
     for name, (param, cat_dim) in tp.local_shards().items():
         want_grad = expected(ref_grads[name], cat_dim)
         want_param = expected(ref_updated[name], cat_dim)
-        grad_close &= torch.allclose(tp_grads[name], want_grad)
-        step_close &= torch.allclose(param.detach(), want_param)
+        grad_close &= close(tp_grads[name], want_grad)
+        step_close &= close(param.detach(), want_param)
         max_grad_diff = max(max_grad_diff, (tp_grads[name] - want_grad).abs().max().item())
         max_param_diff = max(max_param_diff, (param.detach() - want_param).abs().max().item())
 
     Path(result_dir, f"result_{rank}.json").write_text(
         json.dumps(
             {
-                "forward_close": torch.allclose(tp_logits, ref_logits),
-                "loss_close": torch.allclose(tp_loss, ref_loss),
+                "forward_close": close(tp_logits, ref_logits),
+                "loss_close": close(tp_loss, ref_loss),
                 "grad_close": bool(grad_close),
                 "step_close": bool(step_close),
+                "max_forward_diff": (tp_logits - ref_logits).abs().max().item(),
+                "max_loss_diff": (tp_loss - ref_loss).abs().item(),
                 "max_grad_diff": max_grad_diff,
                 "max_param_diff": max_param_diff,
             }
@@ -140,11 +153,14 @@ def test_tp_matches_reference_within_tolerance(tmp_path, degree):
     results = [json.loads(Path(tmp_path, f"result_{rank}.json").read_text()) for rank in range(degree)]
 
     assert len(results) == degree
+    for rank, result in enumerate(results):
+        # Surfaced so a failure shows the actual magnitude (reassociation vs bug).
+        print(f"TP{degree} rank {rank} diffs: {result}")
     for result in results:
-        assert result["forward_close"]
-        assert result["loss_close"]
-        assert result["grad_close"]
-        assert result["step_close"]
+        assert result["forward_close"], result
+        assert result["loss_close"], result
+        assert result["grad_close"], result
+        assert result["step_close"], result
 
 
 @requires_torch

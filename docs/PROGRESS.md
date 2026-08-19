@@ -207,6 +207,7 @@
 ### 验收口径调整（应要求：`torch.equal` → `torch.allclose`）
 - **原则 A 的比特级 `torch.equal` 与真正的分片 all-reduce 不可兼得**：真正的分片计算引入两处「重排 FP32 求和」的归约——① 前向 row-parallel all-reduce（`out_proj`/`fc2`，`partial₀+partial₁`）；② 反向 column-parallel 输入梯度 all-reduce（Q/K/V/`fc1`）。浮点加法不满足结合律，分片部分和 ≠ 参考单块 matmul。
 - 按要求**放宽为 `torch.allclose`**（允许微小 FP 误差），从而实现**多卡真正的分片 all-reduce**。TP degree=1 时所有 collective 退化为 no-op，仍与参考逐比特一致；degree=2 在容差内一致。
+- **容差取 `rtol=1e-4, atol=1e-5`**（非默认 `atol=1e-8`）：q/k/v 与逐 head attention 是 column-parallel、无归约、与参考逐比特一致，误差**仅**来自 `out_proj`/`fc2` 的 2 路 all-reduce（单次 ~1e-6，几层累积后更大）；默认 `atol=1e-8` 对近零 logits 过严会误报。此容差反映真实 reassociation 误差，真实 bug 量级远大于此仍会失败。测试同时记录 `max_forward/loss/grad/param_diff` 以便区分「重排误差」与「真实 bug」。
 
 ### 真实 TP 执行（Megatron 两算子）
 - 每个进程即一个 TP rank，**只持有自身 shard**（真正省显存，非"存整份"）：Q/K/V/`fc1` 按输出(head)维分片（column-parallel），`out_proj`/`fc2` 按输入维分片（row-parallel），token embedding / LM head 按 vocab 分片；两个 LayerNorm 与 position embedding 复制。布局与 `resihp/memory.py` 预算一致；每个 shard 是独立 leaf 参数、独立梯度、独立 AdamW 矩状态（正是 T11+ 收集/重切的对象）。
