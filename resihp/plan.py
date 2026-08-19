@@ -128,13 +128,6 @@ class ExecutionPlan:
         """All ranks that have not failed (a superset of ``active_ranks``)."""
         return tuple(rank for rank in range(self.config.world_size) if rank not in set(self.failed_ranks))
 
-    @property
-    def by_micro_batch(self) -> dict[int, tuple[DPPlacement, ...]]:
-        result: dict[int, list[DPPlacement]] = {}
-        for placement in self.placements:
-            result.setdefault(placement.micro_batch, []).append(placement)
-        return {key: tuple(value) for key, value in result.items()}
-
 
 def _owner_ranges(stage_layers: tuple[int, ...]) -> tuple[tuple[int, int] | None, ...]:
     ranges = []
@@ -189,8 +182,8 @@ def _old_layout(config: TrainConfig, previous: "ExecutionPlan | None") -> dict[i
     }
 
 
-def _owner_of(stage_layout: dict[int, tuple[tuple[int, ...], tuple[int, int]]], layer: int):
-    """Return ``(members, layer_range)`` of the stage owning ``layer``."""
+def _owner_of(stage_layout: dict[int, tuple[tuple[int, ...], tuple[int, int]]], layer: int) -> tuple[int, ...]:
+    """Return the TP members of the stage owning ``layer``."""
     for members, layer_range in stage_layout.values():
         if layer_range[0] <= layer < layer_range[1]:
             return members
@@ -198,7 +191,6 @@ def _owner_of(stage_layout: dict[int, tuple[tuple[int, ...], tuple[int, int]]], 
 
 
 def _state_route(
-    config: TrainConfig,
     old_layout: dict[int, dict[int, tuple[tuple[int, ...], tuple[int, int]]]],
     replica: int,
     layer: int,
@@ -213,7 +205,7 @@ def _state_route(
         if peer == replica:
             continue
         peer_members = _owner_of(old_layout[peer], layer)
-        if peer_members and all(rank not in failed_set for rank in peer_members):
+        if all(rank not in failed_set for rank in peer_members):
             return StateRoute(replica, layer, new_members, "peer_replica", peer_members, "gather_reshard")
     return StateRoute(replica, layer, new_members, "checkpoint", (), "checkpoint_restore")
 
@@ -317,7 +309,7 @@ def build_plan(
             new_owner = _owner_of(new_stage_layout, layer)
             if old_members != new_owner:
                 state_routes.append(
-                    _state_route(config, old_layout, replica, layer, old_members, new_owner, failed_set)
+                    _state_route(old_layout, replica, layer, old_members, new_owner, failed_set)
                 )
 
     if not dp_stages:

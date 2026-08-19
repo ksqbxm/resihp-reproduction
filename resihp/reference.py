@@ -48,7 +48,14 @@ def _digest(items) -> str:
     return hasher.hexdigest()
 
 
-def _param_digest(model: ReferenceTransformer) -> str:
+def logical_state_digest(model) -> str:
+    """sha256 over a model's full logical parameters.
+
+    The per-step parameter summary and the safe-point step-8 state digest. Works
+    for any model exposing ``logical_state_dict`` -- the single-process reference
+    and the tensor-parallel transformer alike -- so every rank that holds the same
+    logical state agrees on the digest.
+    """
     return _digest(sorted(model.logical_state_dict().items()))
 
 
@@ -72,6 +79,62 @@ def _token_stream(vocab_size, sequence_length, batch_size, count, seed):
     ]
 
 
+class ReferenceRun:
+    """A resumable single-process reference training run.
+
+    Construction fixes the model init, optimizer, and token stream from
+    ``config.seed`` exactly as before; :meth:`step` advances one iteration and
+    :attr:`cursor` is the number of completed steps (also the data cursor). The
+    run object is the unit that :mod:`resihp.checkpoint` saves and restores, so
+    that resuming from a checkpoint continues bit-for-bit with an uninterrupted
+    run (plan section 3.1).
+    """
+
+    def __init__(self, config: TrainConfig, *, vocab_size: int, sequence_length: int):
+        if sequence_length < 2:
+            raise ValueError("sequence_length must be at least 2 for next-token loss")
+
+        torch.manual_seed(config.seed)
+        self.config = config
+        self.vocab_size = vocab_size
+        self.sequence_length = sequence_length
+        self.model = ReferenceTransformer(config, vocab_size=vocab_size, sequence_length=sequence_length)
+        self.model.train()
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=LEARNING_RATE,
+            betas=ADAM_BETAS,
+            eps=ADAM_EPS,
+            weight_decay=WEIGHT_DECAY,
+        )
+        self.batches = _token_stream(
+            vocab_size, sequence_length, config.batch_size, config.iterations, config.seed
+        )
+        self.name_by_param = {param: name for name, param in self.model.named_parameters()}
+        self.cursor = 0
+
+    def step(self) -> StepRecord:
+        """Run one iteration on the next fixed batch and record the result."""
+        tokens = self.batches[self.cursor]
+        logits = self.model(tokens)
+        loss = F.cross_entropy(
+            logits[:, :-1].reshape(-1, self.vocab_size),
+            tokens[:, 1:].reshape(-1),
+        )
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        record = StepRecord(
+            step=self.cursor,
+            tokens=tuple(tuple(int(token) for token in row) for row in tokens.tolist()),
+            loss=float(loss.detach()),
+            param_digest=logical_state_digest(self.model),
+            optim_digest=_optim_digest(self.optimizer, self.name_by_param),
+        )
+        self.cursor += 1
+        return record
+
+
 def run_reference(
     config: TrainConfig,
     *,
@@ -79,39 +142,5 @@ def run_reference(
     sequence_length: int,
 ) -> list[StepRecord]:
     """Train the reference model deterministically and record every step."""
-    if sequence_length < 2:
-        raise ValueError("sequence_length must be at least 2 for next-token loss")
-
-    torch.manual_seed(config.seed)
-    model = ReferenceTransformer(config, vocab_size=vocab_size, sequence_length=sequence_length)
-    model.train()
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        betas=ADAM_BETAS,
-        eps=ADAM_EPS,
-        weight_decay=WEIGHT_DECAY,
-    )
-    batches = _token_stream(vocab_size, sequence_length, config.batch_size, config.iterations, config.seed)
-    name_by_param = {param: name for name, param in model.named_parameters()}
-
-    records: list[StepRecord] = []
-    for step, tokens in enumerate(batches):
-        logits = model(tokens)
-        loss = F.cross_entropy(
-            logits[:, :-1].reshape(-1, vocab_size),
-            tokens[:, 1:].reshape(-1),
-        )
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        records.append(
-            StepRecord(
-                step=step,
-                tokens=tuple(tuple(int(token) for token in row) for row in tokens.tolist()),
-                loss=float(loss.detach()),
-                param_digest=_param_digest(model),
-                optim_digest=_optim_digest(optimizer, name_by_param),
-            )
-        )
-    return records
+    run = ReferenceRun(config, vocab_size=vocab_size, sequence_length=sequence_length)
+    return [run.step() for _ in range(config.iterations)]

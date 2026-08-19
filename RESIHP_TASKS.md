@@ -154,6 +154,8 @@
 >
 > 测试：TP1 与 TP2 的前向、反向与一步 AdamW 更新，**与 T7 单进程参考数值精确一致**（`torch.equal`）。
 >
+> **承接 T9（本任务范围内接入）**：T9 的 safe-point 第 2 步（原子 checkpoint）与第 7 步（恢复/迁移/重切）在 `resihp/control.py` 中先留成空调用点 `ControlPlane._commit_checkpoint` / `_recover_state`——因 T9 骨架训练用 all-reduce，无真实逻辑状态可存搬。本任务引入真实 TP 训练状态后，把 T8 的 `save_checkpoint` 接进第 2 步；第 8 步 `agree_on_digest` 的 `state_digest` 由空串占位改为真实逻辑张量摘要。第 7 步真正的收集/重切随 T11–T14 落地，此处只做与真实状态对齐的最小接入。
+>
 > 门禁全绿后更新 PROGRESS.md 并停下。
 
 ### T11 — TP 重切与异构 TP 边界

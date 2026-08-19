@@ -142,3 +142,94 @@
 遗留问题：
 - 参考训练**仅锁 CPU 确定性**（`torch.manual_seed` 只设 CPU RNG，未涉及 CUDA/`use_deterministic_algorithms`）。CPU/CUDA RNG 状态保存属 T8 checkpoint，GPU 确定性与"GPU 执行 vs CPU 参考 `torch.equal`"的可复现前提延后到 T10/T18。
 - AdamW 超参（`LEARNING_RATE/WEIGHT_DECAY/ADAM_BETAS/ADAM_EPS`）目前硬编码在 `reference.py`。T8 要保存优化器状态、T10 要求数值一致，届时应收敛为单一真源（可能并入 config），避免两处不同步。
+
+## T8：原子 checkpoint 保存 / 恢复
+
+状态：实现完成，**门禁待 torch 环境执行**（本机无 torch，计划硬性禁止安装/升级 torch，故 T8 行为门禁需在带 torch 的目标机跑）。
+
+新增：`resihp/checkpoint.py`、`tests/test_checkpoint.py`；最小改动 `resihp/reference.py`（抽出可续训的 `ReferenceRun`）。
+
+设计要点：
+- **`reference.py` 抽出 `ReferenceRun`（外部行为不变）**：把原 `run_reference` 的建模/建优化器/生成 token 流与单步训练逻辑收进类，`step()` 前进一次迭代、`cursor` = 已完成步数（同时也是数据游标）。`run_reference` 改为「建 `ReferenceRun` → 循环 `step()`」的薄封装，逐算子顺序不变，`StepRecord`/两份摘要仍逐字节一致，既有 `tests/test_reference.py` 不受影响。续训是 T8 硬需求，故此重构属本任务范畴，非投机。
+- **checkpoint 覆盖计划 3.1 全集**：完整逻辑参数、AdamW（`exp_avg`/`exp_avg_sq`/`step`）、`completed_steps`（=迭代号=数据游标，token 流是 `seed+index` 纯函数，单一游标即可确定下一 batch，不另存冗余游标）、CPU/CUDA RNG 状态、执行计划版本 `plan_version`（存 int，不耦合 T6 `ExecutionPlan` 对象）。另存 `identity`（只含决定逻辑参数形状与 token 数据流的字段：`model_dim/num_layers/num_heads/vocab_size/sequence_length/batch_size/seed`，**不含拓扑字段**，详见下方审阅修正）以锁定张量形状与 token 流来源。
+- **原子写（计划 3.6）**：`save_checkpoint` 先写 `path.tmp` → 重新 `torch.load` 并按 sha256 逐张量字节摘要与内存态核对（写入校验）→ `os.replace` 原子替换到唯一 canonical 路径；任何异常都 `unlink` 临时文件并向上抛，最后有效 checkpoint 不被覆盖，磁盘上恒为单一文件。
+- **加载即校验，缺一即明确失败**：`load_checkpoint` 依次校验格式版本、`identity` 一致、参数不缺/不多且逐个形状匹配、`completed_steps` 与每个参数的 AdamW `step` 一致（游标一致性）；任一失败抛 `CheckpointError` 并指明根因。恢复顺序：`copy_` 回参数 → 清空并按 param 对象重建 optimizer.state → 恢复 RNG → 置 `cursor`。
+
+本机可做的验证（无 torch）：
+- `py_compile resihp/reference.py resihp/checkpoint.py tests/test_checkpoint.py`：通过。
+- 用 torch stub `import resihp.model, resihp.reference, resihp.checkpoint`：通过（无 import 期错误）。
+- 全量 `python -m pytest -q`：74 passed, 2 skipped——`tests/test_reference.py` 与 `tests/test_checkpoint.py` 顶部 `pytest.importorskip("torch")` 在无 torch 时整体跳过；既有 74 项无回归（`run_reference` 重构未改变外部行为）。
+
+审阅后修正（本轮）：
+- **正确性（根本）**：`_identity` 原用 `asdict(config)` 把 `tp/pp/dp/micro_batch_size` 也焊进 checkpoint 身份，与恢复设计（原则 A：同一 checkpoint 起点 + 新拓扑）冲突——T10/T11「读 checkpoint → 换拓扑重切」会在 load 身份校验处被误拒。改为只保留决定「逻辑参数形状 + token 数据流」的字段（`model_dim/num_layers/num_heads/vocab_size/sequence_length/batch_size/seed`）；拓扑由 `plan_version` 追踪，不作 config 相等性把关。新增 `test_identity_ignores_topology_fields` 锁定「同逻辑/数据、异 TP/PP/DP」可正常续训。
+- **完备性**：`_validate` 的游标一致性检查原为「遍历 optim 逐个比 step」，当 `completed>0` 而 `optim` 被篡改成空/缺项时循环空转、静默放行，恢复出残缺 AdamW 状态。补「`completed>0` 时 `set(optim)` 必须恰等于参数集合」，missing/extra 均明确报错。新增 `test_missing_optimizer_state_is_rejected`。
+- 小修：删去因 `_identity` 改写而多余的 `from dataclasses import asdict` 导入；`test_config_mismatch` 改用 `dataclasses.replace` 构造异 seed 配置，替代 `CONFIG.__dict__`。
+
+待目标机（带 torch）执行的门禁：`python3 -m pytest -q tests/test_checkpoint.py`，覆盖：save→load 后续训的下一步与不中断训练逐字段一致；成功保存后磁盘仅剩唯一 canonical 文件、无残留 `.tmp`；`os.replace` 失败时原 checkpoint 完好且无残留临时文件；参数缺失 / 形状错 / 游标不一致 / 优化器状态缺失 / 配置不一致分别以 `CheckpointError` 明确拒绝；异拓扑同逻辑可续训；负 `plan_version` 被拒。通过后本节状态改为「实现完成，待审核」。
+
+遗留问题：
+- CUDA RNG 已保存/恢复，但仅在 GPU 上生效；CPU 门禁只覆盖 CPU RNG。GPU 确定性前提仍随计划延后到 T10/T18。
+- `plan_version` 现为 int；与 T6 `ExecutionPlan` 版本/摘要的绑定（故障恢复链路里按计划版本校验）留到接入分布式执行时再做，本任务不引入耦合。
+- checkpoint 只服务单进程 `ReferenceRun`；「从健康 replica 收集 / 缺失 shard 才回落 checkpoint」的分布式恢复链路（计划 3.3/3.6）属 T11+。
+
+## T9：控制面与安全点九步骨架
+
+状态：实现完成，**分布式门禁待 torch 环境执行**（本机无 torch，计划硬性禁止安装/升级 torch，故 8 进程 Gloo 门禁需在带 torch 的目标机跑）。
+
+新增：`resihp/control.py`、`tests/test_control.py`；`resihp/train.py` 加分布式主循环分支（非 torchrun 启动时保留原「解析并打印 JSON」行为，`tests/test_entrypoint.py` 不受影响）。
+
+设计要点：
+- **两个进程组，模拟式 fail-stop**：`ControlPlane` 持有**始终存活的 Gloo 控制组**（`WORLD`，全程不销毁，承载 fail-stop 广播与计划摘要一致性校验）；**训练组**是按当前 `ExecutionPlan.live_ranks` 建的子组（GPU=NCCL / CPU=Gloo），每次故障销毁重建。本复现用「排除」模拟 fail-stop：进程不真死，只被移出训练组、停做训练，仍留在控制组，从而让确定性故障表可测且控制组集合不死锁。
+- **严格九步安全点**（`ControlPlane.safe_point`）：① 完成并提交当前迭代（调用方在进入前完成）→ ② 原子 checkpoint（`_commit_checkpoint` 调用点）→ ③ 控制组广播 fail-stop（src=0 协调者，本复现故障表不打 rank 0）→ ④ 标记 rank 永久失效（并入 `failed`）→ ⑤ TP→PP→DP 重规划（`reconfigure` 纯函数，版本 +1，`previous` 传旧计划）→ ⑥ 统一顺序先销旧训练组再建新组 → ⑦ 恢复/迁移/重切（`_recover_state` 调用点，本任务不搬张量，留给 T11–T14）→ ⑧ `all_gather_object` 校验各 rank 计划/状态摘要一致 → ⑨ 调用方从下一迭代继续。
+- **通信 rank 只由当前计划决定**：训练组成员 = `plan.live_ranks`，`is_training_rank` 与建组同源，不从旧布局隐式推导。
+- **非成员正确处理**：`new_group` 是 `WORLD` 级集合调用，全体（含失效 rank）都要进入；非成员拿到 sentinel，故 `build_training_group` 对非成员存 `None`，`destroy_training_group` 只销真实组——非成员既不跑训练集合，也不销毁自己没加入的组。
+- **训练用最简 all-reduce** 代替真前反向（T9 只锁控制面「建组—毁组—重建」骨架）；真实 TP/PP/DP 执行属 T10+。
+
+本机可做的验证（无 torch）：
+- `py_compile resihp/control.py resihp/train.py tests/test_control.py`：通过。
+- 全量 `python -m pytest -q`：75 passed, 3 skipped——新增纯函数用例 `test_reconfigure_is_deterministic_and_increments_version`（不依赖 torch，本机通过）验证重规划确定性与版本严格递增；`tests/test_control.py` 的 8 进程 Gloo 用例经 `skipif(torch 缺失)` 跳过；既有用例无回归。
+- `python -m resihp.train --config ... --failures ...`（非 torchrun）：仍打印解析后的 JSON，`test_entrypoint.py` 行为不变。
+- **离线仿真校验**（scratchpad 假 `torch.distributed`，逐 rank 记录集合调用序列）确认：8 个 rank 的 WORLD 级集合调用（`init`/`new_group`/`broadcast`/`all_gather_object`/`barrier`/销毁默认组）顺序完全一致（控制组不死锁）；每个训练组恰由其成员集合销毁（无残留、收支平衡：失效 rank 1 只销 1 组、rank 5 销 2 组、健康 rank 各销 3 组）；每次 all-reduce 的组都含调用者；失效 rank 在故障迭代后退出训练路径（rank 1 训 `[1,2]`、rank 5 训 `[1,2,3,4]`、其余训满 6 步）；结束后无 rank 残留 `is_initialized`。
+
+待目标机（带 torch）执行的门禁：`python3 -m pytest -q tests/test_control.py`（8 进程 Gloo，`mp.spawn`），覆盖：每个 fail-stop 事件恰生成一个严格递增的新计划版本（各 rank `versions==[1,2]`）；失效 rank 永久退出训练路径（`trained` 分别为 `[1,2]`/`[1,2,3,4]`，健康 rank 满 6）；各 rank 每个事件的计划摘要一致；无死锁、结束后无残留进程组（`still_initialized==False`）。通过后本节状态改为「实现完成，待审核」。
+
+遗留问题：
+- ② checkpoint 与 ⑦ 恢复/迁移/重切仅为调用点：本任务训练无真实逻辑状态可存搬，`save_checkpoint`（T8）与 `state_routes` 驱动的收集/重切（T11–T14）在真实执行接入后再落地，届时 ⑧ 的「状态摘要」补入真实逻辑张量摘要（现为空串占位，各 rank 恒等）。
+- src=0 广播依赖协调者 rank 0 存活；本复现确定性故障表不打 rank 0。若后续放开「任意 rank 可失效」，广播源需改为当前最低存活 rank，属 T14 一致停止/恢复链路范畴。
+- 训练组 = `live_ranks`；锁定配置 TP=2 下 `active==live`。「健康但未分配」rank（TP>2 降级留空位）不参与训练却仍在训练组的取舍，与 T6 同一遗留，接入真实执行时再定。
+
+## T10：真实 TP 前反向（真正分片 all-reduce，`allclose` 容差）
+
+状态：实现完成，**分布式门禁待 torch 环境执行**（本机无 torch，计划硬性禁止安装/升级 torch，故 2 进程 Gloo TP 门禁需在带 torch 的目标机跑）。
+
+新增：`resihp/parallel/__init__.py`、`resihp/parallel/tp.py`、`tests/test_parallel_tp.py`；最小改动 `resihp/reference.py`（新增 `logical_state_digest`）与 `resihp/control.py`（安全点 ②/⑧ 接入真实状态）。
+
+### 验收口径调整（应要求：`torch.equal` → `torch.allclose`）
+- **原则 A 的比特级 `torch.equal` 与真正的分片 all-reduce 不可兼得**：真正的分片计算引入两处「重排 FP32 求和」的归约——① 前向 row-parallel all-reduce（`out_proj`/`fc2`，`partial₀+partial₁`）；② 反向 column-parallel 输入梯度 all-reduce（Q/K/V/`fc1`）。浮点加法不满足结合律，分片部分和 ≠ 参考单块 matmul。
+- 按要求**放宽为 `torch.allclose`**（允许微小 FP 误差），从而实现**多卡真正的分片 all-reduce**。TP degree=1 时所有 collective 退化为 no-op，仍与参考逐比特一致；degree=2 在容差内一致。
+
+### 真实 TP 执行（Megatron 两算子）
+- 每个进程即一个 TP rank，**只持有自身 shard**（真正省显存，非"存整份"）：Q/K/V/`fc1` 按输出(head)维分片（column-parallel），`out_proj`/`fc2` 按输入维分片（row-parallel），token embedding / LM head 按 vocab 分片；两个 LayerNorm 与 position embedding 复制。布局与 `resihp/memory.py` 预算一致；每个 shard 是独立 leaf 参数、独立梯度、独立 AdamW 矩状态（正是 T11+ 收集/重切的对象）。
+- `f`（`_CopyToRegion`）：前向恒等、**反向 all-reduce**，包住每个 column-parallel 区（Q/K/V、`fc1`）的输入，使复制的输入梯度在组内求和。
+- `g`（`_ReduceFromRegion`）：**前向 all-reduce**、反向恒等，把每个 row-parallel 区（`out_proj`、`fc2`）与 vocab-parallel token embedding 的部分输出归约为完整复制结果。
+- LM head column-parallel over vocab：各 rank 的分片 logits 经 **all-gather**（`_GatherLastDim`，反向取本地切片）拼成完整 logits，loss 用普通 cross-entropy。
+- 因每处 `g` all-reduce 与残差加都在各 rank 产出相同字节，隐藏态**始终一致复制**，故复制的 LayerNorm/position-embedding 梯度各 rank 天然一致、无需额外通信即保持同步。
+- TP 组用 `group`（默认 world）参数化，degree/rank 从组导出，可服务整组 TP 或 3D 布局中的 TP 子组。
+- **不做重切**：degree/成员变化的 gather+reshard 留给 T11+；此处只做静态 TP 的正确执行。
+
+### 承接 T9 的最小接入
+- `ControlPlane` 新增可选 `training_run`/`checkpoint_path`（默认 `None`）。未附真实状态时安全点行为与 T9 骨架完全一致（② 空操作、⑧ state_digest 为空串），故 `tests/test_control.py` 不受影响、无回归。
+- 附上真实状态后：② `_commit_checkpoint` 调 T8 `save_checkpoint`；⑧ `_state_digest` 由新增 `reference.logical_state_digest(model)` 产出完整逻辑参数摘要，`safe_point` 把它传给 `agree_on_digest`。⑦ 收集/重切仍为调用点（T11–T14）。
+- 分片 TP run 的「完整逻辑 checkpoint」需先 gather optimizer 矩状态（属 T11 重切），本任务不做；wiring 单测用 `ReferenceRun`（完整逻辑）验证 ②/⑧ 机制打通。
+
+本机可做的验证（无 torch）：
+- `python -m py_compile resihp/parallel/tp.py resihp/reference.py resihp/control.py tests/test_parallel_tp.py`：通过。
+- 全量 `python -m pytest -q`：75 passed, 4 skipped——`tests/test_parallel_tp.py` 顶部 `pytest.importorskip("torch")` 在无 torch 时整体跳过；`resihp/control.py` 仍为 import 期 torch-free（`save_checkpoint`/`logical_state_digest` 均方法内惰性导入），既有 75 项无回归。
+
+待目标机（带 torch）执行的门禁：`python3 -m pytest -q tests/test_parallel_tp.py`（TP1/TP2 各以 `mp.spawn` 起 1/2 进程 Gloo），覆盖：gather 后完整 logits 与 loss 与参考 `allclose`；各 rank 本地 shard 的**梯度**与一步 AdamW 后的**参数**与参考对应切片 `allclose`（degree=1 精确一致，degree=2 容差内）；不整除 degree 被拒；`ControlPlane` 附真实状态后 ② 落盘且可重载、⑧ 摘要为真实逻辑摘要（未附状态时为空串）。通过后本节状态改为「实现完成，待审核」。
+
+遗留问题：
+- 数值验收为 `allclose`（容差内），非逐比特；两两组合/端到端（T15/T16）沿用同一口径与参考对照。
+- 分布式后端：门禁用 Gloo（CPU）；GPU/NCCL 验收属 T18。
+- TP 仅静态执行，无 degree/成员重切；gather+reshard 属 T11。
+- `ControlPlane._commit_checkpoint` 目前只能存**完整逻辑** run；分片 TP run 的 checkpoint 需 T11 的 optimizer 矩状态 gather。⑦ `_recover_state` 仍空。
