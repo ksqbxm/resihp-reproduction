@@ -233,7 +233,8 @@ def _assert_runtime(results, ref_loss, *, label):
         assert result["activation_peak"] == len(result["processed"]), result
 
     # Every (micro, stage) executed exactly once across all ranks (no shared workload).
-    pairs = [pair for result in results for pair in result["processed"]]
+    # JSON turns the tuples into lists on the round-trip through the result files.
+    pairs = [tuple(pair) for result in results for pair in result["processed"]]
     assert len(pairs) == len(set(pairs)), pairs
 
     losses = [result["loss"] for result in results if result["loss"] is not None]

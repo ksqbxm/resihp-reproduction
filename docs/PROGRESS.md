@@ -367,6 +367,11 @@
 - **简洁性**：删掉 `ActivationLog.history`（记录每次 retain/release 事件的列表）——无任何代码或测试读取，属投机状态。生命周期由纯单测（retain/release/峰值/非法 release）+ 运行时门禁（`peak == 处理数` 且结束 `live` 清空）验证，`history` 冗余。删后离线仿真与全量 75 passed 无回归。
 - 复审确认无正确性/完备性问题：跨-replica micro（stage0/stage1 落不同 replica）的前向/反向梯度经手工逐 rank trace 与参考一致；`dp_combine_gradients` 的「每 replica 按自身 degree 重建→跨 replica 求和→重切」是失衡/异构下的**根本正确**归一化（非兜底），且 `total = full.clone()` 已隔离 `reconstruct_full` 对 `shard_dim=None` 分支返回未克隆张量的别名风险；全前向→全反向的最简 DP 调度经 P2P 逐 micro 配对分析无死锁。
 
+### 目标机（torch + GPU）门禁执行修正（本轮）
+
+- 目标机实跑 `tests/test_parallel_dp.py`（Gloo 全部 + NCCL 按 GPU 数）：**数值全部通过**——`dp_normalization`/`cross_replica`/`pp_heterogeneous` 三场景各 rank 的梯度/一步 AdamW 后参数与参考 `allclose`，实测 `max_grad_diff ~1e-8…1e-9`、`max_param_diff ~1.5e-8`；`tp_heterogeneous`（含真实 TP2 分片）合并后与参考切片一致，Gloo/NCCL 均 PASS。运行时逻辑经真实多进程 + 真实 NCCL 验证正确。
+- **修一个纯测试 harness bug**：`_assert_runtime` 的 workload 互斥检查 `set(pairs)` 报 `TypeError: unhashable type: 'list'`——`processed` 里的 `(micro, stage)` 元组经 result JSON 文件往返被反序列化成 **list**（不可哈希）。修复：断言前 `tuple(pair)` 归一。仅测试断言改动，运行时代码与数值不受影响。
+
 ### 遗留问题
 
 - 运行时按**全前向→全反向**最简 DP 调度，无 1F1B 交叠（PP 交叠是 T12 职责，本任务不重做）；`DataParallelRuntime` 只驱动 **TP 未分片**（TP1）的 `PipelineStage` replica，TP 分片前反向仍是 T10 `TensorParallelTransformer` 的职责。`tp_heterogeneous` 门禁只对**DP 合并**用真实 TP2 分片梯度验收；「同一 run 内 TP×DP 端到端」属 T15 两两组合。
