@@ -270,3 +270,54 @@
 - T11 只交付重切**原语 + 异构边界原语 + 单测**。把它接进安全点⑦ `_recover_state` 的真正收集/重切、分片 TP run 的完整逻辑 checkpoint（optimizer 矩状态 gather），以及六条一致停止条件，属 T12（PP 运行时/层迁移）/T14（原子重配与一致停止）范畴，本任务不动 `control.py`。
 - `reshard_tp_state` 假定「每个健康 rank 对每个逻辑张量都贡献其 shard」的纯 TP 汇总；PP 下 stage 只持有非连续层子集时的按-stage 收集在 T12 的层迁移里落地。
 - 数值校验用 `torch.equal`（重切是纯搬运/拼接/切片，无浮点归约，逐比特成立）；异构边界前向广播、反向广播亦不引入 reassociation，故梯度可逐元素 `torch.equal` 对齐参考，与 T10 执行路径的 `allclose` 口径不冲突（各自对应无归约/有归约场景）。
+
+## T12：PP 1F1B 运行时与层状态迁移
+
+状态：实现完成，**分布式门禁（Gloo + 真实 GPU/NCCL）待 torch 环境执行**（本机无 torch，计划硬性禁止安装/升级 torch，故 `mp.spawn` 门禁需在带 torch 的目标机跑）。
+
+新增：`resihp/parallel/pp.py`、`tests/test_parallel_pp.py`。未改动 `tp.py`/`reshard.py`/`planner/pp.py`/`model.py`/`control.py`（保持 surgical）。
+
+### 设计要点
+
+- **真正切分模型的 stage**：`PipelineStage` 只持有自己那段连续 layer，首 stage 另持 token/position embedding、末 stage 另持 final norm 与 LM head（计划 3.4「embedding/LM head 归属首/尾可执行 stage」）。子模块命名与参考模型逐字相同，故 `named_parameters()` 直接产出稳定逻辑名（`layers.<gid>.attn.q_proj.weight`），按名从参考 `logical_state_dict` 装载——层迁到别的 stage 后名字不变。测试断言「任一 stage 都不持有整模型」「各 stage 参数集两两不交且并集 == 参考全集」，证明是真 PP 而非元数据。
+- **1F1B 是真调度**：`PipelineRuntime.train_step` 按 warmup → 1F1B 稳态 → cooldown 发出计划要求的 Forward/Backward/Send/Recv/WeightUpdate 原语，激活前向、梯度反向都是真实 P2P 传输，micro-batch 梯度累积后一次 AdamW。`schedule` 属性记录发出的原语顺序，测试逐字比对（2 stage/4 micro 下 stage0=`F0 F1 B0 F2 B1 F3 B2 B3 W`、stage1=`F0 B0 F1 B1 F2 B2 F3 B3 W`），锁死「不是先全 F 再全 B」。
+- **稳态两处收发必须融合（NCCL 正确性，非性能优化）**：`send_forward+recv_backward` 与 `send_backward+recv_forward` 各用**一次** `dist.batch_isend_irecv` 发出。NCCL 下每个 rank 的传输在自己的 stream 上按序执行，若把这两步拆成先后两次独立收发，stage0 会卡在「送 act1」（对端尚未 post 对应 recv），而 stage1 卡在「送 grad0」（对端被前一步堵住永远到不了 recv）——**确定性死锁**。融合后两个方向同时推进。此点已用离线仿真反证（见下）。
+- **loss 按 micro 数缩放**：每个 micro 的 cross-entropy 除以 micro 数后累加，等价于参考的整 batch 均值（各 micro 等大），故梯度与 loss 与参考一致；但 micro 切分重排了 FP32 归约顺序，验收沿用 T10 的 `allclose(rtol=1e-4, atol=1e-5)` 口径，单 micro 时精确。
+- **层迁移复用唯一恢复路径，不造第二套机制**：`plan_migration` 把 T4 重分层（哪层落到哪个 stage）与两侧 TP degree 组合成 `LayerPlacement{layer, old_owner, new_owner, old_degree, new_degree}`，张量搬运仍走 T11 的 `reshard_tp_state`（健康 peer 收集 → 与 checkpoint 校验 → 按新布局重切）。`reshard_layout` 给出某 stage 需要重新获取状态的层的分片布局（`shard_dims` 里属首/尾 stage 的 embedding/LM head 不混入层布局）。
+
+### 关键完备性修正（本轮自查发现）
+
+`PPPlan.migrations` 只列**换了 stage** 的层，据此驱动重切会漏掉一整类：**stage 没丢层、但自己掉了一个 TP rank**，其保留的层同样必须从旧 degree 重切到新 degree。实测 `(2,2)/TP(2,2) → TP(1,2)`：`plan.migrations == ()`（无一层移动），但 layer 0/1 的 degree 2→1 必须重切——只看 migrations 会把 stage0 的状态静默留在旧的两路布局里。故 `plan_migration` 对**每个**全局 layer 都给出新旧 `(owner, degree)`，并用 `moved` / `resharded` 两个独立属性区分「换 stage」与「换 degree」（可同时成立）。`test_stationary_layers_still_reshard_when_their_stage_loses_a_rank` 专门锁定这条。
+
+### 本机可做的验证（无 torch）
+
+- `python -m py_compile`（全包 + 全部测试）：通过。
+- 全量 `python -m pytest -q`：**75 passed, 6 skipped**——`tests/test_parallel_pp.py` 顶部 `pytest.importorskip("torch")` 在无 torch 时整体跳过（较 T11 基线 5 skipped 增 1）；既有 75 项无回归。
+- torch stub 下 `import resihp.parallel.pp`：通过（import 期 torch-free 安全），并在 stub 下跑通纯 planner 路径（`plan_migration` / `reshard_layout` / `balanced_layers`）。
+- **离线调度仿真**（scratchpad，纯 Python 复刻调度控制流）：stages×micro = 1×1/1×4/2×1/2×2/2×4/3×3/3×4/4×4/4×8/4×2 全部无死锁，每个 micro-batch 的 F 与 B 各恰一次且按序；4 stage×8 micro 输出标准 1F1B 阶梯。
+- **离线运行时仿真**（scratchpad，假 torch/dist + 多线程跑 `PipelineRuntime.train_step` **真身**）：假 `batch_isend_irecv` 复刻 NCCL 群语义（send 必须等到对端 post 对应 recv 才完成，整组全完成才返回）。1/2/3/4 stage 全部跑通、schedule 逐字符合预期、stage forward 恰调用 micro 次、WeightUpdate 恰一次。**反证控制组**：把融合组拆成两次独立单op组后，2 stage 用例如期双向 `TimeoutError` 死锁——证明仿真不是空转、融合设计确实承重。
+
+### 待目标机（带 torch）执行的门禁
+
+`python3 -m pytest -q tests/test_parallel_pp.py`，Gloo/NCCL 双后端跑同一逻辑（`_compare_pp`/`_run_migration` 设备无关，`_gloo_*`/`_nccl_*` 仅切后端与设备）：
+
+- 纯函数（单进程）：`balanced_layers` 连续/唯一/完整与余数前置、stage 多于层被拒；placements 覆盖每层且给出两侧 `(owner, degree)`；「移动且重切」「只重切不移动」「只移动不重切」三类分别锁定；`reshard_layout` 同时含到达层与「原地但降 degree」的层、分片维与 T11 布局一致、不含 embedding/LM head，且对无状态变更的 stage 返回空。
+- **CPU/Gloo**（始终可跑）：`test_pp_matches_reference_gloo[1,2]`——2 stage×4 micro，每 stage 的**梯度**与**一步 AdamW 后参数**与参考对应部分 `allclose`，末 stage loss 与参考一致、非末 stage 返回 `None`，参数归属不重不漏，schedule 逐字为 1F1B；`test_pp_layer_migration_is_lossless_gloo`——stage 1 的整份状态工作量（moved+resharded 的 layer 4 与「原地但降 degree」的 layer 3）在一次重切里走真实集合通信，两层共 20 个张量的 `param/grad/exp_avg/exp_avg_sq/step` 全部与 checkpoint 锚点 `torch.equal`，被踢 rank 返回空。
+- **GPU/NCCL**（`torch.cuda.set_device(rank)` + `cuda:rank` + `nccl`，显式 `assert get_backend()=="nccl"`、`current_device()==rank`、参数 `is_cuda`；GPU 不足才 skip）：与 Gloo 同两组场景在**真实 GPU 张量 + 真实 NCCL P2P/集合**上重跑；迁移用例另断言 shard 确实曾在 GPU（`local_was_device`）。2 stage 与迁移用例均只需 **2 GPU**，2-GPU 服务器可实跑。
+
+通过后本节状态改为「实现完成，待审核」。
+
+### 复审修正（本轮）
+
+自查发现**同一个完备性缺陷在下游又犯了一遍**：`plan_migration` 已按「每层都给两侧 (owner, degree)」修好，但喂给 `reshard_tp_state` 的布局函数只挑 `moved` 的层，于是「stage 没丢层、只掉了一个 TP rank」的场景又被漏掉。实测 `(2,2)/TP(2,2)→TP(1,2)`：`migration_layout(new_owner=0)` 返回 `{}`，而 layer 0/1 明明需要 2→1 重切——等于把上一层刚修好的坑在下一层重新挖开。修正：函数改名 `reshard_layout` 并按 `moved or resharded` 选层，语义从「到达的层」改为「该 stage 需要重新获取状态的层」；新增 `test_reshard_layout_selects_stage_that_only_lost_a_rank` 专门锁定，分布式迁移用例也随之覆盖「一次重切同时处理 moved 层与原地降 degree 层」。
+
+小修：`train_step` 中四处重复的 `torch.empty(shape, device=device)` 收敛为一个 `buffer()` 局部函数；`exchange` 补注释说明 `ops` 的存活期正是发送缓冲区不被提前回收的原因。
+
+### 遗留问题
+
+- **一次 `reshard_layout` + `reshard_tp_state` 调用只覆盖一个 `old_degree → new_degree` 对**（`reshard_tp_state` 只收单个 `old_size`）。当某 stage 同时接收来自不同 degree 源 stage 的层时，调用方需按 `LayerPlacement.old_degree` 分组多次调用；锁定配置 TP=2 起步、单 rank 逐次失效下不触发，已在 `reshard_layout` docstring 写明。
+- **embedding / LM head 的 owner 变更未做状态迁移**：`PPPlan` 给出 `embedding_owner` / `lm_head_owner`，但首/尾 stage 整组失效导致 owner 改变时，这两个张量的搬运不在 `reshard_layout`（其语义是逐层布局，不含非层张量）中，属 T14 接入范畴。
+- PP 与 TP 尚未在同一 run 内组合执行：`PipelineStage` 走完整（未分片）层，TP 分片执行在 `parallel/tp.py`。`TP2×PP2` 同时真实执行属 T15/T16 两两组合与端到端范畴。
+- 层迁移交付的是**计划 + 复用 T11 重切原语 + 单测**；接进安全点⑦ `_recover_state` 的真正收集/重切链路仍属 T14。`control.py` 本任务未动。
+- 1F1B 为**功能调度**（计划 3.4 原话），未做 P2P 与计算重叠、未做 F/B/W 三类的细粒度拆分调度。
+- 每个 stage 都收到完整 batch，首 stage 取输入、末 stage 取标签；真实场景的 batch 分发（只发首/末 stage）属 DP 数据路由接入范畴。
