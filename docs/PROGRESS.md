@@ -237,3 +237,36 @@
 - 分布式后端：CPU 用 Gloo、GPU 用 NCCL 均已成门禁；8 进程完整 3D/NCCL 大规模验收仍属 T16/T18。
 - TP 仅静态执行，无 degree/成员重切；gather+reshard 属 T11。
 - `ControlPlane._commit_checkpoint` 目前只能存**完整逻辑** run；分片 TP run 的 checkpoint 需 T11 的 optimizer 矩状态 gather。⑦ `_recover_state` 仍空。
+
+## T11：TP 重切与异构 TP 边界
+
+状态：实现完成 + 一轮复审修正，**分布式门禁（Gloo + 真实 GPU/NCCL）待 torch 环境执行**（本机无 torch/numpy，计划硬性禁止安装/升级 torch，故 `mp.spawn` 门禁需在带 torch 的目标机跑）。
+
+新增：`resihp/parallel/reshard.py`、`tests/test_parallel_reshard.py`。未改动 `tp.py`/`control.py`/`model.py`/`reference.py`（保持 surgical）。
+
+设计要点：
+- **单一恢复路径的纯函数化**：`reconstruct_full(name, shard_dim, old_size, contributions, checkpoint)` 是重构完整逻辑张量的唯一入口——① 全部 shard 索引在健康 rank 中齐备（同一逻辑层的 shard 也存在于健康 peer DP replica）→ 从 peer 拼接（`source="peer"`）；② 某 shard 索引在所有健康 rank 均缺失→回落故障前 checkpoint（`source="checkpoint"`）；③ 两处皆无→抛 `ReshardError`（一致停止条件，链路接入属 T14）。此函数不依赖任何进程组，故 **donor 恢复路径与 checkpoint fallback 路径分别以纯单测锁定**（计划 3.3 要求「分别单测」）。
+- **分布式驱动是薄封装**：`reshard_tp_state(...)` 用一次 `all_gather_object` 汇总各健康 rank 持有的 `{name: {shard_index, param, grad, exp_avg, exp_avg_sq, step}}`，`_merge` 折叠成 `{name: {field: {shard_index: tensor}}}`，每个 rank 用同一 merged 视图独立重构 → 与 checkpoint **逐张量 `torch.equal` 校验**（计划步骤⑤）→ 按新 layout（`local_slice`）切出**本 rank 的新 shard**；被踢 rank（`new_rank=None`）仍参与 gather 供 peer 使用但不接收（返回 `{}`）。param/grad/exp_avg/exp_avg_sq 按参数 shard 维重切，`step` 作复制标量。
+- **shard 布局单一真源**：`shard_dims(layer_ids)` 给出全模型 `logical_name → shard_dim|None`，与 `TensorParallelTransformer.local_shards()` 的分片维一致；`test_shard_dims_matches_tp_module` 用 tp=1 组实例化 TP 模块逐项核对二者相等，锁死漂移。
+- **异构 TP 边界（功能正确，不做 P2P 优化）**：`cross_tp_boundary` = 自定义 autograd `_ReplicatedBridge`：前向从 `upstream_leader` 广播权威副本给边界组全体（下游 TP 组据此拿到激活）；反向从 `downstream_leader` 广播权威梯度回全体——因两侧在各自 TP 组内激活/梯度均复制，**只搬一份、绝不求和**，故上游每个 rank 拿到的边界梯度恰等于单进程参考（naive all-reduce 会按下游 degree 倍增而被测试抓出）。测试用**上游 TP1→下游 TP2**（下游 degree>上游，双 rank 均跑真实下游 loss，无需零缩放占位），既覆盖「不重复计数」又能在 2-GPU 机实跑 NCCL `broadcast`。
+
+### 审阅修正（本轮，新增真实 GPU/NCCL 测试并复审）
+
+- **正确性（GPU 致命，根因修复）**：`all_gather_object` 汇总的是各 rank 持有的**活 CUDA shard**，pickle 会给每个张量打上**属主的 device 序号**；`reconstruct_full` 里 `torch.cat([cuda:0 shard, cuda:1 shard])` 会**跨设备崩溃**。既有 Gloo 测试全在 CPU，永远碰不到这条路径。修复：新增 `_to_cpu`，在 `all_gather_object` 之前把本 rank shard 规范化为 CPU——完整逻辑张量本就是**设备无关的规范形态**（checkpoint 锚点也是 CPU），重构后返回 CPU shard，由调用方放回计算设备。这是根因修复而非兜底：跨设备 gather-then-cat 本身语义就错。
+- **完备性（潜在 KeyError）**：原 `ckpt = {name: checkpoint[name][field]}` 对每个 field 都急切索引 checkpoint；真实 T8 checkpoint **不含 `grad`**，于是当 grad 由 peer 提供时也会 `KeyError`。修复：仅当 checkpoint 确实带该 field 时才取用（`ckpt_entry.get(field)`），peer 提供的 grad 正常重切。
+- **离线逻辑校验**（scratchpad 假 torch/dist，纯 Python 张量执行 `reshard_tp_state` 真身）：degrade / replace 在 `cpu` 与 `cuda:0` 两种 device 下均通过；假 `torch.cat` 内置**单设备断言**，故若无 `_to_cpu` 则 `cuda:0` 用例会像真 torch 一样崩——通过即证明修复生效而非掩盖。另验证 checkpoint fallback 与「grad 不在 checkpoint」不再 KeyError。
+
+本机可做的验证（无 torch）：
+- `python -m py_compile`（全包 + 测试）：通过。
+- 全量 `python -m pytest -q`：75 passed, 5 skipped——`tests/test_parallel_reshard.py` 顶部 `pytest.importorskip("torch")` 在无 torch 时整体跳过（较 T10 基线 4 skipped 增 1）；`resihp/parallel/reshard.py` 仅被该 gated 测试导入，非 torch 路径不触碰，既有 75 项无回归。
+
+待目标机（带 torch）执行的门禁：`python3 -m pytest -q tests/test_parallel_reshard.py`，Gloo/NCCL 双后端跑同一逻辑（与 T10 结构一致：`_run_reshard`/`_run_boundary` 设备无关，`_gloo_*`/`_nccl_*` 仅切后端与设备）：
+- 纯函数（单进程）：peer 拼接 / 复制取一份 / shard 缺失回落 checkpoint / 两处皆无抛 `ReshardError`；`local_slice` 与 `chunk` 一致；`shard_dims` 与 TP 模块分片维逐项相等。
+- **CPU/Gloo**（始终可跑）：**`TP2→TP1`**（2 进程，两 shard 拼回、存活 rank 得完整 degree-1 张量、被踢 rank 返回空）；**成员替换 `{0,1}→{0,2}`**（3 进程，rank0 保 shard0、rank2 收 shard1、rank1 退出，**无丢失**，均与 checkpoint `torch.equal`）；**异构边界反向**（上游 TP1→下游 TP2，rank0 边界梯度逐元素等于单进程参考，下游 loss 等于参考）。
+- **GPU/NCCL**（`torch.cuda.set_device(rank)` + `cuda:rank` + `nccl`，显式 `assert get_backend()=="nccl"`；GPU 数不足则 skip）：与 Gloo 同三场景在**真实 GPU shard + NCCL 集合**上重跑——reshard 用例断言 shard 确实曾在 GPU（`local_was_device`）后由 NCCL `all_gather_object` 汇总、`_to_cpu` 规范化、正确重构；边界用例断言激活/梯度 `is_cuda` 且梯度逐元素等于参考。`TP2→TP1` 与异构边界需 2 GPU（**2-GPU 服务器即可实跑**，边界特意设计为上游 TP1→下游 TP2 两 rank，`dist.broadcast` 走 NCCL），成员替换需 3 GPU。
+通过后本节状态改为「实现完成，待审核」。
+
+遗留问题：
+- T11 只交付重切**原语 + 异构边界原语 + 单测**。把它接进安全点⑦ `_recover_state` 的真正收集/重切、分片 TP run 的完整逻辑 checkpoint（optimizer 矩状态 gather），以及六条一致停止条件，属 T12（PP 运行时/层迁移）/T14（原子重配与一致停止）范畴，本任务不动 `control.py`。
+- `reshard_tp_state` 假定「每个健康 rank 对每个逻辑张量都贡献其 shard」的纯 TP 汇总；PP 下 stage 只持有非连续层子集时的按-stage 收集在 T12 的层迁移里落地。
+- 数值校验用 `torch.equal`（重切是纯搬运/拼接/切片，无浮点归约，逐比特成立）；异构边界前向广播、反向广播亦不引入 reassociation，故梯度可逐元素 `torch.equal` 对齐参考，与 T10 执行路径的 `allclose` 口径不冲突（各自对应无归约/有归约场景）。
