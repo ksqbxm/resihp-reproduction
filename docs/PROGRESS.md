@@ -321,3 +321,54 @@
 - 层迁移交付的是**计划 + 复用 T11 重切原语 + 单测**；接进安全点⑦ `_recover_state` 的真正收集/重切链路仍属 T14。`control.py` 本任务未动。
 - 1F1B 为**功能调度**（计划 3.4 原话），未做 P2P 与计算重叠、未做 F/B/W 三类的细粒度拆分调度。
 - 每个 stage 都收到完整 batch，首 stage 取输入、末 stage 取标签；真实场景的 batch 分发（只发首/末 stage）属 DP 数据路由接入范畴。
+
+## T13：DP 跨 replica 执行
+
+状态：实现完成，**分布式门禁（Gloo + 真实 GPU/NCCL）待 torch 环境执行**（本机无 torch，计划硬性禁止安装/升级 torch，故 `mp.spawn` 门禁需在带 torch 的目标机跑）。
+
+新增：`resihp/parallel/dp.py`、`tests/test_parallel_dp.py`。未改动 `planner/dp.py`（T5）/`pp.py`（T12）/`tp.py`（T10）/`reshard.py`（T11）/`control.py`/`model.py`/`reference.py`（保持 surgical）。
+
+### 关键设计决策（计划 3.5 逐-stage 语义 vs T5 整-replica assignment 的歧义）
+
+计划 3.5 运行时保证写「失效 stage 的 micro-batch → 健康 peer **stage**」（逐 stage 跨 replica），而已锁定的 T5 `planner/dp.py` 实际按**整 replica** 迁移（一个 micro 始终在单一 replica 内）。T13 指令是「把 T5 的 assignment **接到真实执行**」。
+
+- **决策**：运行时**完全由 assignment 驱动**——每个 `(micro, stage)` 的 executor、上/下游 peer 都从 `DPAssignment.placements` 查表，**绝不从固定拓扑推导**（计划 3.2 硬性要求）。因此它对 T5 的整-replica assignment 与手工构造的逐-stage 跨-replica assignment **都正确**，忠于计划 3.5 原文又不与 T5 冲突。`executor_route(assignment, rank)` 是纯查表函数，`crossreplica` 场景下 rank0 的下游随 micro 变化（micro0/1→rank1、micro3→rank3，跨到另一 replica），单测直接锁定。
+
+### 设计要点（计划 3.5 六条运行时保证逐条落地）
+
+- **① 每 micro·stage 恰执行一次**：运行时只跑 assignment 把本 rank 列为 executor 的 `(micro, stage)`；测试对全体 rank 的 `processed` 断言两两不交且并集完整（无 workload 同归属源与目标，保证④）。
+- **② forward 发给实际下游 / backward 返回实际上游**：`train_step` 用 T12 同款融合 `batch_isend_irecv` 收发，peer 取自 `route["downstream"]/["upstream"]`（即 assignment 里下/上一 stage 的 executor）——rerouted micro 的激活因此跨 replica 传到真正的下游 executor，梯度回到真正的上游 executor。全前向→全反向的最简 DP 调度（1F1B 是 PP/T12 职责，不重做），已手工反证无死锁（前向 DAG 严格 stage0→stage1，反向反序配对）。
+- **③ activation 生命周期**：`ActivationLog` 在 forward `retain`、对应 backward `release`；`live` 永不含已完成 backward 的激活，`peak` 为并发驻留高水位。纯单测锁定「retain/release/峰值/对已释放者再 release 报错」，运行时门禁另断言 `peak == len(processed)` 且结束 `live` 清空。
+- **⑤ executor 改变不影响 global batch 归一化**：每个 micro 的 loss 除以**全局** micro 数后累加，各 replica 持自身 micro 的梯度**偏和**；DP 合并对每个逻辑参数**跨 replica 求和**恰得整-batch 均值——3-vs-1 失衡切分（模拟 reroute）下 AdamW 更新仍逐参与参考一致。
+- **⑥ 不同 replica 的 PP 分层 / TP degree 可不同**：`dp_combine_gradients` 统一走「**每 replica 用 T11 `reconstruct_full` 重建完整逻辑梯度 → 跨 replica 求和 → 用 `local_slice` 按各自 degree 重切**」**单一路径**（不造第二套 all-reduce）。同一函数同时覆盖同构、PP 异构（replica A 两 stage / replica B 单 stage 持全层）、TP-degree 异构（replica A TP2 / replica B TP1）；`shard_dim=None` 的复制参数只取一份，避免 TP 组内复制副本被重复计数（离线单测专门反证）。old_size 按 **replica** 记录，修掉「用全局单一 old_size 重建异 degree replica」的隐患。
+
+### 本机可做的验证（无 torch）
+
+- `python -m py_compile resihp/parallel/dp.py tests/test_parallel_dp.py`：通过。
+- 全量 `python -m pytest -q`：**75 passed, 7 skipped**——`tests/test_parallel_dp.py` 顶部 `pytest.importorskip("torch")` 在无 torch 时整体跳过（较 T12 基线 6 skipped 增 1）；`resihp/parallel/dp.py` 仅被该 gated 测试导入，既有 75 项无回归。
+- **离线逻辑仿真**（scratchpad 假 torch/dist + 1-D FakeTensor 跑函数真身）：`executor_route` 跨-replica 路由（rank0 下游随 micro 变化、rank3 跨界收 micro3）；`ActivationLog` 生命周期与非法 release；`dp_combine_gradients` **TP-degree 异构**（TP2 两 shard + TP1 全量，和为参考、各 rank 得正确重切）、**PP 异构/复制形态**求和、**复制参数不重复计数**（TP 组内两份相同副本只入一份，5+5+1 ≠ 6 的反证）全部通过。
+
+### 待目标机（带 torch）执行的门禁
+
+`python3 -m pytest -q tests/test_parallel_dp.py`，Gloo/NCCL 双后端跑同一 runner（`_run_*` 设备无关，`_gloo_*`/`_nccl_*` 仅切后端与设备），验收口径沿用 T10/T12 的 `allclose(rtol=1e-4, atol=1e-5)`（micro 切分重排 FP32 归约）：
+
+- 纯函数（单进程）：`executor_route` 读实际上/下游 executor（含跨-replica）；`stage_pipeline` 按 stage 排序；`ActivationLog` 生命周期。
+- **CPU/Gloo**（始终可跑）：
+  - `dp_normalization`（2 rank，全模型两 replica，3-vs-1 失衡）——各 rank 梯度/一步 AdamW 后参数与参考 `allclose`、loss 汇总等于参考、activation 峰值=处理数且结束清空。
+  - `cross_replica`（4 rank，PP2×DP2，micro3 的 stage0/stage1 落在不同 replica）——断言 rank0 对 micro3 的下游确为另一 replica 的 rank3，激活/梯度真实跨界，各 stage 合并梯度与参考一致。
+  - `pp_heterogeneous`（3 rank，replica A 两 PP stage / replica B 单 stage 持全层）——异构 PP 分层合并后与参考一致。
+  - `tp_heterogeneous`（3 rank，replica A 真实 TP2 分片前反向 / replica B TP1）——DP 合并重建+重切后各 rank shard 与参考对应切片一致。
+- **GPU/NCCL**（`torch.cuda.set_device(rank)` + `cuda:rank` + `nccl`，显式 `assert get_backend()=="nccl"`、`current_device()==rank`、`is_cuda`；GPU 不足才 skip）：与 Gloo 同四场景在真实 GPU 张量 + 真实 NCCL P2P/集合上重跑。`dp_normalization` 仅需 **2 GPU**（2-GPU 服务器可实跑）；`pp_heterogeneous`/`tp_heterogeneous` 需 3 GPU、`cross_replica` 需 4 GPU，不足则 skip。
+
+通过后本节状态改为「实现完成，待审核」。
+
+### 复审修正（本轮）
+
+- **简洁性**：删掉 `ActivationLog.history`（记录每次 retain/release 事件的列表）——无任何代码或测试读取，属投机状态。生命周期由纯单测（retain/release/峰值/非法 release）+ 运行时门禁（`peak == 处理数` 且结束 `live` 清空）验证，`history` 冗余。删后离线仿真与全量 75 passed 无回归。
+- 复审确认无正确性/完备性问题：跨-replica micro（stage0/stage1 落不同 replica）的前向/反向梯度经手工逐 rank trace 与参考一致；`dp_combine_gradients` 的「每 replica 按自身 degree 重建→跨 replica 求和→重切」是失衡/异构下的**根本正确**归一化（非兜底），且 `total = full.clone()` 已隔离 `reconstruct_full` 对 `shard_dim=None` 分支返回未克隆张量的别名风险；全前向→全反向的最简 DP 调度经 P2P 逐 micro 配对分析无死锁。
+
+### 遗留问题
+
+- 运行时按**全前向→全反向**最简 DP 调度，无 1F1B 交叠（PP 交叠是 T12 职责，本任务不重做）；`DataParallelRuntime` 只驱动 **TP 未分片**（TP1）的 `PipelineStage` replica，TP 分片前反向仍是 T10 `TensorParallelTransformer` 的职责。`tp_heterogeneous` 门禁只对**DP 合并**用真实 TP2 分片梯度验收；「同一 run 内 TP×DP 端到端」属 T15 两两组合。
+- 运行时消费 T5 assignment 但门禁多用**手工构造**的 assignment 以覆盖逐-stage 跨-replica（T5 现产整-replica）；把 T5 逐-stage reroute 与运行时对接、接进安全点⑦ `_recover_state` 的真正收集/重切链路属 T14。`control.py` 本任务未动。
+- 数值验收 `allclose`，与 T10/T12 同口径；完整 3D `TP2×PP2×DP2` 8 进程端到端属 T16。
