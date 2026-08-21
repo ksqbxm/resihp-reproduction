@@ -50,6 +50,7 @@ checkpoint ones, where no arithmetic is involved.
 
 import faulthandler
 import json
+import math
 import os
 import socket
 import time
@@ -157,6 +158,12 @@ def _adamw(params):
 # --- reference anchors ------------------------------------------------------------
 
 
+def _denominator(state):
+    """AdamW's own ``sqrt(v / bias_correction2) + eps`` for the step it just took."""
+    bias_correction2 = 1 - ADAM_BETAS[1] ** float(state["step"])
+    return state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2) + ADAM_EPS
+
+
 def _step_record(model, optimizer, tokens):
     """One full-batch reference iteration: its gradients, new weights, new moments."""
     logits = model(tokens)
@@ -170,6 +177,9 @@ def _step_record(model, optimizer, tokens):
         "loss": float(loss.detach()),
         "grads": grads,
         "params": {name: param.detach().clone() for name, param in named.items()},
+        # Read back from the optimizer that just used it: this is the divisor that
+        # turns a gradient difference into a parameter difference (``_compare_shards``).
+        "denoms": {name: _denominator(optimizer.state[param]) for name, param in named.items()},
     }
 
 
@@ -215,27 +225,78 @@ def _steps_from_anchor(anchor, device, *, start, count):
 
 
 def _compare_shards(stage, record):
-    """Compare this rank's shards to the reference, sliced by its own TP layout."""
+    """Compare this rank's shards to the reference, sliced by its own TP layout.
+
+    Gradients are compared in the reassociation band directly -- they are what the
+    distributed algorithm is responsible for producing. Parameters cannot be, because
+    AdamW's update is ``lr * m_hat / (sqrt(v_hat) + eps)``: a gradient difference ``d``
+    reaches the parameter scaled by at most ``lr / denom``, which is ~1e-10 where the
+    gradient is healthy and rises to ``lr`` itself where ``sqrt(v_hat)`` has fallen to
+    ``eps`` and the update degenerates into ``lr * sign(g)``. A fixed band on the
+    post-step parameter asserts that AdamW is well conditioned, not that the run is
+    correct, so the allowance carries that factor per element instead.
+
+    It stays tight exactly where the check earns its keep: a moment that did not
+    survive a recovery, a wrong step count, or a parameter the optimizer never touched
+    each move the parameter by order ``lr`` while leaving the gradient -- and therefore
+    the allowance -- where it was.
+    """
     grad_close = step_close = True
     max_grad_diff = max_param_diff = 0.0
+    worst_grad = worst_param = None
     for name, (param, dim) in stage.local_shards().items():
-        want_param = local_slice(record["params"][name], dim, stage.tp_rank, stage.tp_size)
-        step_close &= torch.allclose(param.detach(), want_param, rtol=RTOL, atol=ATOL)
-        max_param_diff = max(max_param_diff, (param.detach() - want_param).abs().max().item())
         if param.grad is None:
             grad_close = False  # every owned parameter must have taken a gradient
             continue
-        want_grad = local_slice(record["grads"][name], dim, stage.tp_rank, stage.tp_size)
+        sliced = (dim, stage.tp_rank, stage.tp_size)
+        want_param = local_slice(record["params"][name], *sliced)
+        want_grad = local_slice(record["grads"][name], *sliced)
+        denom = local_slice(record["denoms"][name], *sliced)
+        grad_diff = (param.grad - want_grad).abs()
+        param_diff = (param.detach() - want_param).abs()
+        # The factor 2 is what makes this an upper bound rather than a first-order
+        # estimate: at ``g ~ 0`` the update is ``lr * sign(g)``, so two runs can differ
+        # by the whole ``2 * lr`` while the linear term alone would allow only ``lr``.
+        allowed = ATOL + RTOL * want_param.abs() + 2 * LEARNING_RATE * grad_diff / denom
+
         grad_close &= torch.allclose(param.grad, want_grad, rtol=RTOL, atol=ATOL)
-        max_grad_diff = max(max_grad_diff, (param.grad - want_grad).abs().max().item())
+        step_close &= bool((param_diff <= allowed).all())
+        max_grad_diff = max(max_grad_diff, grad_diff.max().item())
+        max_param_diff = max(max_param_diff, param_diff.max().item())
+        element = (name, stage, grad_diff, param_diff, want_grad, denom)
+        if worst_grad is None or grad_diff.max().item() > worst_grad["abs"]:
+            worst_grad = _worst(*element, int(grad_diff.argmax()))
+        excess = (param_diff - allowed).max().item()
+        if worst_param is None or excess > worst_param["excess"]:
+            index = int((param_diff - allowed).argmax())
+            worst_param = dict(_worst(*element, index), excess=excess)
     return {
         "grad_close": bool(grad_close),
         "step_close": bool(step_close),
         "max_grad_diff": max_grad_diff,
         "max_param_diff": max_param_diff,
+        "worst_grad": worst_grad,
+        "worst_param": worst_param,
         "owned": sorted(stage.logical_state_dict()),
         "tp_size": stage.tp_size,
         "reference_loss": record["loss"],
+    }
+
+
+def _worst(name, stage, grad_diff, param_diff, want_grad, denom, index):
+    """One element's full numeric story, for a failure message that explains itself."""
+    return {
+        "name": name,
+        "abs": grad_diff.max().item(),
+        "grad_diff_here": grad_diff.flatten()[index].item(),
+        "param_diff_here": param_diff.flatten()[index].item(),
+        "reference_grad_here": want_grad.flatten()[index].abs().item(),
+        "reference_grad_max": want_grad.abs().max().item(),
+        # How far the gradient is off relative to the tensor's own scale, and AdamW's
+        # divisor at this element -- ``eps``-sized means the update is ``lr * sign(g)``.
+        "rel": grad_diff.max().item() / max(want_grad.abs().max().item(), ATOL),
+        "denom_here": denom.flatten()[index].item(),
+        "tp_size": stage.tp_size,
     }
 
 
@@ -525,12 +586,24 @@ def _assert_matches_reference_after_resume(results, label):
         for record in result["iterations"]:
             if not record["trained"]:
                 continue
+            worst = record["worst_grad"]
             print(
                 f"{label} rank {result['rank']} iter {record['iteration']}: "
-                f"grad={record['max_grad_diff']:.2e} param={record['max_param_diff']:.2e}"
+                f"grad={record['max_grad_diff']:.2e} param={record['max_param_diff']:.2e} "
+                f"worst={worst['name']} rel={worst['rel']:.2e} "
+                f"ref_max={worst['reference_grad_max']:.2e}"
             )
-            assert record["grad_close"], (label, result["rank"], record)
-            assert record["step_close"], (label, result["rank"], record)
+            # The worst element's whole story: which tensor, how far the gradient is
+            # off in absolute and relative terms, how large the reference gradient is
+            # there, what the parameter did, and AdamW's divisor at that element.
+            detail = (
+                label,
+                f"rank {result['rank']} iter {record['iteration']}",
+                worst,
+                record["worst_param"],
+            )
+            assert record["grad_close"], detail
+            assert record["step_close"], detail
     # The replicas' losses partition the global batch, so they sum to the reference's.
     for iteration in range(1, CONFIG.iterations + 1):
         by_replica, reference_loss = {}, None

@@ -4,9 +4,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from torch.nn import functional as F
+
 from resihp.config import TrainConfig
 from resihp.model import ReferenceTransformer
-from resihp.reference import run_reference
+from resihp.reference import run_reference, _token_stream
 
 
 CONFIG = TrainConfig(
@@ -119,3 +121,39 @@ def test_layer_parameter_count_matches_memory_model():
 def test_short_sequence_is_rejected():
     with pytest.raises(ValueError):
         run_reference(CONFIG, vocab_size=VOCAB, sequence_length=1)
+
+
+def test_cuda_and_cpu_agree_at_float32():
+    """Control for principle A's numeric band: identical math, different device.
+
+    Nothing distributed happens here -- one model, one batch, one backward, run on two
+    devices from the same seed. What it measures is therefore only what the device's
+    kernels do to identical FP32 arithmetic, which is the floor under every
+    distributed comparison in the suite. That makes it the guard on the precision
+    ``resihp.model`` pins: TF32 answers a GEMM to ten mantissa bits and puts this at
+    ~1e-3 relative, three orders of magnitude above IEEE FP32, and the eight-process
+    gates fail with it. The band here is ~8 ulps of the largest gradient.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    def gradients(device):
+        torch.manual_seed(CONFIG.seed)
+        model = ReferenceTransformer(CONFIG, vocab_size=VOCAB, sequence_length=SEQLEN).to(device)
+        tokens = _token_stream(VOCAB, SEQLEN, CONFIG.batch_size, 1, CONFIG.seed)[0].to(device)
+        logits = model(tokens)
+        F.cross_entropy(
+            logits[:, :-1].reshape(-1, VOCAB), tokens[:, 1:].reshape(-1)
+        ).backward()
+        return {
+            name: param.grad.detach().cpu()
+            for name, param in model.logical_state_dict().items()
+        }
+
+    cpu, cuda = gradients(torch.device("cpu")), gradients(torch.device("cuda"))
+    worst = max((cuda[name] - cpu[name]).abs().max().item() for name in cpu)
+    scale = max(tensor.abs().max().item() for tensor in cpu.values())
+    assert worst <= 1e-6 * scale, (
+        f"CUDA and CPU float32 disagree by {worst:.3e} on gradients up to {scale:.3e} "
+        f"(matmul precision: {torch.get_float32_matmul_precision()})"
+    )

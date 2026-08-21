@@ -30,6 +30,17 @@ from torch.nn import functional as F
 from .config import TrainConfig
 
 
+# Plan section 一 fixes the run at FP32, and principle A compares the distributed run
+# against the reference at the level of a few float32 ulps. On Ampere and later, CUDA
+# answers ``matmul`` with TF32 -- ten mantissa bits -- whenever the precision setting
+# allows it, which moves a single GEMM by ~1e-3 relative: the sharded and unsharded
+# forms of the same math then disagree by reduced precision rather than by
+# reassociation, and the comparison stops measuring anything. The setting is a
+# process-wide default that has changed across torch versions, so the run pins it here
+# rather than inheriting it. This module is imported by every process that builds a
+# model -- reference or sharded -- which makes it the one place that covers them all.
+torch.set_float32_matmul_precision("highest")
+
 #: MLP hidden width as a multiple of ``model_dim``.
 MLP_RATIO = 4
 

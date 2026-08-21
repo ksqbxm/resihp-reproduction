@@ -771,3 +771,81 @@ NCCL 要求**同一通信器上所有 rank 按相同顺序入队**。rank 1/3 �
 **复核过、确认无误的点**：checkpoint writer 在序列中会换人（rank 0 中途死掉后由 `plan.active_ranks[0]` 接手，T14 的修复），门禁期望的 `[completed, version] == [最后事件轮次, 事件数-1]` 在停止与不停止两种收尾下是同一个式子；2 个 micro-batch 下「各 replica loss 之和 == 参考整批 loss」仍成立（等分微批时逐微批均值的均值就是整批均值），空 replica 贡献 0 也不破坏它；`_plan_by_iteration` 对「中途停止」与「跑满」两种收尾都给出正确映射。
 
 遗留问题：分布式门禁本机无法执行，需在目标机跑完 10 项后才能把状态改为「已验证」。
+
+---
+
+## T16 / T17 目标机门禁修复（两个独立根因）
+
+状态：**根因已定位并修改，待目标机复跑确认**（本机无 torch / 无 GPU，无法执行分布式门禁；下面每条结论都给出了它所依据的证据，以及一条可被证伪的预测）。
+
+改动文件：`resihp/model.py`（生产代码，1 行 + 注释）、`tests/test_reference.py`（新增 1 个对照门禁）、`tests/test_end_to_end.py` 与 `tests/test_fault_sequences.py`（诊断 + 参数比较口径）。
+
+### 根因一：CUDA 上的 GEMM 不是 IEEE FP32（TF32），影响全部 NCCL 门禁
+
+**症状**：同一份代码、同一个比较，Gloo/CPU 梯度差 `9.3e-09 ~ 3.5e-08`，CUDA/NCCL 上 `3.9e-06 ~ 1.8e-05`——**差了 500~1000 倍**，且 T16 与 T17 的 5 个 NCCL case 全部在同一处失败，其中多个发生在第一次故障**之前**，与 recovery / donor / reshard 无关。
+
+**证据链**（不是"差值小就放过"，而是"这个差值不可能来自 FP32"）：
+
+1. 分片与参考之间的结构性差异**与设备无关**：只有 `out_proj` / `fc2` 是按输入维分片（`shard_dim=1`），把 K=16 的点积拆成 8+8 再 all-reduce；`q/k/v/fc1` 按输出维分片，K 不变。所以两条路径的算术差异在 CPU 和 GPU 上是同一个。
+2. CPU 侧的实测告诉我们这张网络对扰动的**放大系数约等于 1**：一个 ulp 级的扰动穿过 6 层前反向之后仍是 `~3e-08`，相对梯度量级就是 1 个 ulp。
+3. 因此 GPU 上 500~1000 ulp 的差异只能来自**单个算子本身的精度**，而不是重结合或放大。
+4. 本仓 attention 是手写 `@` + `softmax`（**没有 SDPA**），MLP 是 `F.linear`——GPU 与 CPU 之间唯一会换实现的就是 GEMM。TF32 的尾数是 10 位（相对 ~5e-4），落在量级 0.03~0.1 的梯度上正好是 `1.5e-05 ~ 5e-05`，与实测的 `1.8e-05` 同量级。
+
+**修法（生产代码）**：`resihp/model.py` 模块级 `torch.set_float32_matmul_precision("highest")`。计划「一」把整个 run 锁在 FP32，原则 A 又要求在几个 ulp 的尺度上跟参考比对；TF32 是**进程级默认值**且在 torch 各版本间变过，所以这条数值契约必须像种子一样被显式钉死，而不是继承默认。放在 `model.py` 是因为它是**唯一**被所有会做模型算术的进程导入的模块（参考路径直接导入它，分布式路径经 `recovery` → `model`），planner 那条无 torch 的路径不导入它，因此仍然保持无 torch 可测。
+
+**新增对照门禁** `tests/test_reference.py::test_cuda_and_cpu_agree_at_float32`：同一个模型、同一批数据、同一个种子，在 CPU 和 GPU 上各跑一次前反向，比较梯度。**全程没有任何分布式成分**，所以它测到的就是"设备内核对同一份 FP32 算术做了什么"，也就是全套门禁的误差地板。TF32 下它会以 ~1e-3 相对误差失败，IEEE FP32 下停在几个 ulp。它同时是这条精度钉死的守卫：TF32 一旦回来，先炸的是这个只需 1 张卡的用例，而不是 8 进程门禁。
+
+**可证伪的预测**：目标机上 `test_cuda_and_cpu_agree_at_float32` 在改动前失败（差值 ~1e-5 量级）、改动后通过；若它**改动前就通过**，则本条诊断错误——那说明 GPU 侧的 GEMM 本来就是 IEEE FP32，1.8e-05 另有来源，需要用新加的 `worst_grad` 诊断重新定位。
+
+### 根因二：AdamW 第一步把接近零的梯度差放大成参数差（`donor_exhaustion` Gloo）
+
+**症状**：`grad_close=True` 而 `step_close=False`，发生在 rank 0、`cursor=0`，即**第一次故障之前的第一轮**——同样与 donor fallback 无关。
+
+**证据（排除法 + 一个恒等式）**：第 1 轮里，参数只由四样东西决定：初始权重（两边同种子、同构造顺序，逐位相同）、优化器状态（两边都是空的）、超参（两边都取自 `resihp.reference` 的同一组常量）、梯度。前三样在第 1 轮全部相同，而梯度已被 `grad_close` 判为一致——所以参数差**只能**是梯度差经 AdamW 的更新映射产生的。已核对 `TensorParallelStage.local_shards()` 的每一项都是 `nn.Parameter` 且等于 `parameters()`，排除了"某个参数根本没被 optimizer 更新"这一非数值解释。
+
+再看 AdamW 在 step 1 的恒等式（torch 实现，`bc1 = 1-β1`、`bc2 = 1-β2`）：
+
+```
+Δp = -(lr/bc1) · (1-β1)g / ( sqrt((1-β2)g²)/sqrt(bc2) + eps ) = -lr · g/(|g|+eps)
+```
+
+即 **step 1 的更新就是 `lr·sign(g)`**（`|g| ≫ eps` 时），在 `g → 0` 处不是 Lipschitz 的：`|g| ≲ eps = 1e-8` 时，一个 `1e-8` 的重结合噪声就能把更新从 `+lr` 翻到 `-lr`，参数差达 `2·lr = 2e-3`。而 LayerNorm 的 bias 初始化为 **0**，走完一步后 `|p| ≈ lr = 1e-3`，`rtol·|p| + atol` 只有 `1.01e-05`——差了两个数量级。DP2 下两个 replica 的梯度求和还会制造额外的相消，正是"某个分量恰好接近零"的来源。
+
+**修法（测试口径，不是放宽容差）**：梯度仍然用原来的 `rtol=1e-4 / atol=1e-5` 严格比，**一个字没动**；参数改为按 AdamW 自己的条件数给出逐元素允许量：
+
+```
+allowed = atol + rtol·|p_ref| + 2·lr·|Δg| / denom        # denom = sqrt(v̂)+eps，从参考优化器里读回来
+```
+
+这不是一个拍脑袋的阈值，而是"观测到的梯度差经过更新映射之后最多能变成多大的参数差"这一上界。已用纯数值验证（脚本不入库）：
+
+- **上界成立**：在 `g`、`Δg` 各跨 12 个数量级、含正负号与零的网格 + 40 万随机样本上，`真实|Δp| / allowed` 的最大值为 **0.9998**——既没有超过 1（不会假失败），也贴着 1（不松）。
+- **系数 2 是必需的**：只用一阶项（系数 1）时最坏比值 **1.9995**，会低估 2 倍；而且这个角落是**可达的**——`|g_ref| ≲ 1e-7` 时，一个仍在 `grad_close` 带内的梯度差就足以翻转符号。系数 2 的依据是 `|m̂/(sqrt(v̂)+eps)| ≤ 1`，所以两次更新至多相差 `2·lr`。
+- **不损失检出力**：健康分量上这一项是 `7e-10`（CPU 噪声地板）到 `3.6e-07`（GPU 地板），相对 `atol=1e-5` 可忽略，参数比较仍是原来的强度；而三类真实缺陷——恢复时矩状态丢失（`|Δp|~3e-04`）、bias correction 用错步数（`~1e-04`）、参数根本没被更新（`~lr`）——**梯度都不变，因此允许量恰好是 0**，全部照抓。
+
+**遗留的已知盲区（记录，不掩盖）**：梯度比较用的是绝对带 `atol=1e-5`，所以量级低于 `1e-5` 的梯度分量本身就验不出相对误差；这类分量的参数差也随之被上面的允许量放行。它们由"整张量的 `torch.equal` 对 checkpoint"和梯度的绝对带共同兜住，但确实不构成逐分量的相对验收。要收紧它需要先在目标机上量出 NCCL 的真实噪声地板（见根因一），属于后续。
+
+**可证伪的预测**：目标机上 `donor_exhaustion` 的失败元素，其新诊断 `worst_param` 应显示 `denom_here ≈ 1e-08`（即 eps 主导）且 `reference_grad_here ≈ 0`；若它显示的是一个健康的 `denom`，那本条诊断错误，是真 bug 而不是条件数问题。
+
+### 诊断增强（两个门禁模块）
+
+`_compare_shards` 现在记录**最坏那个元素的完整故事**，失败信息里直接可读：张量名、梯度绝对差与相对该张量量级的相对差、该元素处的参考梯度、参考梯度的最大值、该元素处的参数差、AdamW 在该元素处的除数 `denom`、`tp_size`，以及参数超出允许量多少（`excess`）。T16 每轮的 `-s` 打印也带上了最坏张量名与相对差。这样"1.8e-05 到底算大还是算小"不再需要猜——报告里同时有分母和参考量级。
+
+### 为什么可以断定不是 recovery / donor 的问题
+
+- T16 NCCL 的首个失败在 **iteration 2**，T17 的 `donor_exhaustion` 在 **iteration 1**、`interval_n`/`interval_2n`/`random_*` 的失败 `cursor` 分别是 1、1、2、1——**全部早于各自的第一次故障注入**（分别在 iteration 2、1、4、2、1 之后才注入）。故障还没发生，恢复链路一次都没被调用过。
+- 两处修改都不在 `recovery.py` / `reshard.py` / `checkpoint.py`：一处是 `model.py` 的精度契约，一处是测试的比较口径。
+- 计划 / digest 一致、数据不重不漏、layer 与 micro-batch·stage 不重不漏、失效 rank 永久退出、进程组与 checkpoint 文件无泄漏、恢复前 `torch.equal` 等于 checkpoint——**这些断言一条都没有放松**，本轮只改了参数这一项的数值口径，梯度带保持原值。
+
+### 本机验证
+
+`python -m pytest -q`：**81 passed, 11 skipped**（无 torch，分布式与 GPU 门禁在收集阶段整模块 skip）。T17 的离线回放 + 24 项变异全部仍被捕获，28 个计划的集合通信顺序核对仍通过。
+
+### 目标机需要执行
+
+```
+python -m pytest tests/test_reference.py -v -s          # 先看对照门禁：它单独回答根因一
+python -m pytest tests/test_end_to_end.py -v -s
+python -m pytest tests/test_fault_sequences.py -v -s
+python -m pytest -q
+```
