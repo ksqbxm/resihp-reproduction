@@ -72,6 +72,7 @@ import math
 import os
 import socket
 import time
+import types
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
@@ -451,6 +452,63 @@ def _resources(label, control, result_dir, device) -> dict:
     }
 
 
+def _iteration(control, plan, rank, iteration, wanted):
+    """Run one iteration and describe it, holding on to nothing when it returns.
+
+    The whole per-iteration body lives here for one reason: it touches the runtime,
+    the stage and their parameters, and *any* of those left bound in the caller would
+    outlive the next safe point and keep the generation it replaced alive -- which is
+    exactly what ``_sentinel`` must be free to observe. A function frame makes that
+    structural: every reference dies with the call, rather than depending on nobody
+    ever adding one more local to a loop body.
+    """
+    record = {"iteration": iteration, "trained": False}
+    if control.training_run is None:
+        return record
+    stage = stage_of(plan, rank)
+    record["cursor"] = control.training_run.cursor  # the batch about to be read
+    record["replica"] = stage.replica_id
+    record["layers"] = list(range(*stage.layer_range))
+    record["loss"] = control.training_step()  # step 1: complete this iteration
+    record["trained"] = True
+    runtime = control.training_run.runtime
+    record["processed"] = [[route["micro_batch"], route["stage_id"]] for route in runtime.routes]
+    record["activation_peak"] = runtime.activation_log.peak
+    record["activation_drained"] = runtime.activation_log.live == set()
+    record.update(_compare_shards(control.training_run.stage, wanted))
+    return record
+
+
+def _owners(sentinel):
+    """What is still holding a generation that should be gone, named well enough to fix.
+
+    A bounded walk out from the surviving parameter: the objects that reference it,
+    then the objects that reference *those*, so the answer is the retaining chain
+    (``DataParallelRuntime``, ``TensorParallelStage``, ...) rather than the parameter's
+    nearest container. Frames do not appear -- CPython keeps a function's locals in an
+    array the collector does not walk -- but a live runtime is already the whole story:
+    something is still bound to the generation.
+    """
+    alive = sentinel()
+    if alive is None:
+        return []
+    seen, frontier, found = {id(alive)}, [alive], set()
+    for _ in range(3):
+        step = []
+        for obj in frontier:
+            for referrer in gc.get_referrers(obj):
+                if id(referrer) in seen or referrer is frontier or referrer is step:
+                    continue
+                seen.add(id(referrer))
+                if isinstance(referrer, (dict, list, tuple, set)):
+                    step.append(referrer)  # a container: keep walking to its owner
+                elif not isinstance(referrer, types.FrameType):
+                    found.add(type(referrer).__name__)
+                    step.append(referrer)
+        frontier = step
+    return sorted(found)
+
+
 def _sentinel(run):
     """A weakref to one of ``run``'s parameters, or ``None`` when it holds no state.
 
@@ -506,22 +564,7 @@ def _run_sequence(rank, world_size, device, backend, case_name, result_dir):
 
     for step in range(config.iterations):
         iteration = step + 1
-        record = {"iteration": iteration, "trained": False}
-        if control.training_run is not None:
-            stage = stage_of(plan, rank)
-            record["cursor"] = control.training_run.cursor  # the batch about to be read
-            record["replica"] = stage.replica_id
-            record["layers"] = list(range(*stage.layer_range))
-            record["loss"] = control.training_step()  # step 1: complete this iteration
-            record["trained"] = True
-            runtime = control.training_run.runtime
-            record["processed"] = [
-                [route["micro_batch"], route["stage_id"]] for route in runtime.routes
-            ]
-            record["activation_peak"] = runtime.activation_log.peak
-            record["activation_drained"] = runtime.activation_log.live == set()
-            record.update(_compare_shards(control.training_run.stage, reference[iteration - base]))
-        iterations.append(record)
+        iterations.append(_iteration(control, plan, rank, iteration, reference[iteration - base]))
 
         victim = schedule.get(iteration)
         if victim is None:
@@ -548,6 +591,7 @@ def _run_sequence(rank, world_size, device, backend, case_name, result_dir):
                 # one this event superseded has to be unreachable once the collector has
                 # run, whether this rank was rebuilt or dropped entirely.
                 "released_previous": replaced is None or replaced() is None,
+                "held_by": [] if replaced is None else _owners(replaced),
             }
         )
         resources.append(_resources(f"event{iteration}", control, result_dir, device))
@@ -580,6 +624,7 @@ def _run_sequence(rank, world_size, device, backend, case_name, result_dir):
     control.training_run = None
     gc.collect()
     result["released_final"] = final is None or final() is None
+    result["final_held_by"] = [] if final is None else _owners(final)
     resources.append(_resources("shutdown", control, result_dir, device))
     result["resources"] = resources
     return result
@@ -791,8 +836,8 @@ def _assert_no_leaks(results, case, label):
         # released the last one on the way out (``_resources`` says why this is a
         # weakref rather than a byte count).
         for event in result["events"]:
-            assert event["released_previous"], (label, result["rank"], event)
-        assert result["released_final"], (label, result["rank"])
+            assert event["released_previous"], (label, result["rank"], event["held_by"], event)
+        assert result["released_final"], (label, result["rank"], result["final_held_by"])
         baseline = result["resources"][0]["groups"]  # the control group, before any build
         for snapshot in result["resources"]:
             if snapshot["at"] == "shutdown":

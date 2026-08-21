@@ -891,3 +891,50 @@ python -m pytest -q
 ### 本机验证
 
 `python -m pytest -q`：**81 passed, 11 skipped**；离线回放五个场景健康流水全过、25 项变异全捕获；28 个计划的集合通信顺序静态核对通过。
+
+
+---
+
+## T17 weakref 门禁的首轮失败：强引用在测试自己这一侧
+
+状态：**根因已在本机可运行地证明，修改已落地，待目标机复跑确认**。上一轮换成 weakref 之后，10/10 个 case 全部在**第一次** generation replacement 处 `released_previous == False`，Gloo 与 NCCL 结果完全一致。
+
+改动文件：`tests/test_fault_sequences.py`（唯一；**没有动 production**）。
+
+### 根因：`_run_sequence` 训练循环里的 `runtime` 局部变量
+
+循环体里有一行
+
+```python
+runtime = control.training_run.runtime
+```
+
+它绑定的是 `DataParallelRuntime`，而 `DataParallelRuntime` 持有 `stage`、`optimizer`，`stage` 又持有全部 `Parameter`。Python 的函数局部变量**跨循环迭代存活**，所以当 `safe_point → recover()` 把 `control.training_run` 换成新一代之后，`runtime` 仍然指着**旧的那一代**——以旧 `Parameter` 为目标的 weakref 必然还活着。
+
+这与观测到的每一个特征都对得上：Gloo/NCCL 一致（纯 Python 引用，与后端无关）、所有 case 都失败（每个 case 都跑这段循环）、全部在第一次替换就失败（第一次迭代就绑定了）、`released_previous` 恒为 False。
+
+**本机可运行的证明**（scratch 脚本不入库，无需 torch）：用同构对象图 `PlannedRun → runtime → stage → parameter` 复现，循环体里保留 `runtime = run.runtime` 时 sentinel 在 `gc.collect()` 后**仍然存活**，且 `gc.get_referrers` 的有界外扩walk 报出 `['Runtime', 'Stage']`；把同一段循环体搬进一个函数后，sentinel **被释放**。两种写法的唯一差别就是那个局部绑定。
+
+### 修法：把每轮的循环体搬进 `_iteration(...)`
+
+不是加 `del runtime`，而是让"不残留引用"成为**结构性事实**：每轮的记录逻辑整段移进一个函数，它的 frame 一返回，`runtime` / `stage` / 参数的每一个引用都随之消失。`del` 依赖后来者记得，函数边界不依赖。
+
+逐行核对过 `_run_sequence` 里其余每一处触碰 run 的地方，全部是**语句级临时量**：`bool(next(stage.parameters()).is_cuda)` 两处、`_sentinel(...)`、`_matches_anchor(...)`、`.cursor`——都在语句结束或函数返回时释放，没有第二个跨安全点的绑定。
+
+### 顺带补上：失败时报出真正的持有者
+
+`_owners(sentinel)`：从存活的参数出发做**有界外扩**（三跳），穿过容器、收集非容器持有者的类型名，写进 `held_by` / `final_held_by`，出现在断言失败信息里。sentinel 已死时它立刻返回 `[]`，所以正常路径的代价只有一次弱引用解引用。
+
+说明一点：**frame 不会出现在结果里**——CPython 把函数局部变量放在 fast-locals 数组里，`gc` 不遍历它。但"有一个活着的 `DataParallelRuntime`"本身就已经指明了问题：还有东西绑着那一代。已用同一个 scratch 脚本验证这个 walk 确实能报出 `['Runtime', 'Stage']` 而不是只报参数的最近容器。
+
+### 为什么不改 production
+
+`recover()` 把旧 run 作为实参接进去、返回新 run 之后，旧 `PlannedRun` 只被自己的调用帧引用，帧一返回就没了；`local_state()` 交出去的是 `param.detach()`（**新的 Tensor 对象**，只共享 storage，不持有旧 `Parameter`），新 stage 再 `.detach().clone()` 出独立 storage。production 这条链上没有跨代残留。若消掉测试侧引用后仍然为假，`held_by` 会直接给出持有者类型，那时才该动 production。
+
+### 保留的断言
+
+`released_previous` 与 `released_final` **两条都在**，且仍然对 Gloo 与 NCCL 全部 10 个 case 生效。进程组、临时文件、checkpoint 可重载、恢复前 `torch.equal`、plan/digest 一致、数据不重不漏、layer 与 micro-batch·stage 不重不漏、失效 rank 永久退出——一条未动。
+
+### 本机验证
+
+`python -m pytest -q`：**81 passed, 11 skipped**；离线回放五场景健康流水全过、变异测试 **25/25 全捕获**；28 个计划的集合通信顺序静态核对通过；上述强引用机制的同构复现两种写法结论相反，证明修法针对的就是它。
