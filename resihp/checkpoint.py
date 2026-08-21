@@ -115,6 +115,21 @@ def _torch_load(path: Path) -> dict:
         return torch.load(path)
 
 
+def _read_payload(path: Path) -> dict:
+    """Read a checkpoint file, naming a missing or unreadable one as its own root cause.
+
+    Both loaders go through here so they cannot drift apart on what a bad file looks
+    like: a caller must never have to catch ``FileNotFoundError`` from one and
+    :class:`CheckpointError` from the other.
+    """
+    if not path.exists():
+        raise CheckpointError(f"checkpoint 缺失: {path}")
+    try:
+        return _torch_load(path)
+    except Exception as error:
+        raise CheckpointError(f"checkpoint 损坏，无法读取 {path}: {error}") from error
+
+
 def save_checkpoint(path: str | Path, run: ReferenceRun, *, plan_version: int = 0) -> Path:
     """Atomically write ``run``'s state to ``path``, keeping only the latest."""
     if type(plan_version) is not int or plan_version < 0:
@@ -218,13 +233,7 @@ def load_anchor(path: str | Path) -> tuple[dict[str, dict[str, torch.Tensor]], i
     only in the running processes. ``completed_steps`` is the iteration count the
     checkpoint resumes from, which is also the data cursor (plan 3.1).
     """
-    path = Path(path)
-    if not path.exists():
-        raise CheckpointError(f"checkpoint 缺失: {path}")
-    try:
-        payload = _torch_load(path)
-    except Exception as error:
-        raise CheckpointError(f"checkpoint 损坏，无法读取 {path}: {error}") from error
+    payload = _read_payload(Path(path))
     _verify_digest(payload)
     anchor = {}
     for name, param in payload["params"].items():
@@ -238,7 +247,7 @@ def load_anchor(path: str | Path) -> tuple[dict[str, dict[str, torch.Tensor]], i
 
 def load_checkpoint(path: str | Path, run: ReferenceRun) -> tuple[int, int]:
     """Validate and load a checkpoint into ``run``; return ``(completed_steps, plan_version)``."""
-    payload = _torch_load(Path(path))
+    payload = _read_payload(Path(path))
     _validate(payload, run)
     _restore(payload, run)
     return payload["completed_steps"], payload["plan_version"]

@@ -75,7 +75,9 @@ class PipelineRuntime:
     ``stage`` is this rank's :class:`resihp.parallel.tp.TensorParallelStage`.
     ``stage_ranks`` are the **global** ranks of the stages in pipeline order, so
     this rank's neighbours are its adjacent entries; ``group`` is the process group
-    the transfers ride on. :meth:`train_step` runs the schedule and applies one
+    the transfers ride on, and must contain *exactly* those ranks: NCCL runs batched
+    P2P on the group's own collective communicator, so a member that sits out the
+    schedule would leave that communicator's operation order mismatched. :meth:`train_step` runs the schedule and applies one
     AdamW WeightUpdate; :attr:`schedule` records the forward/backward primitives it
     issued, in order.
     """

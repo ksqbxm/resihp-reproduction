@@ -502,3 +502,45 @@ v2  planner 想要   members=(2,3)                        <- rank 3 从未失效
 - 新增回归用例：`tests/test_plan.py` —— 全灭由 PP planner 命名、早已清空的 replica 不作为证据、DP 拒绝装不下的最终布局、失效 rank 两条复活路径均被拒、健康闲置 rank 可被重新选中、累计故障序列不掉出六条分类、同故障序列摘要逐版本一致；`tests/test_recovery.py` —— 失去座位的 rank 一律整段重取、三个 planner 码由**真实重规划**产生（同时校验 `STOP_SCENARIOS` 表诚实）。
 - 六条一致停止的分布式门禁现在**全部走真实 `safe_point → build_plan`**：`no_executable_pp`（world 2，杀 1 再杀 0）与 `no_feasible_dp_target`（`TP1×PP2×DP1`，stage 1 死后 stage 0 吃下全部层并越过预算）不再注入 reason 对象；仅 `plan_disagreement` 仍注入——确定性重规划无法自己和自己不一致，被测的是控制面的反应。
 - 新增恢复门禁 `*_reseat`（`TP4×PP1×DP1`，连杀 0、1）：断言健康闲置 rank 3 被重新启用、rank 2 与 rank 3 在事件②整段重取、且所有在座 rank 恢复到**同一个 cursor**。
+
+### 目标机门禁执行修正（3 failed → 根因与修复）
+
+#### A. `checkpoint_unusable`（Gloo + NCCL 同时失败）——场景前提自相矛盾 + 两个 loader 契约不一致
+
+- **场景前提错**：注入手段是**删除唯一的 checkpoint**，同时又断言「停止后最后有效 checkpoint 可重载」。计划 3.6 明写「只保留当前恢复所需的**唯一最新** checkpoint」，所以「该 checkpoint 不可用」与「还有一个有效 checkpoint 可重载」在同一条件下不可能同时成立。改为**篡改**而不是删除：文件仍可 `torch.load`，被拒的是**存储的内容摘要**（正是 T14 加的那一项），且留下一个可以被证明「停止路径没碰过」的文件。断言相应改为该条件真正欠下的保证——`tmp_left` 为假（写入始终原子）、文件字节与故障注入后**逐字节一致**（停止路径没写、没换、没删）、且根因确为「摘要不匹配」。**没有跳过 reload 断言**：其余五条仍断言 `[events, events-1]` 可重载；只有这一条的**主语就是那唯一的 checkpoint**，故换成更强的原子性断言并在测试里写明理由。
+- **顺带暴露的实现缺陷**：`load_anchor` 会检查文件是否存在并抛 `CheckpointError("checkpoint 缺失")`，而 `load_checkpoint` 直接 `_torch_load`，漏出裸的 `FileNotFoundError`——同一个模块的两个 loader 对「坏文件」给出两种契约，调用方得同时 catch 两类异常。抽出**唯一**的 `_read_payload(path)`（缺失 / 不可读各自指名根因）供两者共用。`tests/test_checkpoint.py` 10/10 不受影响（它们篡改的是已存在的文件）。
+
+#### B. `test_recovery_cuda_nccl[pipeline]` 挂死——batched P2P 跑在**整组的集合通信器**上
+
+根因（torch `ProcessGroupNCCL::pointToPoint`）：
+
+```
+batchP2P = coalescing_state_ & CoalActive          # batch_isend_irecv 会置位
+if batchP2P: key = getKeyFromDevice(device)        # -> 该 group 的集合通信器
+else:        key = getKeySendRecv(rank, peer)      # -> 只含两个 peer 的通信器
+```
+
+`DataParallelRuntime._send/_recv` 用 `batch_isend_irecv`（每次只有**一个** op），于是边界 P2P 落在 **executor group 的集合通信器**上。该通信器上各 rank 的入队顺序变成：
+
+| rank | executor-group 通信器上的入队顺序 |
+|---|---|
+| 0 | send(m0), send(m1), recv(g m1), recv(g m0), all_gather |
+| 1 | all_gather |
+| 2 | recv(m0), recv(m1), send(g m1), send(g m0), all_gather |
+| 3 | all_gather |
+
+NCCL 要求**同一通信器上所有 rank 按相同顺序入队**。rank 1/3 完全没有那四个 P2P，于是它们的 `all_gather` 与 rank 0/2 的 P2P launch 配对 → 挂死。
+
+**修复**：边界 hop 改用**非批量**的 `dist.isend` / `dist.irecv`（每次本来就只有一个 op，批量毫无意义）。非批量 P2P 拿到的是「只含两个 peer」的通信器，executor group 的集合通信器上只剩 DP 合并的 `all_gather`，四个 rank 顺序一致。
+
+**为什么不影响已通过的路径**：
+
+- `replicated` / `reseat`：`pp=1`，单 stage 既是首也是尾，`_send`/`_recv` **一次都不会被调用**，零影响。
+- Gloo 的 `pipeline`：`batch_isend_irecv` 的非 CUDA 分支本身就是逐个调用 `isend`/`irecv`；单 op 时新旧写法走的是**同一段代码**，逐字等价。
+- T12 `PipelineRuntime` **未改**：它融合的是 send+recv **两个** op，批量是必需的（其 docstring 已论证拆开会确定性死锁）；其 group 本就恰好是流水线的那几个 rank。已在 docstring 补上这条前置条件，免得后来者把带旁观者的 group 传进去踩同一个坑。
+
+**离线回归**：`sim_dp_pipeline.py` 现在按通信器记录每个 rank 的入队序列，并断言「集合通信器上各 rank 顺序一致 / P2P 对通信器两侧互为镜像」。修复后 executor 组通信器上只有 `all_gather_object`（四 rank 一致），边界在 `p2p (0,2)` 上镜像；把 P2P 按修复前的归属回放，该断言如期报 MISMATCH——证明这条检查确实承重。
+
+**诊断设施**（测试侧，无生产改动、未放宽超时、未 skip）：每个 worker 用 `faulthandler.dump_traceback_later` 定时把自己的 Python 栈写到 `stack_<rank>.txt`；`_spawn` 超时失败时把各 rank 的栈一并打进报错。下次若再挂，报错本身就会指明每个 rank 卡在哪个 distributed 操作。
+
+本机验证：全量 **81 passed, 8 skipped**；三个离线仿真全过；入口正常。目标机需重跑 `python3 -m pytest -q tests/test_recovery.py` 复核 27 项。

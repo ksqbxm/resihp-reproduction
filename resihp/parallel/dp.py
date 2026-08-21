@@ -200,13 +200,19 @@ class DataParallelRuntime:
         stages' leaders and the receiving group replicates it -- never a per-rank sum,
         which would double-count, and never a single rank holding it, which would
         starve the others.
+
+        The hop is a plain ``irecv``/``isend`` rather than a one-op
+        ``batch_isend_irecv``. NCCL runs *batched* P2P on the group's own collective
+        communicator, which would then have to be issued by every rank of ``group`` in
+        the same order -- but only the two stage leaders take part in a boundary hop,
+        while the other ranks are meanwhile issuing the DP combine on that same
+        communicator, and the mismatched order deadlocks. Un-batched P2P gets a
+        communicator for just the two peers, which is what this operation actually is.
         """
         buffer = torch.empty(shape, device=device)
         leader = route["executors"][0]
         if self.rank == leader:
-            op = dist.P2POp(dist.irecv, buffer, route[key][0], self.group)
-            for work in dist.batch_isend_irecv([op]):
-                work.wait()
+            dist.irecv(buffer, src=route[key][0], group=self.group).wait()
         if self.stage.tp_size > 1:
             dist.broadcast(buffer, src=leader, group=self.stage.group)
         return buffer
@@ -215,9 +221,10 @@ class DataParallelRuntime:
         """Push one authoritative copy from this stage's leader to the peer's."""
         if self.rank != route["executors"][0]:
             return
-        op = dist.P2POp(dist.isend, tensor.contiguous(), route[key][0], self.group)
-        for work in dist.batch_isend_irecv([op]):
-            work.wait()
+        # Bound to a name so the buffer outlives the transfer (see ``_recv`` on why
+        # this is un-batched P2P).
+        payload = tensor.contiguous()
+        dist.isend(payload, dst=route[key][0], group=self.group).wait()
 
     def train_step(self, tokens):
         """Run every routed micro-batch's forward then backward; return the last loss.

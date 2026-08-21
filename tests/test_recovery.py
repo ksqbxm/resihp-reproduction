@@ -49,6 +49,8 @@ tensors and real NCCL training groups (the control group stays Gloo on both, as 
 must). NCCL gates skip only when there are fewer GPUs than the case needs.
 """
 
+import faulthandler
+import hashlib
 import importlib.util
 import json
 import os
@@ -108,6 +110,9 @@ STOP_SCENARIOS = {
 }
 #: A rank stuck in a collective would hang the suite forever; fail the gate instead.
 JOIN_TIMEOUT = 180.0
+#: A blocked rank is invisible from outside, so each one dumps its own Python stack
+#: after this long. A hang then names the exact operation every rank is sitting in.
+STACK_DUMP_AFTER = 60.0
 
 requires_torch = pytest.mark.skipif(
     importlib.util.find_spec("torch") is None, reason="torch not installed"
@@ -150,6 +155,12 @@ def _free_port() -> int:
 
 def _layers_in(names):
     return sorted({int(name.split(".")[1]) for name in names if name.startswith("layers.")})
+
+
+def _file_digest(path):
+    """Hash a checkpoint file's bytes, or ``None`` when it is not there."""
+    path = Path(path)
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
 
 
 # --- pure: the plan is the only layout authority ----------------------------------
@@ -423,17 +434,28 @@ class _FaultInjector(ControlPlane):
 
     Injection lands *after* step 2 has written the pre-failure checkpoint, so what the
     safe point then meets is exactly the condition plan 3.6 names -- not a run that was
-    broken before it started.
+    broken before it started. It runs on the same rank the plan makes the writer, so
+    the fault always lands on the process that just produced the file.
     """
 
     kind = ""
+    corrupted = None
 
     def _commit_checkpoint(self, plan):
         super()._commit_checkpoint(plan)
-        if self.rank != 0:
+        if self.rank != plan.active_ranks[0]:
             return
         if self.kind == "checkpoint_unusable":
-            Path(self.checkpoint_path).unlink()
+            # Corrupt the payload the commit just wrote. The file still loads, so what
+            # rejects it is the stored digest. Corrupting rather than deleting also
+            # leaves a file whose bytes the stop path can be *shown* not to touch --
+            # deleting the only checkpoint would make the "preserved" claim vacuous.
+            from resihp.checkpoint import _torch_load
+
+            payload = _torch_load(Path(self.checkpoint_path))
+            payload["params"]["lm_head.weight"] = payload["params"]["lm_head.weight"] + 1.0
+            torch.save(payload, self.checkpoint_path)
+            self.corrupted = _file_digest(self.checkpoint_path)
         elif self.kind == "state_mismatch":
             # A replicated logical tensor now disagrees with the anchor it was just
             # written from, which is what the post-reshard verification has to catch.
@@ -517,6 +539,12 @@ def _run_stop(rank, world_size, device, code, backend, result_dir):
     result["initialized"] = dist.is_initialized()
     result["checkpoint"] = None
     if rank == 0:
+        # Atomicity: the stop path must not have written, replaced, or removed the
+        # checkpoint, and must not have left a half-written temporary behind.
+        result["tmp_left"] = Path(str(checkpoint) + ".tmp").exists()
+        result["checkpoint_untouched"] = (
+            control.corrupted is None or _file_digest(checkpoint) == control.corrupted
+        )
         try:
             completed, version = load_checkpoint(
                 checkpoint, ReferenceRun(config, vocab_size=VOCAB, sequence_length=SEQLEN)
@@ -536,6 +564,10 @@ def _worker(runner, rank, world_size, kind, result_dir, port, backend):
     )
     import torch.distributed as dist
 
+    # Kept open for the process's lifetime: faulthandler writes into it from a timer.
+    stack_file = Path(result_dir, f"stack_{rank}.txt").open("w")
+    faulthandler.dump_traceback_later(STACK_DUMP_AFTER, repeat=True, file=stack_file)
+
     device = torch.device("cpu")
     if backend == "nccl":
         torch.cuda.set_device(rank)
@@ -545,6 +577,7 @@ def _worker(runner, rank, world_size, kind, result_dir, port, backend):
     # carry object collectives; only the training groups switch to NCCL.
     dist.init_process_group(backend="gloo")
     result = runner(rank, world_size, device, kind, backend, Path(result_dir))
+    faulthandler.cancel_dump_traceback_later()
     Path(result_dir, f"result_{rank}.json").write_text(json.dumps(result))
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -578,7 +611,14 @@ def _spawn(target, world_size, kind, tmp_path):
         if time.monotonic() > deadline:
             for process in context.processes:
                 process.terminate()
-            pytest.fail(f"{kind}: not every rank exited before the timeout (a rank is blocked)")
+            stacks = "\n".join(
+                f"--- rank {peer} ---\n{Path(tmp_path, f'stack_{peer}.txt').read_text()}"
+                for peer in range(world_size)
+                if Path(tmp_path, f"stack_{peer}.txt").exists()
+            )
+            pytest.fail(
+                f"{kind}: not every rank exited before the timeout (a rank is blocked)\n{stacks}"
+            )
     return [
         json.loads(Path(tmp_path, f"result_{rank}.json").read_text()) for rank in range(world_size)
     ]
@@ -663,8 +703,16 @@ def _assert_consistent_stop(results, code, label, tmp_path):
         assert result["groups_are_prefailure"] or not result["groups_alive"], (label, result)
         assert result["initialized"] is False, (label, result)
 
+    assert not results[0]["tmp_left"], results[0]  # the write stayed atomic
+    assert results[0]["checkpoint_untouched"], results[0]  # the stop path wrote nothing
     if code == "checkpoint_unusable":
-        assert results[0]["checkpoint"] is None  # the injection is that it is gone
+        # The subject of this condition *is* the one checkpoint, and plan 3.6 keeps
+        # exactly one file -- so "the last valid checkpoint reloads" cannot apply here
+        # without contradicting the fault. What the stop path owes is the two
+        # assertions above: it left the file exactly as it found it. That it no longer
+        # loads is the condition, reported by its own root cause.
+        assert results[0]["checkpoint"] is None, results[0]
+        assert "摘要不匹配" in results[0]["checkpoint_error"], results[0]
     else:
         # One iteration ran before each event, so the last commit holds them all.
         assert results[0]["checkpoint"] == [events, events - 1], results[0]
