@@ -737,12 +737,12 @@ NCCL 要求**同一通信器上所有 rank 按相同顺序入队**。rank 1/3 �
 
 - **进程组**：在建任何训练组**之前**先采一个 `init` 快照作为基线，之后每个快照断言 `len(_world.pg_map) == 基线 + 2×(本 rank 是否在计划里)`——本 rank 的 TP 组与 executor 组，别的都不该有。既抓「重建一次多留一组」，也抓「建了一半」（TP 建了 executor 没建会差 1）。shutdown 后必须为 0。**基线是量出来的不是写死的**：第一版写的是「恰为 3 / 1」，那等于把 torch 怎么给默认组记账当成前提，目标机 torch 版本若记法不同会误报成缺陷；改成相对基线后，这条检查只依赖「`new_group` 只在成员 rank 上登记」这一条真正被测的性质。
 - **临时文件**：每次事件后 checkpoint 目录里恰好只有 `ckpt.pt`，**永远不出现 `ckpt.pt.tmp`**（原子写的残留），且训练开始前目录里没有任何 checkpoint。
-- **显存**：只断言**跑完后释放干净**（丢掉 run 与参考、`gc.collect()` 后 `memory_allocated()` 为 0）。**刻意不断言「逐事件不增」**：degree 减半时幸存 rank 合法地持有更大的分片、stage 吸层时持有更多层，写成不增就是错的，写成宽上界就是空的。逐事件的字节数仍然记录下来，便于失败时定位。
+- **显存**：断言**每次重配都释放掉被它取代的那一代**，以及**跑完后最后一代也被释放**——用 `weakref` 对该代的一个 parameter 取弱引用，`gc.collect()` 之后必须已死。选 parameter 而不是 stage 是因为它被持有得最全：stage 持有它、runtime 经 stage 持有它、optimizer 在 param_group 与矩状态的键上各持有一次，所以**任何一处残留都会让它活着**。**刻意不断言「逐事件不增」**：degree 减半时幸存 rank 合法地持有更大的分片、stage 吸层时持有更多层，写成不增就是错的，写成宽上界就是空的。字节数仍然记录，作为失败信息里的上下文。
 
 ### 本机能做到的验证（无 torch）
 
 1. **计划流实机核对**：`plan.py` 与 planner 不依赖 torch，直接跑 `build_plan` 把五条序列的每一版计划打出来核对过——`interval_n` v3 确实是「replica 0 的 stage 0 消失、stage 1 拿到 `[0,6)`」，`random_a` v7 确实是「只剩 rank 5、两个 micro-batch 都在它身上」，`donor_exhaustion` v3 确实给出 `checkpoint_restore`。
-2. **断言层离线回放 + 变异测试**（scratch 脚本不入库）：用假 torch 让测试模块可导入，再用**真实** `build_plan` 生成一份忠实的多 rank 运行流水（五个场景各一份），喂给门禁自己的 `_assert_sequence`。健康流水全部通过；随后逐一注入 **24 种缺陷**——漏执行 / 重复执行一个 micro-batch·stage、失效 rank 继续训练、cursor 回放、恢复前状态不等于 checkpoint、与参考发散、一次事件产生两个计划、rank 间 digest 不一致、某层无人拥有、失效 rank 复活为 active、多留一个进程组、残留 `.tmp`、shutdown 后仍占显存、shutdown 后仍有进程组、replica loss 不等于整批、同 stage 的两个 TP peer loss 分歧、两个 rank 停在不同原因、耗尽后仍继续、donor 类别不符、事件确认的失效集与计划不符、把基线组数改掉、最后 checkpoint 载不回——**24/24 全部被捕获**，不存在写了但永不触发的检查。
+2. **断言层离线回放 + 变异测试**（scratch 脚本不入库）：用假 torch 让测试模块可导入，再用**真实** `build_plan` 生成一份忠实的多 rank 运行流水（五个场景各一份），喂给门禁自己的 `_assert_sequence`。健康流水全部通过；随后逐一注入 **25 种缺陷**——漏执行 / 重复执行一个 micro-batch·stage、失效 rank 继续训练、cursor 回放、恢复前状态不等于 checkpoint、与参考发散、一次事件产生两个计划、rank 间 digest 不一致、某层无人拥有、失效 rank 复活为 active、多留一个进程组、残留 `.tmp`、被取代的那一代仍然活着、最后一代没被释放、shutdown 后仍有进程组、replica loss 不等于整批、同 stage 的两个 TP peer loss 分歧、两个 rank 停在不同原因、耗尽后仍继续、donor 类别不符、事件确认的失效集与计划不符、把基线组数改掉、最后 checkpoint 载不回——**25/25 全部被捕获**，不存在写了但永不触发的检查。
 3. **集合通信顺序静态核对（本轮新增）**：用真实 `executor_route` / `dp_assignment` 把 `DataParallelRuntime.train_step` 的**入队顺序**按通信器重放，覆盖五个场景发布的**全部 28 个计划**，断言「每个集合通信器上各成员顺序一致、成员表正确」与「每个 P2P 对两侧互为镜像」——全部通过。反证两条：把 TP broadcast 改成只有 leader 发（T14 修过的「非 leader 挨饿」）、把边界 recv 摘掉，均如期报错，说明这条检查承重。它挡的正是新形态（单 stage 兼首尾的 replica 与两 stage replica 混跑、同一 replica 内 degree 1 与 2 并存）可能带来的死锁。
 4. `python -m pytest -q`：**81 passed, 11 skipped**（新模块与其它分布式模块一样因缺 torch 在收集阶段整模块 skip；此前是 10 skipped）。
 
@@ -849,3 +849,45 @@ python -m pytest tests/test_end_to_end.py -v -s
 python -m pytest tests/test_fault_sequences.py -v -s
 python -m pytest -q
 ```
+
+
+---
+
+## T17 NCCL 门禁修复：显存泄漏检查用错了仪器
+
+状态：**根因已定位并修改，待目标机复跑确认**。前一轮的两个数值根因（TF32、AdamW 条件数）目标机已确认修复——T16 两项全过且 NCCL 的 `max_grad_diff` 从 ~1.8e-05 降到 ~1e-08~3e-08，T17 五个 Gloo case 全过（含原先失败的 `donor_exhaustion`）。剩下 5 个 NCCL case 全部只失败在 `_assert_no_leaks` 的 `cuda_bytes in (None, 0)`，shutdown 时约剩 17 MB，而 `groups == 0`、`is_initialized() == False`、checkpoint 目录只有 `ckpt.pt`。
+
+改动文件：`tests/test_fault_sequences.py`（唯一）。
+
+### 这 17 MB 不是泄漏——三条证据
+
+| 观测 | 说明 |
+|---|---|
+| **量级差 55 倍** | 本模型一代完整状态（param+grad+两个矩）`THREE_D` 是 312 KiB、`DONOR` 是 116 KiB。**即使每一代都泄漏**，八次事件也只有 2.75 MiB / 0.46 MiB。观测是 16.4 MiB。 |
+| **两个不同拓扑给出逐字节相同的数** | `donor_exhaustion`（4 rank / 2 层）与 `interval_2n`（8 rank / 6 层）都是 **17176576**。两者的状态量差 2.7 倍，若残留是运行状态，这不可能相等。 |
+| **不随事件数增长** | `interval_n`（4 次事件）= 17164288，反而**低于** `interval_2n`（2 次事件）= 17176576。 |
+
+结论：这是**进程级库开销**——cuBLAS / cuBLASLt 等在首次使用时从同一个缓存分配器取走 workspace，之后按进程生命周期持有，与 run 无关。
+
+### 为什么不是"把阈值调大"而是换仪器
+
+五个 case 之间的抖动是 **236 KiB**，而一代状态是 **312 KiB / 116 KiB**——**噪声底与信号同量级**。也就是说，无论阈值定在哪里，绝对字节数都分辨不出"泄漏了一代"这件事；它作为仪器的分辨率不够，不是刻度不对。加一次 warm-up 让基线包含 workspace 也救不回来：抖动本身就吃掉了信号。
+
+所以改成直接问那个精确的问题：**被取代的那一代还活着吗**。安全点前对该代的一个 parameter 取 `weakref`，安全点后 `gc.collect()`，断言它已死；跑完后对最后一代同样处理。选 parameter 而不是 stage，是因为它被持有得最全（stage、runtime 经 stage、optimizer 的 param_group 与矩状态键），**任何一处残留都会让它活着**；用弱引用则保证"观察这件事本身"不会把它留住。
+
+这条检查比原来的更强，而且**不再是 NCCL 专属**——Gloo 的 5 个 case 现在也一起检查了对象层面的释放；原来的字节断言在 CPU 上恒为 `None`，等于没检查。
+
+### 完备性
+
+- `cuda_bytes` 仍然记录，但**不再被断言**，且 `_resources` 的 docstring 写明了原因与实测数字（16.4 MiB 的地板、236 KiB 的抖动）。它出现在 groups / files 断言的失败信息里，作为定位上下文。
+- 进程组、临时文件、checkpoint 可重载三项断言**一个字没改**，恢复前 `torch.equal`、plan/digest 一致、数据不重不漏、layer 与 micro-batch·stage 不重不漏、失效 rank 永久退出同样未动。
+- 删掉了原先只为让字节断言成立而写的 `reference = None`——它的唯一用途随断言一起消失，不留残迹。
+- 离线回放 + 变异测试同步更新为 **25/25 全部被捕获**（新增「被取代的那一代仍然活着」「最后一代没被释放」两项，删掉已不成立的「shutdown 后仍占显存」）。
+
+### 可证伪的预测
+
+目标机上这 5 个 NCCL case 应全部转绿；若 `released_previous` / `released_final` 有任何一项为假，那就是**真的有一代没被释放**，是实现缺陷而不是测量问题——此时该看的是 `recovery.recover` 里旧 `PlannedRun` 的引用，而不是分配器。
+
+### 本机验证
+
+`python -m pytest -q`：**81 passed, 11 skipped**；离线回放五个场景健康流水全过、25 项变异全捕获；28 个计划的集合通信顺序静态核对通过。

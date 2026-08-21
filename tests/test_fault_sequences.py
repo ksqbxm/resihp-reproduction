@@ -48,10 +48,13 @@ and its executor group on top of the baseline measured before any training group
 built, and a dropped rank holds nothing beyond that baseline, so a rebuild neither
 accumulates groups nor leaves half a set; the checkpoint directory holds exactly one
 file and never a leftover
-``.tmp``; and after shutdown no process group and, on CUDA, not one allocated byte
-survives. Resident bytes *between* events are recorded but deliberately not asserted
-to be non-increasing: when a stage's degree halves, each surviving rank legitimately
-holds a larger shard, so a bound there would either be vacuous or wrong.
+``.tmp``; and no process group survives shutdown. That a reconfiguration *replaces*
+a generation rather than accumulating one is asserted on the generation itself -- the
+one each event superseded must be unreachable once the collector has run, and so must
+the last one when the run ends. Device bytes are reported but never asserted on:
+the allocator's floor is process-wide library workspace tens of times larger than any
+state this model holds, and its run-to-run spread is the size of a whole generation,
+so it cannot resolve what a weakref answers exactly (see ``_resources``).
 
 The gates run on CPU/**Gloo** and on GPU/**NCCL** with real device tensors and real
 NCCL training groups; the world group stays Gloo on both, as the control plane's
@@ -69,6 +72,7 @@ import math
 import os
 import socket
 import time
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -420,7 +424,19 @@ def _plan_record(plan) -> dict:
 
 
 def _resources(label, control, result_dir, device) -> dict:
-    """What must not accumulate across reconfigurations: groups, files, device bytes."""
+    """What must not accumulate across reconfigurations: groups and files.
+
+    ``cuda_bytes`` is carried for diagnosis only, never asserted on. cuBLAS and its
+    friends take their workspaces from the same caching allocator on first use and
+    hold them for the life of the process: on the eight-GPU target that floor is
+    ~16.4 MiB, which is *fifty times* the largest state a rank of this model could
+    hold, identical to the byte between a four-rank two-layer job and an eight-rank
+    six-layer one, and no larger after four fail-stops than after two. Worse, the
+    floor's run-to-run spread (~236 KiB) is the same size as one generation of state
+    (~312 KiB), so an absolute byte count cannot resolve the very thing it would be
+    asked to detect. What a leaked generation actually means -- the one a
+    reconfiguration replaced is still alive -- a weakref answers exactly (``_sentinel``).
+    """
     # ``_world.pg_map`` is the process groups this rank currently holds. It is torch's
     # own private registry and there is no public equivalent -- a leaked group is
     # invisible from anywhere else, which is exactly what has to be checked here.
@@ -433,6 +449,18 @@ def _resources(label, control, result_dir, device) -> dict:
         "files": sorted(path.name for path in Path(result_dir).glob("ckpt.pt*")),
         "cuda_bytes": torch.cuda.memory_allocated(device) if device.type == "cuda" else None,
     }
+
+
+def _sentinel(run):
+    """A weakref to one of ``run``'s parameters, or ``None`` when it holds no state.
+
+    A parameter is the strongest sentinel for "this generation is gone": the stage
+    holds it, the runtime holds it through the stage, and the optimizer holds it twice
+    over -- in its parameter group and as the key of its moment state -- so anything
+    that retains any part of the generation keeps this object alive. A weakref is used
+    so that watching it cannot itself be what keeps it alive.
+    """
+    return None if run is None else weakref.ref(next(run.stage.parameters()))
 
 
 def _run_sequence(rank, world_size, device, backend, case_name, result_dir):
@@ -498,12 +526,14 @@ def _run_sequence(rank, world_size, device, backend, case_name, result_dir):
         victim = schedule.get(iteration)
         if victim is None:
             continue
+        replaced = _sentinel(control.training_run)
         try:
             plan, failed = control.safe_point(config, plan, failed, victim, next_step=iteration)
         except ConsistentStop as stopped:
             stop = {"code": stopped.reason.code, "message": stopped.reason.message}
             resources.append(_resources("stop", control, result_dir, device))
             break
+        gc.collect()
         anchor, completed = load_anchor(checkpoint)
         plans.append(_plan_record(plan))
         events.append(
@@ -514,6 +544,10 @@ def _run_sequence(rank, world_size, device, backend, case_name, result_dir):
                 "completed": completed,
                 "matches_checkpoint": _matches_anchor(control.training_run, plan, rank, checkpoint),
                 "cursor": None if control.training_run is None else control.training_run.cursor,
+                # Reconfiguration must *replace* a generation, not accumulate one: the
+                # one this event superseded has to be unreachable once the collector has
+                # run, whether this rank was rebuilt or dropped entirely.
+                "released_previous": replaced is None or replaced() is None,
             }
         )
         resources.append(_resources(f"event{iteration}", control, result_dir, device))
@@ -540,11 +574,12 @@ def _run_sequence(rank, world_size, device, backend, case_name, result_dir):
     control.shutdown()
     result["initialized"] = dist.is_initialized()
 
-    # Drop everything this run allocated before the last snapshot: what is still held
-    # afterwards is held by nothing this rank can name, which is the definition of a leak.
+    # The generation still standing at the end has to go the same way every replaced
+    # one did, so the run leaves nothing of itself behind.
+    final = _sentinel(control.training_run)
     control.training_run = None
-    reference = None
     gc.collect()
+    result["released_final"] = final is None or final() is None
     resources.append(_resources("shutdown", control, result_dir, device))
     result["resources"] = resources
     return result
@@ -750,13 +785,18 @@ def _assert_principle_a(results, case, label):
 
 
 def _assert_no_leaks(results, case, label):
-    """Groups, files, and device bytes never accumulate, and the checkpoint reloads."""
+    """Groups, files, and generations never accumulate, and the checkpoint reloads."""
     for result in results:
+        # Every reconfiguration released the generation it replaced, and the run
+        # released the last one on the way out (``_resources`` says why this is a
+        # weakref rather than a byte count).
+        for event in result["events"]:
+            assert event["released_previous"], (label, result["rank"], event)
+        assert result["released_final"], (label, result["rank"])
         baseline = result["resources"][0]["groups"]  # the control group, before any build
         for snapshot in result["resources"]:
             if snapshot["at"] == "shutdown":
                 assert snapshot["groups"] == 0, (label, result["rank"], snapshot)
-                assert snapshot["cuda_bytes"] in (None, 0), (label, result["rank"], snapshot)
             else:
                 # Exactly this rank's two training groups on top of the control group
                 # when the plan places it, and none when it does not: one rebuild's
