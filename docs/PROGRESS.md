@@ -595,3 +595,179 @@ NCCL 要求**同一通信器上所有 rank 按相同顺序入队**。rank 1/3 �
 **复核过、确认无误的点**：`ReferenceTransformer.logical_state_dict()` 返回的是真 `nn.Parameter`（不是副本），所以 `_reference_from_anchor` 里 `optimizer.state[named[name]]` 的键能对上、`param.copy_` 也确实写进模型；`PipelineRuntime` 内部没有任何「一个 stage 一个 rank」的隐含假设（激活缓冲用的是完整 `stage.dim`，loss 用的是 all-gather 后的完整 logits），所以 TP2 按列接入是合法用法；异 degree/异 replica 的梯度合并按「每 replica 重建完整张量 → 求和 → 按各自布局重切」逐名走通。
 
 **已知残留（不改，仅记录）**：`PipelineRuntime` 的 docstring 把 `stage_ranks` 描述为「各 stage 的全局 rank」，在 TP>1 时正确用法是**每个 TP 下标一条流水线列**（本轮 `tp_pp` 门禁确立的用法），照字面把某 stage 的全部 TP 成员都传进去会出错。属于文档措辞，不是缺陷，且改 `resihp/` 超出 T15「只补测试与必要修复」的范围，留待需要时再补。
+
+---
+
+## T16：完整 3D 端到端（8 进程）
+
+状态：测试编写完成，**分布式门禁（Gloo + 真实 GPU/NCCL）待 torch 环境执行**（本机无 torch，计划硬性禁止安装/升级 torch）。**未新增任何功能，也未改动 `resihp/` 下任何文件**——离线核对未发现需要修复的实现缺陷。
+
+新增：`tests/test_end_to_end.py`（唯一新增文件，2 个门禁：Gloo 与 CUDA/NCCL）。
+
+### 场景与它为什么这样选
+
+计划四.D 的「完整 3D」：8 进程 `TP2×PP2×DP2`，一次不间断的 run 里跑完「无故障参考 → 第 2 轮后失效一个 TP rank → TP 重切 / PP 移层 / DP 重路由 → 恢复 → 第 4 轮后失效另一个 DP replica 的 rank → 再次重配恢复 → 训练至结束」。
+
+- **6 层而不是 4 层**：`TP2×PP2` 下 4 层时掉一个 rank 只降 degree、层区间不动（`test_control` 的断言即如此），一次事件只碰到 TP 一个面。6 层时 stage0 的 `L_target = floor(3 × 1/2) = 1`，守恒调整后为 2 层，**层 2 真的跨 stage 迁到 stage1**——一次事件同时触发 TP 重切、PP 移层、DP 执行者重路由。
+- **两个事件分别打在两个 replica 上**（rank 1 与 rank 5）：第二次事件落在第一次完全没碰过的 replica 上，且**两次事件之间两个 replica 的 PP 分层与 TP degree 各不相同**（replica0 = `1/2` degree、层 `[0,2)/[2,6)`；replica1 = `2/2` degree、层 `[0,3)/[3,6)`），正是 T13 异构 DP 合并要处理的形态。第二次事件后还断言 **replica 0 的 stage 表逐字不变**（未受影响的 replica 一个字节不搬）。
+
+三个计划版本的 stage 表在门禁里写死（`EXPECTED_PLANS`），值由真实 `build_plan` / `reconfigure` 跑出来核对过，不是照实现回抄的表达式。
+
+### 逐条对应四.D 的校验清单
+
+| 计划要求 | 门禁里的检查 |
+|---|---|
+| 无 collective 顺序错、无死锁 | 8 个 rank 必须在硬超时前**全部**退出并落盘结果；每个 rank 用 `faulthandler.dump_traceback_later` 自打栈，超时失败时把 8 份栈一起打进报错。集合通信顺序不一致在 Gloo/NCCL 下要么挂死要么报错，两种都会让门禁失败而不是让套件永久挂起 |
+| 失效 rank 不再训练 | 逐 rank 的实际训练轮次：rank 1 = `[1,2]`、rank 5 = `[1,2,3,4]`、其余 = `[1..6]`；未训练的轮次记录里**不允许出现** `processed` |
+| 每次故障仅一个新计划 | `plans` 版本序列恰为 `[0,1,2]`，两个事件各对应一次 `safe_point`；每个版本的 digest 在 8 个 rank 上唯一 |
+| 恢复前状态精确等于 checkpoint | 原则 A 前半段：`_matches_anchor` 对每个 rank 的每个 shard 与 AdamW 矩状态做 `torch.equal`（按新计划的 degree 切 anchor），并要求持有的名字集合**恰好**等于 `stage_layout`（不多不少）；被踢 rank 必须什么都不持有 |
+| 恢复后与新配置参考一致 | 原则 A 后半段：把 6 轮切成三段，第 1 段（轮 1–2）对**无故障参考**，第 2 段（轮 3–4）对「事件①的 anchor + 新拓扑 + 新配置实际 batch + 同种子」重建的参考，第 3 段（轮 5–6）对事件②的 anchor 参考。逐轮比梯度与 AdamW 更新后的权重（`allclose`，T10 的重结合带），另比各 replica 的 loss 之和等于参考整批 loss |
+| 数据不重不漏 | 逐 rank 的 cursor 序列必须是 `0,1,2,...` 无重无跳；恢复后的 cursor 必须等于 checkpoint 的 `completed_steps`（既不回放也不跳过）；同一轮里所有训练 rank 消费的 batch 下标必须相同 |
+| layer 不重不漏 | 每个版本、每个 replica 的 stage 层区间并起来恰为 `0..L-1`（连续、无重叠、无缺口）；且每个 rank 实际持有的层等于它在该版本计划里那个 stage 的区间 |
+| micro-batch·stage 不重不漏 | 逐轮把 8 个 rank **实际执行**的 `(micro, stage)` 汇总成 `pair -> 执行它的 rank 集合`，与该轮生效计划的 `placements` **整表相等**——既锁「恰好一次」，也锁「在计划指定的那组 executor 上」。另加 activation 生命周期：峰值等于本 rank 的路由条数、结束时清空 |
+
+另外锁死三个面**真的动了**（不只是版本号变了）：事件①后 `(micro 0, stage 0)` 的 executor 由 `[0,1]` 变 `[0]`（TP 重切 + DP 重路由），stage 表显示层 2 从 stage0 迁到 stage1（PP 移层）；事件②对 replica 1 同理。
+
+### GPU 门禁
+
+两个门禁共用同一个 runner，只切训练组后端：
+
+- `test_end_to_end_three_d_gloo`：计划四.D 明写的 8 进程 Gloo 配置。
+- `test_end_to_end_three_d_cuda_nccl`：**真实 GPU 张量 + 真实 NCCL 训练组**，逐 rank 绑一张卡（`torch.cuda.set_device(rank)` 并断言 `current_device() == rank`），断言参数 `is_cuda`、且所有持有训练组的 rank 后端都是 `nccl`。世界组两种后端下都是 Gloo——它是控制面的常驻组（计划 3.2），只有训练组切 NCCL。
+
+**该门禁需要 8 张 GPU**（一 rank 一卡，与 T18 `torchrun --nproc_per_node=8` 的 NCCL 验收同一前提），卡数不足时 skip。
+
+### 本机能做到的验证（无 torch）
+
+1. **计划形态实机核对**：`plan.py` 与 planner 不依赖 torch，直接跑 `build_plan` / `reconfigure` 确认 `EXPECTED_PLANS` 三张表逐项正确（含 v1 的 `[1,2,2,2]` 异构 degree 与层 2 的跨 stage 迁移）。
+2. **断言层离线回放 + 变异测试**（scratch 脚本不入库）：用假 torch 让测试模块可导入，再用**真实** `build_plan` / `dp_assignment` / `executor_route` / `stage_layout` 生成一份忠实的 8-rank 运行流水，喂给门禁自己的 `_assert_end_to_end`。健康流水通过；随后逐一注入 11 种缺陷——漏执行一个 micro-batch·stage、重复执行、失效 rank 继续训练、数据回放一轮、恢复前状态不等于 checkpoint、与参考发散、一次故障产生两个计划、rank 间计划 digest 不一致、某层无人拥有、残留进程组、loss 不等于整批——**全部被捕获**。证明每条断言都承重，不存在写了但永不触发的检查。
+3. `python -m pytest -q`：**81 passed, 10 skipped**（新模块与其它分布式模块一样因缺 torch 在收集阶段整模块 skip；此前是 9 skipped）。
+
+### 目标机需要复核的点
+
+- `python3 -m pytest -q tests/test_end_to_end.py` 共 2 项：Gloo 项需 8 个进程，NCCL 项需 **8 张 GPU**。
+- 数值容差：每段内最多累两轮重结合误差（与 T15 `dynamic_groups_pipeline` 同量级），若只有第二轮擦边则是容差问题不是缺陷。
+
+### 自审修正（提交前）
+
+**补一条真实的漏检（TP peer 之间的 loss 分歧）**：原写法 `by_replica[replica] = loss` 直接覆盖——同一 stage 的两个 TP 成员算出的 loss 必然相同，但若实现让它们不同（例如某个 TP all-reduce 漏掉），后写入的那份会把前一份顶掉，而「各 replica loss 之和 == 参考整批 loss」仍可能成立，缺陷被静默吞掉。改为 `setdefault` + 逐个断言相等再计入，与 T15 `_assert_tp_pp` 的口径一致。离线变异（只改 rank 3 的 loss、不动 replica 合计）证明这条新断言是唯一能抓住它的检查。
+
+**`is_cuda` 由「起始事实」改成「全程事实」**：原来只在建初始 stage 后采一次样。恢复会**重建** stage，采样点在那之前，因此证明不了恢复后的参数仍在 GPU 上——正是 T15 修过的那类「断言只复述意图」的问题。改为循环结束后对最终 stage 再采一次并与初值相与，NCCL 门禁于是覆盖「初始 + 两次恢复后」都在卡上。
+
+**删掉恒不生效的 `requires_torch`**：模块顶层已有 `pytest.importorskip("torch")`，无 torch 时整模块在收集阶段就被 skip，两个 `@pytest.mark.skipif` 装饰器永远不会起作用。这是从 T15 抄来的冗余，作为本轮新文件里的死代码删除（连同 `importlib.util` 导入）。
+
+**两处可读性**：`_assert_micro_batch_stage_executed_once` 里 `zip(results, _iteration(...))` 的 `_iteration` 本就按 rank 顺序遍历同一份 `results`，zip 没有增加信息，改为直接索引；两行超过 100 列的表达式按仓库既有风格折行。
+
+**复核过、确认无误的点**：
+- `_assert_planes_reconfigured` / `_assert_layers_tile_the_model` / `_assert_micro_batch_stage_executed_once` 只读 `results[0]["plans"]`，合法——digest 覆盖 `stages` 与 `placements` 全量，而 digest 跨 rank 唯一已由 `_assert_one_plan_per_failure` 先行锁定。
+- 事件后 `load_anchor` 与 rank 0 落盘之间**无竞态**：`save_checkpoint` 在 `broadcast_failure` 之前完成，其余 rank 阻塞在该 broadcast 上，返回时文件必已就绪。
+- `_steps_from_anchor` 会推进全局 RNG，但分布式侧此后不依赖全局 RNG（token 流用独立 Generator，stage 参数全部由 `local_state` 覆写），且 8 个 rank 的消耗量完全一致；参考本身的参数逐个从 anchor 覆写，与 RNG 状态无关。
+- 某个 rank 在集合通信之外抛异常时，`mp.spawn` 的 join 会终止其余进程并把子进程 traceback 原样抛给 pytest，不会退化成 600 秒超时。
+
+**已知残留（不改，仅记录）**：本模块的 `_free_port` / `_step_record` / `_compare_shards` / `_matches_anchor` / `_entry` / `_spawn` / `_skip_if_few_gpus` 与 `tests/test_combinations.py` 高度重复（约 150 行）。仓库现有约定就是每个测试模块自带 harness（`_free_port` 在 6 个模块里各有一份），抽公共模块要改 T15 已锁定的文件，超出 T16「只补测试与必要修复」的范围，故按既有约定保持自足。
+
+遗留问题：分布式门禁本机无法执行，需在目标机跑完 2 项后才能把状态改为「已验证」。目标机已确认有 ≥8 张 GPU，NCCL 项按「一 rank 一卡」可直接跑，无需多 rank 共卡。
+
+---
+
+## T17：随机故障序列与反复注入
+
+状态：测试编写完成，**分布式门禁（Gloo + 真实 GPU/NCCL）待 torch 环境执行**（本机无 torch，计划硬性禁止安装/升级 torch）。**未新增任何功能，也未改动 `resihp/` 下任何文件**——离线核对未发现需要修复的实现缺陷。
+
+新增：`tests/test_fault_sequences.py`（唯一新增文件，10 个门禁：5 个故障序列 × Gloo/NCCL）。
+
+### 四条任务各落在哪个场景
+
+| 任务 | 场景 | 形态 |
+|---|---|---|
+| 1. 固定 seed 随机序列，逐次注入直到资源耗尽 | `random_a` | 随机安全点（间隔 1~2 轮）+ 随机 rank，八个事件把 8 个 rank 全部打掉，第八次 `build_plan` 抛 `no_executable_pp`，全体一致停止 |
+| 2. 反复注入（固定间隔坏一个）+ 无泄漏 | `interval_n` | 每 N=2 轮坏一个，共四次；进程组 / 临时文件 / 显存三项泄漏口径见下 |
+| 3. 多故障点位 + 多次序列回归 | `interval_n`（每 N）、`interval_2n`（每 2N）、`random_a` + `random_b`（随机间隔的两条独立序列） | 四条序列的**故障点位与受害 rank 都不同**，四.C 的双口径数值验收在每条上逐轮跑 |
+| 4. 四.E 资源耗尽与错误注入补全 | `donor_exhaustion` + 两条随机序列的收尾 | 见下「四.E 覆盖对照」 |
+
+四条序列的受害 rank 不是随手挑的，各自打在不同的面上：
+
+- `interval_n`（1, 5, 0, 4）依次打空**两个 replica 的 stage 0**：幸存的 stage 1 吃下全部 6 层，**embedding 的 owner stage 变了两次**（`acquire_layout` 里 T12 留给 T14 的那个边界口子）。
+- `interval_2n`（3, 7）打在**末 stage**：动的是 LM head 一端，层反向从 stage 1 挪到 stage 0，embedding 一端一个字节不动。
+- `random_a`（2, 3, 6, 0, 4, 7, 1, 5）第二次事件就把 replica 0 的 stage 1 整个打空，之后一路收缩到「单 rank 扛整个模型 + 全部 micro-batch」，最后一击才耗尽。
+- `random_b`（1, 4, 7, 2, 6, 3, 0, 5）与它的收缩路径完全不同（先两个 replica 各降 degree，再逐个塌成单 stage），这就是四.C 要求的「多次序列回归」。
+
+三条 8 进程序列共用 `TP2×PP2×DP2`、6 层：6 层时 degree 减半会**真的把层推过 stage 边界**（4 层不会），一次事件同时触发 TP 重切、PP 移层、DP 重路由。
+
+### 随机序列为什么不用 `random`
+
+`_random_events` 用一个 4 行 LCG，不用 `random.Random(seed)`：固定 seed 的意义就是这条序列在任何机器上都能原样重放，而 `random.choice` / `randrange` 的内部实现不在语言的兼容性保证里（历史上换过）。LCG 让「固定 seed 的随机序列」既是随机的、也是可移植的，且**只有一份真值**——不需要把生成结果抄成表再和生成器对不上。
+
+### 四.E 覆盖对照（本轮只补第 7 条）
+
+计划四.E 列了七个场景。前六条**恰好就是六条一致停止条件**，`tests/test_recovery.py`（T14）已经每条一个门禁、且全部走真实 `safe_point → build_plan`，本轮不重复：
+
+| 四.E 场景 | 在哪 |
+|---|---|
+| TP 候选空 | T14 `no_feasible_tp` |
+| PP 无法覆盖全层 | T14 `no_executable_pp`；本轮 `random_a` / `random_b` 另外从**长随机序列的资源耗尽**这一侧到达同一条件 |
+| DP 目标显存全不足 | T14 `no_feasible_dp_target` |
+| checkpoint 损坏 | T14 `checkpoint_unusable` |
+| rank 间计划摘要不一致 | T14 `plan_disagreement` |
+| 状态迁移摘要错误 | T14 `state_mismatch` |
+| **健康 donor 全失但 checkpoint 可用** | **本轮 `donor_exhaustion`（此前无覆盖）** |
+
+第 7 条不是停止条件而是一次**成功的恢复**，且 T14 的三个恢复场景都够不着它：
+
+- `pipeline` 是 `DP1`，压根没有 peer replica，走 checkpoint 是**平凡**的（没有 donor 可失去）；
+- `replicated` / `reseat` 里每次事件只死一个 rank，而 `_state_route` 查 peer 用的是**上一版计划**的成员表——上一版里没有失效 rank，所以只要还有第二个 replica，peer 分支必然命中。**`DP≥2` 下 checkpoint 分支不可达**，除非那个 peer replica 已经被更早的事件整个抹掉。
+
+`donor_exhaustion` 就是这个形态：`TP2×PP1×DP2` 依次杀 2 → 3 → 1。事件①走 `peer_replica`；事件②把 replica 1 整个打空（此时 replica 0 未受影响，**donors 为空、一个字节不搬**）；事件③ replica 0 掉一个 rank，`old_layout` 里只剩它自己，于是计划给出 `checkpoint / checkpoint_restore`，恢复后**继续训练两轮**并与新配置参考一致。门禁把这三步的 donor 序列写进用例表（`_Case.donors`）为 `[] → [peer_replica] → [] → [checkpoint]`。**但这只是计划的意图**：`recovery.recover` 根本不读 `plan.state_routes`（全仓 0 处引用），真正决定「问 peer 还是问 checkpoint」的是 `reshard_tp_state` 按各 rank 实际贡献逐名判定的。所以「运行时确实读了 checkpoint」由另外两条共同证明：事件③时**全局只剩 1 个 rank 存活**（由记录的 `failed` 集合算出，不写死 rank 号），它手上只有 degree-2 的 index 0 半份，缺的另一半无处可来；而恢复后各分片与 anchor **逐张量 `torch.equal`**，静默零填或留着半份都过不了这一关。这条推理写进了 `_assert_donor_stream` 的 docstring，不留给读者自己重建。
+
+### B 组不变量：门禁里对应的检查
+
+| 四.B 条目 | 检查 |
+|---|---|
+| 计划版本严格递增、各 rank 摘要一致 | 版本序列恰为 `0..n`；每版 digest 在所有 rank 上唯一 |
+| 重路由函数对同输入幂等 | **把整条受害序列在纯 planner 上重跑两遍**，两遍的 digest 流必须相等，且与分布式跑出来的 digest 流**逐版本相等**——既锁幂等，也锁「发布的计划就是纯函数的输出，没有运行时输入渗进来」 |
+| `active` 与 `assigned` 一一对应、不重叠 | 每版 `stages` 的成员并集恰为 `active`、无重复、与 `failed` 不交 |
+| 失效 rank 单调累计、永不重回 | `failed` 逐版包含前一版；`active ∩ failed == ∅`；且**每轮是否训练必须恰好等于「本版计划是否安排了我」** |
+| 每层任意时刻恰被一个 stage 拥有 | 每版每 replica 的层区间并起来恰为 `0..L-1`；每个训练 rank 实际持有的层等于它那个 stage 的区间 |
+| `Σ microbatches == 实际 batch`、每 micro-batch·stage 恰执行一次 | 每版 placements 覆盖全部 micro-batch；逐轮把各 rank **实际执行**的 `(micro, stage)` 汇总成 `pair -> rank 集合`，与该轮生效计划的 placements **整表相等** |
+| activation 生命周期 | 峰值等于本 rank 的路由条数、结束时清空 |
+| 数据不重不漏 | 同一轮里所有训练 rank 的 cursor 相同且等于 `iteration-1`；恢复后的 cursor 等于 checkpoint 的 `completed_steps` |
+| 原则 A 双口径 | 每次事件后各 rank 分片与 anchor 逐张量 `torch.equal`（按新 degree 切），持有的名字集合不多不少；每轮梯度与 AdamW 更新后的权重对「同 checkpoint 起点 + 新拓扑 + 新配置实际 batch + 同种子」的参考 `allclose`；各 replica loss 之和等于参考整批 loss，且同 stage 的 TP peer 必须先相等再计入 |
+
+### 泄漏三项的口径
+
+- **进程组**：在建任何训练组**之前**先采一个 `init` 快照作为基线，之后每个快照断言 `len(_world.pg_map) == 基线 + 2×(本 rank 是否在计划里)`——本 rank 的 TP 组与 executor 组，别的都不该有。既抓「重建一次多留一组」，也抓「建了一半」（TP 建了 executor 没建会差 1）。shutdown 后必须为 0。**基线是量出来的不是写死的**：第一版写的是「恰为 3 / 1」，那等于把 torch 怎么给默认组记账当成前提，目标机 torch 版本若记法不同会误报成缺陷；改成相对基线后，这条检查只依赖「`new_group` 只在成员 rank 上登记」这一条真正被测的性质。
+- **临时文件**：每次事件后 checkpoint 目录里恰好只有 `ckpt.pt`，**永远不出现 `ckpt.pt.tmp`**（原子写的残留），且训练开始前目录里没有任何 checkpoint。
+- **显存**：只断言**跑完后释放干净**（丢掉 run 与参考、`gc.collect()` 后 `memory_allocated()` 为 0）。**刻意不断言「逐事件不增」**：degree 减半时幸存 rank 合法地持有更大的分片、stage 吸层时持有更多层，写成不增就是错的，写成宽上界就是空的。逐事件的字节数仍然记录下来，便于失败时定位。
+
+### 本机能做到的验证（无 torch）
+
+1. **计划流实机核对**：`plan.py` 与 planner 不依赖 torch，直接跑 `build_plan` 把五条序列的每一版计划打出来核对过——`interval_n` v3 确实是「replica 0 的 stage 0 消失、stage 1 拿到 `[0,6)`」，`random_a` v7 确实是「只剩 rank 5、两个 micro-batch 都在它身上」，`donor_exhaustion` v3 确实给出 `checkpoint_restore`。
+2. **断言层离线回放 + 变异测试**（scratch 脚本不入库）：用假 torch 让测试模块可导入，再用**真实** `build_plan` 生成一份忠实的多 rank 运行流水（五个场景各一份），喂给门禁自己的 `_assert_sequence`。健康流水全部通过；随后逐一注入 **24 种缺陷**——漏执行 / 重复执行一个 micro-batch·stage、失效 rank 继续训练、cursor 回放、恢复前状态不等于 checkpoint、与参考发散、一次事件产生两个计划、rank 间 digest 不一致、某层无人拥有、失效 rank 复活为 active、多留一个进程组、残留 `.tmp`、shutdown 后仍占显存、shutdown 后仍有进程组、replica loss 不等于整批、同 stage 的两个 TP peer loss 分歧、两个 rank 停在不同原因、耗尽后仍继续、donor 类别不符、事件确认的失效集与计划不符、把基线组数改掉、最后 checkpoint 载不回——**24/24 全部被捕获**，不存在写了但永不触发的检查。
+3. **集合通信顺序静态核对（本轮新增）**：用真实 `executor_route` / `dp_assignment` 把 `DataParallelRuntime.train_step` 的**入队顺序**按通信器重放，覆盖五个场景发布的**全部 28 个计划**，断言「每个集合通信器上各成员顺序一致、成员表正确」与「每个 P2P 对两侧互为镜像」——全部通过。反证两条：把 TP broadcast 改成只有 leader 发（T14 修过的「非 leader 挨饿」）、把边界 recv 摘掉，均如期报错，说明这条检查承重。它挡的正是新形态（单 stage 兼首尾的 replica 与两 stage replica 混跑、同一 replica 内 degree 1 与 2 并存）可能带来的死锁。
+4. `python -m pytest -q`：**81 passed, 11 skipped**（新模块与其它分布式模块一样因缺 torch 在收集阶段整模块 skip；此前是 10 skipped）。
+
+### 目标机需要复核的点
+
+- `python3 -m pytest -q tests/test_fault_sequences.py` 共 **10 项**（5 场景 × Gloo/NCCL）。NCCL 侧 4 项需 **8 张 GPU**（一 rank 一卡），1 项（`donor_exhaustion`）需 4 张，不足即 skip。
+- 两条随机序列各有 8 个安全点、10 轮内跑完，是本仓最长的门禁；`JOIN_TIMEOUT` 沿用 600 秒，超时会把 8 份 Python 栈一起打进报错而不是把套件挂死。
+- **唯一依赖 torch 私有 API 的地方**：进程组泄漏检查读 `torch.distributed.distributed_c10d._world.pg_map`（没有公开等价物——泄漏的组从别处根本看不见）。若目标机的 torch 版本记账方式不同，断言会带着实际数字失败，按数字修即可，不是实现缺陷。
+- 容差：每段最多累两轮重结合误差（与 T15/T16 同量级）。事件密集时每段往往只有一轮，比 T16 更宽松。
+- **已知残留（不改，仅记录）**：本模块的 `_free_port` / `_step_record` / `_reference_steps` / `_steps_from_anchor` / `_compare_shards` / `_matches_anchor` / `_entry` / `_spawn` / `_skip_if_few_gpus` 与 `tests/test_end_to_end.py`、`tests/test_combinations.py` 高度重复（约 180 行）。仓库既有约定就是每个测试模块自带 harness，抽公共模块要改 T15/T16 已锁定的文件，超出本任务范围。
+
+### 自审修正（提交前）
+
+按「正确性 / 完备性 / 简洁性」重读一遍，改掉四处、补上一处：
+
+**① 组数断言把 torch 的记账方式当成了前提（正确性）**：原写法 `groups == 3 if holds else 1`。3 里那个 1 是「默认组在 `pg_map` 里算一条」，那是 torch 内部实现而不是被测性质；目标机版本若记法不同，会把一次版本差异误报成实现缺陷、白烧一轮 8 卡。改为在**建任何训练组之前**采一个 `init` 快照做基线，断言 `groups == 基线 + 2×holds`。捕获能力不变（多留、少留、建一半都还是能抓），依赖面从「torch 怎么记账」缩到「`new_group` 只在成员 rank 上登记」。
+
+**② donor 断言只证明了计划的意图，没证明运行时（正确性）**：`recovery.recover` **全程不读 `plan.state_routes`**（全仓 0 处引用），真正选 peer/checkpoint 的是 `reshard_tp_state`。原来只比对 donor 序列，等于断言「planner 想走 checkpoint」而不是「真的走了」。修法不是加断言，而是把已经成立的推理写出来并让它由数据推出：事件③时全局只剩 1 个 rank 存活（**由记录的 `failed` 集合算，不写死 rank 号**），缺的那半份无处可来；加上恢复后与 anchor 逐张量 `torch.equal`，两条合起来才是「运行时读了 checkpoint」。docstring 里写明这条链路，不留给读者重建。
+
+**③ 按用例名 `if` 分支（简洁性）**：`_assert_sequence` 里原有 `if case_name == "donor_exhaustion"`。改为 `_Case.donors` 字段，有就查、没有就跳；`case_name` 参数随之删除。断言由数据驱动，加新场景不用回来改分派逻辑。
+
+**④ 两处小的（简洁性）**：`result["resources"][-2]["at"] == "stop"` 的位置耦合改为 `any(...)`；只用一次的 `_micro_batches` 内联。
+
+**⑤ 补一条真实的漏检（完备性）**：安全点第③步广播确认的失效 rank 集合（`safe_point` 的返回值）与第⑤步据以重规划的计划里的 `failed_ranks`，此前**没有任何检查要求它们一致**。加了一行逐事件比对；变异测试证明它是唯一能抓住「广播确认的集合与计划不符」的检查。
+
+**复核过、确认无误的点**：checkpoint writer 在序列中会换人（rank 0 中途死掉后由 `plan.active_ranks[0]` 接手，T14 的修复），门禁期望的 `[completed, version] == [最后事件轮次, 事件数-1]` 在停止与不停止两种收尾下是同一个式子；2 个 micro-batch 下「各 replica loss 之和 == 参考整批 loss」仍成立（等分微批时逐微批均值的均值就是整批均值），空 replica 贡献 0 也不破坏它；`_plan_by_iteration` 对「中途停止」与「跑满」两种收尾都给出正确映射。
+
+遗留问题：分布式门禁本机无法执行，需在目标机跑完 10 项后才能把状态改为「已验证」。
