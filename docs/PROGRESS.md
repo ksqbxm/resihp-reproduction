@@ -544,3 +544,54 @@ NCCL 要求**同一通信器上所有 rank 按相同顺序入队**。rank 1/3 �
 **诊断设施**（测试侧，无生产改动、未放宽超时、未 skip）：每个 worker 用 `faulthandler.dump_traceback_later` 定时把自己的 Python 栈写到 `stack_<rank>.txt`；`_spawn` 超时失败时把各 rank 的栈一并打进报错。下次若再挂，报错本身就会指明每个 rank 卡在哪个 distributed 操作。
 
 本机验证：全量 **81 passed, 8 skipped**；三个离线仿真全过；入口正常。目标机需重跑 `python3 -m pytest -q tests/test_recovery.py` 复核 27 项。
+
+---
+
+## T15：两两组合测试
+
+状态：测试编写完成，**分布式门禁（Gloo + 真实 GPU/NCCL）待 torch 环境执行**（本机无 torch，计划硬性禁止安装/升级 torch）。**未新增任何功能，也未改动 `resihp/` 下任何文件**——本轮暂未发现需要修复的实现缺陷。
+
+新增：`tests/test_combinations.py`（唯一新增文件）。
+
+### 七项组合各自补的是哪条缝
+
+计划四.D 要求两两组合「须执行真实前反向，不只比计划」。逐条核对已有覆盖后，每项都选了**现有门禁没锁住的那条缝**，而不是把已过的场景再跑一遍：
+
+| 组合 | 已有覆盖 | 本轮补的缝 |
+|---|---|---|
+| TP+PP | T10 是单 stage 的 TP，T12 是 TP degree 1 的流水 | **TP2 跑在 1F1B 里**：ranks (0,1)=stage0 TP 组、(2,3)=stage1 TP 组；激活在 TP 组内是复制的，所以流水 hop 按 TP 下标分两列 (0,2)/(1,3)。每个 rank 的前反向本身就是真 TP all-reduce，且发出的原语序列逐字等于 1F1B |
+| TP+DP | T13 的 `tp_heterogeneous` 只手工喂 `dp_combine_gradients` | 整个 `DataParallelRuntime` 驱动合并，合并看到的是**它自己分片前反向产出的** shard |
+| PP+DP | T13 有「均衡+跨 replica 重路由」与「不均衡但无流水」 | 两者合起来的形态：**流水化 replica 之间 3-vs-1 的不均衡切分** |
+| Scheduler+建群 | T14 走这条路但**从不校验数值** | `build_plan` → `build_training_groups` → 在这些组上训练一步，**逐参与参考比对** |
+| Scheduler+状态迁移 | T14 只断言原则 A 的**恢复前**半段 | 补**恢复后**半段：迁移后的下一轮 == 「同 checkpoint 起点 + 新拓扑 + 新配置实际 batch」的参考。此场景两个 replica 迁移后 TP degree 一个 1 一个 2 |
+| 状态迁移+checkpoint | T14 断言各 rank 分片等于 checkpoint 切片 | 补**往返**：分片态 gather 成的 anchor 本身就是完整逻辑模型、且等于参考（含 AdamW 矩与 step），各 rank 再从它取回自己那片（无 peer replica，走 checkpoint 兜底分支），然后继续训练仍对 |
+| 动态通信组+PipelineRuntime | 无 | 迭代**之间**销毁并重建全部训练组，`PipelineRuntime` 在新通信器上跑第二轮，AdamW 矩状态跨重建带过去，第二轮仍等于参考第二轮。不掺任何故障，被测的只有建组/毁组本身 |
+
+每项都有 Gloo 与 **NCCL** 两个门禁（真实 GPU 张量 + 真实 NCCL 训练组，GPU 不够才 skip）；world 组一律 Gloo，因为它是控制面的常驻组（计划 3.2）。
+
+### 本机能做到的验证（无 torch）
+
+1. **计划形态已实机核对**：`resihp/plan.py` 与 planner 均不依赖 torch，直接跑 `build_plan` 确认了断言里写死的每个数字——`tp_dp` v0/v1 的 micro-batch 划分都是 `[(0,0),(0,1),(1,2),(1,3)]`；v1 的 degree 是 `[1, None, 2, 2]`；`pipeline` v1 的层区间是 stage0 `[0,1]` / stage1 `[2,3,4,5]`（确实既降 degree 又跨 stage 搬了一层）；`solo_pp` 两个 stage 各 2 层。
+2. **排队顺序与死锁离线仿真**（沿用 T14 的做法，scratch 脚本不入库）：把每个 rank 建模成阻塞算子序列（集合通信按通信器成员对齐、批量 P2P 按镜像配对），跑会合式仿真。三个新并行场景 `tp_pp` / `tp_dp` / `pp_dp` 全部跑完、无死锁，且每个集合通信器上各成员入队序列一致。
+   - **反证 1**：把 `tp_pp` 里融合的 `send_forward+recv_backward` 拆成两次独立收发，仿真如期在第 11 个算子上四个 rank 同时卡在 send——正是 T12 docstring 论证过的确定性死锁，说明这个仿真承重。
+   - **反证 2**：把 `pp_dp` 的 stage 边界 hop 改回**批量** P2P、挂到 executor 集合通信器上（即 T13 那个已被 T14 修掉的故障），顺序检查如期报 `exec: {0:7, 1:7, 2:3, 3:3}`。本轮写法沿用修复后的非批量 `isend`/`irecv`，边界拿到的是只含两个 peer 的通信器，故一致。
+3. `python3 -m pytest -q`：**81 passed, 9 skipped**（新模块与其它分布式模块一样，因缺 torch 在收集阶段整模块 skip；此前是 8 skipped）。
+
+### 目标机需要复核的点
+
+- `python3 -m pytest -q tests/test_combinations.py` 共 14 项（7 组合 × Gloo/NCCL）。NCCL 侧 6 项需 4 GPU、1 项需 2 GPU。
+- 唯一对容差敏感的断言是 `dynamic_groups_pipeline` 的**第二轮**：它从第一轮自己的输出出发，与参考第二轮比，比其它门禁多累一轮重结合误差。若只有它擦边，是容差问题不是缺陷；其余门禁都只跨一轮。
+
+遗留问题：分布式门禁本机无法执行，需在目标机跑完 14 项后才能把状态改为「已验证」。
+
+### 自审修正（提交前）
+
+**修掉一个真 bug（`_stage` 的 layout 与 source 不匹配）**：`shard_dims(layer_ids)` **无条件**含 embedding / final_norm / lm_head 五个边界名（它们总归属某个 stage），而 `shard_logical_state` 会对 layout 里每个名字做 `full_state[name]`。首次建 stage 传的是完整逻辑态，取得到；但 `dynamic_groups_pipeline` 重建 stage 时传的是**该 stage 自己的分片**（stage0 没有 `final_norm`/`lm_head`，stage1 没有 embedding），于是 `KeyError`——两个 rank 每次必崩。改法是让 layout 跟随 source（`if name in source`），而不是给缺失名兜个默认值：`_stage` 的契约本来就是「按你交给它的状态建」，`TensorParallelStage` 再按 `is_first`/`is_last` 各取所需。首次建 stage 的行为逐字不变（完整态与 `shard_dims` 全集相交仍是全集），其余六个门禁不受影响。
+
+**两处 NCCL 断言由「意图」改成「事实」**：`scheduler_migration` / `migration_checkpoint` 原本记 `is_cuda = device.type == "cuda"`——那只是复述自己传进去的参数，即使张量其实落在 CPU 也照样通过。改为在 `_attach` 之后取 `next(run.stage.parameters()).is_cuda`，与其余五个门禁口径一致。
+
+**两处可读性**：`tp_dp` 的 executor 由 `(micro // 2 * 2, micro // 2 * 2 + 1)` 改为直白的 `(0, 1) if micro < 2 else (2, 3)`；`_assert_dynamic_groups_pipeline` 里名为 `rounds` 实为「按 rank 排列」的列表改名 `first_stage` / `last_stage`。
+
+**复核过、确认无误的点**：`ReferenceTransformer.logical_state_dict()` 返回的是真 `nn.Parameter`（不是副本），所以 `_reference_from_anchor` 里 `optimizer.state[named[name]]` 的键能对上、`param.copy_` 也确实写进模型；`PipelineRuntime` 内部没有任何「一个 stage 一个 rank」的隐含假设（激活缓冲用的是完整 `stage.dim`，loss 用的是 all-gather 后的完整 logits），所以 TP2 按列接入是合法用法；异 degree/异 replica 的梯度合并按「每 replica 重建完整张量 → 求和 → 按各自布局重切」逐名走通。
+
+**已知残留（不改，仅记录）**：`PipelineRuntime` 的 docstring 把 `stage_ranks` 描述为「各 stage 的全局 rank」，在 TP>1 时正确用法是**每个 TP 下标一条流水线列**（本轮 `tp_pp` 门禁确立的用法），照字面把某 stage 的全部 TP 成员都传进去会出错。属于文档措辞，不是缺陷，且改 `resihp/` 超出 T15「只补测试与必要修复」的范围，留待需要时再补。
