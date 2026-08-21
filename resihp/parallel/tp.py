@@ -1,12 +1,22 @@
-"""Real sharded tensor parallelism with genuine TP all-reduce (T10).
+"""Tensor-parallel pipeline stage: real sharded execution over a TP group (T10).
 
-Each process is one TP rank and holds only its shard of every weight -- Q/K/V and
-MLP ``fc1`` sharded over the output (head) dimension, ``out_proj`` and ``fc2`` over
-the input dimension, the token embedding and LM head over vocabulary -- while the
-two LayerNorms and the position embedding are replicated. This is the shard
-layout the memory model budgets (:mod:`resihp.memory`); each shard is a real leaf
-parameter with its own gradient and AdamW moments, the state fail-stop recovery
-gathers and reshards in T11+.
+A stage owns a **contiguous subset of global layer ids**; the first executable stage
+of its replica also owns the token/position embeddings and the last one the final
+LayerNorm and LM head (plan 3.4). Within a stage every weight is sharded over the TP
+group -- Q/K/V and MLP ``fc1`` over the output (head) dimension, ``out_proj`` and
+``fc2`` over the input dimension, the token embedding and LM head over vocabulary --
+while the two LayerNorms and the position embedding are replicated. This is the
+shard layout the memory model budgets (:mod:`resihp.memory`) and the one
+:func:`resihp.parallel.reshard.shard_dims` names; each shard is a real leaf
+parameter with its own gradient and AdamW moments.
+
+There is exactly one stage class, so PP ownership and TP layout are always expressed
+together: a whole-model TP run is the stage that owns every layer and both
+boundaries, and a TP-degree-1 pipeline stage is the same class over a one-rank
+group. A stage is instantiated from ``local_state`` -- **this rank's shards**, keyed
+by stable logical name, exactly what :func:`resihp.parallel.reshard.reshard_tp_state`
+returns -- so it is always built from the layout its current plan gives it and never
+from an older one.
 
 Execution is genuine tensor parallelism over a TP process group (NCCL on GPU,
 Gloo on CPU), using the two Megatron collectives:
@@ -29,8 +39,8 @@ Numerical accuracy (plan principle A, relaxed to ``allclose``). Summing per-shar
 partials reorders FP32 accumulation relative to the reference's single matmul, so
 results match the single-process reference within floating-point tolerance rather
 than bit-for-bit; at TP degree 1 every collective is a no-op and the match is
-exact. No resharding lives here -- static TP only; degree/member changes land in
-T11+.
+exact. No resharding lives here -- a stage is built from the shards it is given;
+producing those shards on a degree/member change is T11.
 """
 
 import math
@@ -41,7 +51,6 @@ from torch import nn
 from torch.nn import functional as F
 
 from ..config import TrainConfig
-from ..model import ReferenceTransformer
 
 
 def _require_divisible(config: TrainConfig, vocab_size: int, tp_size: int) -> None:
@@ -49,15 +58,6 @@ def _require_divisible(config: TrainConfig, vocab_size: int, tp_size: int) -> No
         raise ValueError("tp_size must divide model_dim and num_heads")
     if vocab_size % tp_size:
         raise ValueError("tp_size must divide vocab_size")
-
-
-def _local_shard(weight: torch.Tensor, tp_rank: int, tp_size: int, dim: int) -> nn.Parameter:
-    """This rank's contiguous shard of ``weight`` along ``dim``."""
-    return nn.Parameter(torch.chunk(weight, tp_size, dim=dim)[tp_rank].detach().clone())
-
-
-def _replicated(weight: torch.Tensor) -> nn.Parameter:
-    return nn.Parameter(weight.detach().clone())
 
 
 class _CopyToRegion(torch.autograd.Function):
@@ -113,19 +113,23 @@ class _GatherLastDim(torch.autograd.Function):
 class _TPBlock(nn.Module):
     """One Transformer block's local shards and replicated LayerNorms."""
 
-    def __init__(self, state: dict, gid: int, tp_rank: int, tp_size: int):
+    def __init__(self, local_state: dict, gid: int):
         super().__init__()
         prefix = f"layers.{gid}"
-        self.attn_norm_weight = _replicated(state[f"{prefix}.attn_norm.weight"])
-        self.attn_norm_bias = _replicated(state[f"{prefix}.attn_norm.bias"])
-        self.q_proj = _local_shard(state[f"{prefix}.attn.q_proj.weight"], tp_rank, tp_size, 0)
-        self.k_proj = _local_shard(state[f"{prefix}.attn.k_proj.weight"], tp_rank, tp_size, 0)
-        self.v_proj = _local_shard(state[f"{prefix}.attn.v_proj.weight"], tp_rank, tp_size, 0)
-        self.out_proj = _local_shard(state[f"{prefix}.attn.out_proj.weight"], tp_rank, tp_size, 1)
-        self.mlp_norm_weight = _replicated(state[f"{prefix}.mlp_norm.weight"])
-        self.mlp_norm_bias = _replicated(state[f"{prefix}.mlp_norm.bias"])
-        self.fc1 = _local_shard(state[f"{prefix}.mlp.fc1.weight"], tp_rank, tp_size, 0)
-        self.fc2 = _local_shard(state[f"{prefix}.mlp.fc2.weight"], tp_rank, tp_size, 1)
+
+        def take(suffix):
+            return nn.Parameter(local_state[f"{prefix}.{suffix}"].detach().clone())
+
+        self.attn_norm_weight = take("attn_norm.weight")
+        self.attn_norm_bias = take("attn_norm.bias")
+        self.q_proj = take("attn.q_proj.weight")
+        self.k_proj = take("attn.k_proj.weight")
+        self.v_proj = take("attn.v_proj.weight")
+        self.out_proj = take("attn.out_proj.weight")
+        self.mlp_norm_weight = take("mlp_norm.weight")
+        self.mlp_norm_bias = take("mlp_norm.bias")
+        self.fc1 = take("mlp.fc1.weight")
+        self.fc2 = take("mlp.fc2.weight")
 
     def local_shards(self, gid: int) -> dict[str, tuple[nn.Parameter, int | None]]:
         """Map logical name -> (local parameter, shard dim); ``None`` = replicated."""
@@ -144,15 +148,14 @@ class _TPBlock(nn.Module):
         }
 
 
-class TensorParallelTransformer(nn.Module):
-    """Decoder-only Transformer executed as real tensor parallelism over a TP group.
+class TensorParallelStage(nn.Module):
+    """A pipeline stage's layers, executed as real tensor parallelism over ``group``.
 
     ``group`` is the TP process group (``None`` -> the default world group); the
-    degree and this rank's index come from it, so the module works for a whole-world
-    TP run or a TP subgroup of a larger 3D layout. Pass ``source_state`` (a
-    reference's ``logical_state_dict``) to shard a known init; with none, the same
-    fixed init as the reference is rebuilt from ``config.seed`` and this rank keeps
-    only its shard.
+    degree and this rank's index come from it. ``layer_ids`` is the contiguous global
+    layer subset this stage owns, and ``is_first`` / ``is_last`` say whether it also
+    owns the embeddings / the final norm and LM head. ``local_state`` supplies this
+    rank's shard of every owned tensor, keyed by stable logical name.
     """
 
     def __init__(
@@ -161,53 +164,60 @@ class TensorParallelTransformer(nn.Module):
         *,
         vocab_size: int,
         sequence_length: int,
+        layer_ids,
+        is_first: bool,
+        is_last: bool,
+        local_state: dict,
         group=None,
-        source_state: dict | None = None,
     ):
         super().__init__()
         self.group = group
         self.tp_rank = dist.get_rank(group)
         self.tp_size = dist.get_world_size(group)
         _require_divisible(config, vocab_size, self.tp_size)
-        if source_state is None:
-            torch.manual_seed(config.seed)
-            source_state = ReferenceTransformer(
-                config, vocab_size=vocab_size, sequence_length=sequence_length
-            ).logical_state_dict()
 
         self.config = config
         self.vocab_size = vocab_size
         self.sequence_length = sequence_length
         self.num_heads = config.num_heads
         self.dim = config.model_dim
+        self.layer_ids = tuple(sorted(int(gid) for gid in layer_ids))
+        self.is_first = bool(is_first)
+        self.is_last = bool(is_last)
         self.vocab_per_rank = vocab_size // self.tp_size
         self.vocab_start = self.tp_rank * self.vocab_per_rank
 
-        self.token_embedding = _local_shard(source_state["token_embedding.weight"], self.tp_rank, self.tp_size, 0)
-        self.position_embedding = _replicated(source_state["position_embedding.weight"])
-        self.blocks = nn.ModuleDict(
-            {str(gid): _TPBlock(source_state, gid, self.tp_rank, self.tp_size) for gid in range(config.num_layers)}
-        )
-        self.final_norm_weight = _replicated(source_state["final_norm.weight"])
-        self.final_norm_bias = _replicated(source_state["final_norm.bias"])
-        self.lm_head = _local_shard(source_state["lm_head.weight"], self.tp_rank, self.tp_size, 0)
+        def take(name):
+            return nn.Parameter(local_state[name].detach().clone())
 
-    @property
-    def layer_ids(self) -> tuple[int, ...]:
-        return tuple(sorted(int(gid) for gid in self.blocks))
+        if self.is_first:
+            self.token_embedding = take("token_embedding.weight")
+            self.position_embedding = take("position_embedding.weight")
+        self.blocks = nn.ModuleDict(
+            {str(gid): _TPBlock(local_state, gid) for gid in self.layer_ids}
+        )
+        if self.is_last:
+            self.final_norm_weight = take("final_norm.weight")
+            self.final_norm_bias = take("final_norm.bias")
+            self.lm_head = take("lm_head.weight")
 
     def local_shards(self) -> dict[str, tuple[nn.Parameter, int | None]]:
-        """Every local parameter keyed by logical name -> (param, shard dim | None)."""
-        shards = {
-            "token_embedding.weight": (self.token_embedding, 0),
-            "position_embedding.weight": (self.position_embedding, None),
-            "final_norm.weight": (self.final_norm_weight, None),
-            "final_norm.bias": (self.final_norm_bias, None),
-            "lm_head.weight": (self.lm_head, 0),
-        }
+        """Every owned parameter keyed by logical name -> (param, shard dim | None)."""
+        shards: dict[str, tuple[nn.Parameter, int | None]] = {}
+        if self.is_first:
+            shards["token_embedding.weight"] = (self.token_embedding, 0)
+            shards["position_embedding.weight"] = (self.position_embedding, None)
         for gid in self.layer_ids:
             shards.update(self.blocks[str(gid)].local_shards(gid))
+        if self.is_last:
+            shards["final_norm.weight"] = (self.final_norm_weight, None)
+            shards["final_norm.bias"] = (self.final_norm_bias, None)
+            shards["lm_head.weight"] = (self.lm_head, 0)
         return shards
+
+    def logical_state_dict(self) -> dict[str, nn.Parameter]:
+        """Owned parameters (this rank's shards) keyed by stable logical name."""
+        return {name: param for name, (param, _dim) in self.local_shards().items()}
 
     def _embed(self, tokens: torch.Tensor) -> torch.Tensor:
         # Vocab-parallel embedding: look up only owned rows, zero the rest, then
@@ -238,18 +248,23 @@ class TensorParallelTransformer(nn.Module):
         partial = F.linear(hidden, block.fc2)  # row-parallel partial
         return _ReduceFromRegion.apply(partial, self.group)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        _, seq = tokens.shape
-        if seq != self.sequence_length:
-            raise ValueError("token sequence length does not match the model")
-        positions = torch.arange(seq, device=tokens.device)
-        x = self._embed(tokens) + F.embedding(positions, self.position_embedding)
+    def forward(self, *, tokens=None, hidden=None):
+        """Embed ``tokens`` (first stage) or continue from ``hidden``; logits on the last."""
+        if self.is_first:
+            if tokens.shape[1] != self.sequence_length:
+                raise ValueError("token sequence length does not match the stage")
+            positions = torch.arange(tokens.shape[1], device=tokens.device)
+            x = self._embed(tokens) + F.embedding(positions, self.position_embedding)
+        else:
+            x = hidden
         for gid in self.layer_ids:
             block = self.blocks[str(gid)]
             normed = F.layer_norm(x, (self.dim,), block.attn_norm_weight, block.attn_norm_bias)
             x = x + self._attention(block, _CopyToRegion.apply(normed, self.group))
             normed = F.layer_norm(x, (self.dim,), block.mlp_norm_weight, block.mlp_norm_bias)
             x = x + self._mlp(block, _CopyToRegion.apply(normed, self.group))
+        if not self.is_last:
+            return x
         x = F.layer_norm(x, (self.dim,), self.final_norm_weight, self.final_norm_bias)
         # LM head is column-parallel over vocab, so like every column-parallel
         # region its input passes through ``f``: the per-rank partials of the input

@@ -3,6 +3,10 @@
 Plan section 3.4. The model is cut into contiguous PP stages, one process per
 stage; a stage holds only its own layers (the first stage also the embeddings, the
 last stage the final LayerNorm and LM head), so no stage stores the whole model.
+The stage itself is :class:`resihp.parallel.tp.TensorParallelStage` -- there is one
+stage class for the whole project, so PP ownership and TP layout are always
+expressed together and a TP-degree-1 pipeline is just that class over a one-rank
+group.
 
 :class:`PipelineRuntime` executes one training iteration as a genuine **1F1B**
 schedule over a PP process group, emitting the plan's Forward / Backward / Send /
@@ -41,11 +45,8 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-from torch import nn
 from torch.nn import functional as F
 
-from ..config import TrainConfig
-from ..model import TransformerBlock
 from ..planner.pp import repartition_pp
 from ..reference import ADAM_BETAS, ADAM_EPS, LEARNING_RATE, WEIGHT_DECAY
 from .reshard import shard_dims
@@ -68,68 +69,10 @@ def balanced_layers(num_layers: int, num_stages: int) -> tuple[tuple[int, ...], 
     return tuple(stages)
 
 
-class PipelineStage(nn.Module):
-    """One PP stage: a contiguous subset of layers plus the boundary modules.
-
-    Submodules are named exactly as the reference, so ``named_parameters`` yields
-    the stable logical names (``layers.<gid>.attn.q_proj.weight``) and the stage is
-    loaded from a reference ``logical_state_dict`` by those names -- a layer keeps
-    its name after moving here from another stage. The first stage owns the
-    token/position embeddings and the last stage the final norm and LM head, which
-    is plan 3.4's "embedding / LM head belong to the first / last executable stage".
-    """
-
-    def __init__(
-        self,
-        config: TrainConfig,
-        *,
-        vocab_size: int,
-        sequence_length: int,
-        layer_ids,
-        is_first: bool,
-        is_last: bool,
-        source_state: dict,
-    ):
-        super().__init__()
-        self.layer_ids = tuple(sorted(int(gid) for gid in layer_ids))
-        self.is_first = is_first
-        self.is_last = is_last
-        self.dim = config.model_dim
-        self.vocab_size = vocab_size
-        self.sequence_length = sequence_length
-        if is_first:
-            self.token_embedding = nn.Embedding(vocab_size, config.model_dim)
-            self.position_embedding = nn.Embedding(sequence_length, config.model_dim)
-        self.layers = nn.ModuleDict(
-            {str(gid): TransformerBlock(config.model_dim, config.num_heads) for gid in self.layer_ids}
-        )
-        if is_last:
-            self.final_norm = nn.LayerNorm(config.model_dim)
-            self.lm_head = nn.Linear(config.model_dim, vocab_size, bias=False)
-        with torch.no_grad():
-            for name, param in self.named_parameters():
-                param.copy_(source_state[name])
-
-    def forward(self, *, tokens=None, hidden=None):
-        if self.is_first:
-            positions = torch.arange(tokens.shape[1], device=tokens.device)
-            x = self.token_embedding(tokens) + self.position_embedding(positions)
-        else:
-            x = hidden
-        for gid in self.layer_ids:
-            x = self.layers[str(gid)](x)
-        if self.is_last:
-            x = self.lm_head(self.final_norm(x))
-        return x
-
-    def logical_state_dict(self) -> dict:
-        """Owned parameters keyed by their stable logical name."""
-        return {name: param for name, param in self.named_parameters()}
-
-
 class PipelineRuntime:
     """1F1B execution of one training iteration over a linear pipeline of stages.
 
+    ``stage`` is this rank's :class:`resihp.parallel.tp.TensorParallelStage`.
     ``stage_ranks`` are the **global** ranks of the stages in pipeline order, so
     this rank's neighbours are its adjacent entries; ``group`` is the process group
     the transfers ride on. :meth:`train_step` runs the schedule and applies one
@@ -137,7 +80,7 @@ class PipelineRuntime:
     issued, in order.
     """
 
-    def __init__(self, stage: PipelineStage, *, stage_ranks, num_micro_batches: int, group=None):
+    def __init__(self, stage, *, stage_ranks, num_micro_batches: int, group=None):
         self.stage = stage
         self.group = group
         self.stage_ranks = tuple(int(rank) for rank in stage_ranks)

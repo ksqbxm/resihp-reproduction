@@ -180,17 +180,25 @@ def _reference(device):
     return source, tokens, grads, updated, float(loss.detach())
 
 
-def _stage(source, *, layer_ids, is_first, is_last, device):
-    from resihp.parallel.pp import PipelineStage
+def _stage(source, *, layer_ids, is_first, is_last, device, world_size):
+    """A TP-degree-1 stage: one TP rank per stage, so every rank gets a solo group."""
+    import torch.distributed as dist
 
-    return PipelineStage(
+    from resihp.parallel.reshard import shard_dims, shard_logical_state
+    from resihp.parallel.tp import TensorParallelStage
+
+    solo = [dist.new_group([peer]) for peer in range(world_size)][dist.get_rank()]
+    return TensorParallelStage(
         _config(),
         vocab_size=VOCAB,
         sequence_length=SEQLEN,
         layer_ids=layer_ids,
         is_first=is_first,
         is_last=is_last,
-        source_state=source,
+        local_state=shard_logical_state(
+            source, layout=shard_dims(layer_ids), tp_rank=0, tp_size=1
+        ),
+        group=solo,
     ).to(device).train()
 
 
@@ -247,7 +255,14 @@ def _assert_runtime(results, ref_loss, *, label):
 def _run_dp_normalization(rank, world_size, device):
     """Two full-model replicas, an imbalanced 3-vs-1 micro-batch split."""
     source, tokens, ref_grads, ref_updated, ref_loss = _reference(device)
-    stage = _stage(source, layer_ids=range(_config().num_layers), is_first=True, is_last=True, device=device)
+    stage = _stage(
+        source,
+        layer_ids=range(_config().num_layers),
+        is_first=True,
+        is_last=True,
+        device=device,
+        world_size=world_size,
+    )
     assignment = _assignment([(0, 0, 0, (0,)), (1, 0, 0, (0,)), (2, 0, 0, (0,)), (3, 0, 1, (1,))])
     result = _runtime_result(
         stage, replica_id=rank, assignment=assignment, tokens=tokens, ref_grads=ref_grads, ref_updated=ref_updated
@@ -265,7 +280,12 @@ def _run_cross_replica(rank, world_size, device):
     stage_id = rank % 2
     replica = rank // 2
     stage = _stage(
-        source, layer_ids=groups[stage_id], is_first=stage_id == 0, is_last=stage_id == 1, device=device
+        source,
+        layer_ids=groups[stage_id],
+        is_first=stage_id == 0,
+        is_last=stage_id == 1,
+        device=device,
+        world_size=world_size,
     )
     assignment = _assignment(_CROSS_SPEC)
     result = _runtime_result(
@@ -287,7 +307,14 @@ def _run_pp_heterogeneous(rank, world_size, device):
         replica, layer_ids, is_first, is_last = 0, (2, 3), False, True
     else:
         replica, layer_ids, is_first, is_last = 1, range(_config().num_layers), True, True
-    stage = _stage(source, layer_ids=layer_ids, is_first=is_first, is_last=is_last, device=device)
+    stage = _stage(
+        source,
+        layer_ids=layer_ids,
+        is_first=is_first,
+        is_last=is_last,
+        device=device,
+        world_size=world_size,
+    )
     assignment = _assignment([
         (0, 0, 0, (0,)), (0, 1, 0, (1,)),
         (1, 0, 0, (0,)), (1, 1, 0, (1,)),
@@ -314,7 +341,8 @@ def _run_tp_heterogeneous(rank, world_size, device):
     from torch.nn import functional as F
 
     from resihp.parallel.dp import dp_combine_gradients
-    from resihp.parallel.tp import TensorParallelTransformer
+    from resihp.parallel.reshard import shard_dims, shard_logical_state
+    from resihp.parallel.tp import TensorParallelStage
 
     source, tokens, ref_grads, _ref_updated, _ref_loss = _reference(device)
     group_a = dist.new_group([0, 1])
@@ -326,11 +354,24 @@ def _run_tp_heterogeneous(rank, world_size, device):
     else:
         replica, tp_group, micros = 1, group_b, [2, 3]
 
-    model = TensorParallelTransformer(
-        _config(), vocab_size=VOCAB, sequence_length=SEQLEN, group=tp_group, source_state=source
+    layer_ids = range(_config().num_layers)
+    model = TensorParallelStage(
+        _config(),
+        vocab_size=VOCAB,
+        sequence_length=SEQLEN,
+        layer_ids=layer_ids,
+        is_first=True,
+        is_last=True,
+        local_state=shard_logical_state(
+            source,
+            layout=shard_dims(layer_ids),
+            tp_rank=dist.get_rank(tp_group),
+            tp_size=dist.get_world_size(tp_group),
+        ),
+        group=tp_group,
     ).to(device).train()
     for index in micros:
-        logits = model(chunks[index])
+        logits = model(tokens=chunks[index])
         loss = F.cross_entropy(
             logits[:, :-1].reshape(-1, VOCAB), chunks[index][:, 1:].reshape(-1)
         ) / MICRO

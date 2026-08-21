@@ -103,16 +103,31 @@ def _layout_worker(rank, port):
     import torch.distributed as dist
 
     from resihp.config import TrainConfig
-    from resihp.parallel.tp import TensorParallelTransformer
+    from resihp.model import ReferenceTransformer
+    from resihp.parallel.reshard import shard_logical_state
+    from resihp.parallel.tp import TensorParallelStage
 
     dist.init_process_group(backend="gloo")
     config = TrainConfig(
         model_dim=16, num_layers=3, num_heads=4, batch_size=4,
         micro_batch_size=2, seed=7, tp=1, pp=1, dp=1, iterations=1,
     )
-    model = TensorParallelTransformer(config, vocab_size=32, sequence_length=8)
-    from_module = {name: dim for name, (_, dim) in model.local_shards().items()}
-    assert from_module == shard_dims(model.layer_ids), (from_module, shard_dims(model.layer_ids))
+    layer_ids = range(config.num_layers)
+    layout = shard_dims(layer_ids)
+    reference = ReferenceTransformer(config, vocab_size=32, sequence_length=8)
+    stage = TensorParallelStage(
+        config,
+        vocab_size=32,
+        sequence_length=8,
+        layer_ids=layer_ids,
+        is_first=True,
+        is_last=True,
+        local_state=shard_logical_state(
+            reference.logical_state_dict(), layout=layout, tp_rank=0, tp_size=1
+        ),
+    )
+    from_module = {name: dim for name, (_, dim) in stage.local_shards().items()}
+    assert from_module == layout, (from_module, layout)
     dist.destroy_process_group()
 
 

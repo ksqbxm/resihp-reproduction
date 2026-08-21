@@ -121,6 +121,9 @@ def save_checkpoint(path: str | Path, run: ReferenceRun, *, plan_version: int = 
         raise CheckpointError("plan_version 必须是非负整数")
 
     payload = _build_payload(run, plan_version)
+    # Stored so a later load can tell a byte-corrupted file from a valid one; the
+    # digest covers every other field, so adding it does not change its own value.
+    payload["digest"] = _payload_digest(payload)
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
     try:
@@ -162,6 +165,7 @@ def _validate(payload: dict, run: ReferenceRun) -> None:
     if completed == 0:
         if optim:
             raise CheckpointError("游标不一致：completed_steps 为 0 但优化器状态非空")
+        _verify_digest(payload)
         return
     # A stepped checkpoint must carry optimizer state for exactly every
     # parameter; an empty or partial ``optim`` would otherwise slip past the
@@ -174,6 +178,16 @@ def _validate(payload: dict, run: ReferenceRun) -> None:
         step = _step_int(state["step"])
         if step != completed:
             raise CheckpointError(f"游标不一致：completed_steps={completed} 但 {name}.step={step}")
+    _verify_digest(payload)
+
+
+def _verify_digest(payload: dict) -> None:
+    """Last check, so a structural fault reports its own root cause first."""
+    stored = payload.get("digest")
+    if stored is None:
+        raise CheckpointError("checkpoint 缺少内容摘要")
+    if _payload_digest(payload) != stored:
+        raise CheckpointError("checkpoint 摘要不匹配：内容已损坏")
 
 
 def _restore(payload: dict, run: ReferenceRun) -> None:
@@ -188,6 +202,38 @@ def _restore(payload: dict, run: ReferenceRun) -> None:
     if payload["cuda_rng_state"] is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(payload["cuda_rng_state"])
     run.cursor = payload["completed_steps"]
+
+
+def load_anchor(path: str | Path) -> tuple[dict[str, dict[str, torch.Tensor]], int]:
+    """Read the checkpoint as the full logical anchor, with its completed-step count.
+
+    The checkpoint leg of the single recovery path (plan 3.6). A missing file, an
+    unreadable payload, and a payload whose content no longer matches its stored
+    digest each raise :class:`CheckpointError` naming exactly that root cause, which
+    the control plane turns into the ``checkpoint_unusable`` consistent stop.
+
+    Returns ``(anchor, completed_steps)``. The anchor is ``{logical name:
+    {"param"/"exp_avg"/"exp_avg_sq"/"step": full tensor}}`` -- topology-free, so
+    recovery re-shards it under the new plan alone; it carries no ``grad``, which lives
+    only in the running processes. ``completed_steps`` is the iteration count the
+    checkpoint resumes from, which is also the data cursor (plan 3.1).
+    """
+    path = Path(path)
+    if not path.exists():
+        raise CheckpointError(f"checkpoint 缺失: {path}")
+    try:
+        payload = _torch_load(path)
+    except Exception as error:
+        raise CheckpointError(f"checkpoint 损坏，无法读取 {path}: {error}") from error
+    _verify_digest(payload)
+    anchor = {}
+    for name, param in payload["params"].items():
+        entry = {"param": param}
+        state = payload["optim"].get(name)
+        if state is not None:
+            entry.update({key: state[key] for key in _OPTIM_STATES})
+        anchor[name] = entry
+    return anchor, payload["completed_steps"]
 
 
 def load_checkpoint(path: str | Path, run: ReferenceRun) -> tuple[int, int]:

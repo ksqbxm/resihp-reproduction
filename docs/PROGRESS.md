@@ -377,3 +377,128 @@
 - 运行时按**全前向→全反向**最简 DP 调度，无 1F1B 交叠（PP 交叠是 T12 职责，本任务不重做）；`DataParallelRuntime` 只驱动 **TP 未分片**（TP1）的 `PipelineStage` replica，TP 分片前反向仍是 T10 `TensorParallelTransformer` 的职责。`tp_heterogeneous` 门禁只对**DP 合并**用真实 TP2 分片梯度验收；「同一 run 内 TP×DP 端到端」属 T15 两两组合。
 - 运行时消费 T5 assignment 但门禁多用**手工构造**的 assignment 以覆盖逐-stage 跨-replica（T5 现产整-replica）；把 T5 逐-stage reroute 与运行时对接、接进安全点⑦ `_recover_state` 的真正收集/重切链路属 T14。`control.py` 本任务未动。
 - 数值验收 `allclose`，与 T10/T12 同口径；完整 3D `TP2×PP2×DP2` 8 进程端到端属 T16。
+
+## T14：原子重配与一致停止
+
+状态：实现完成，**分布式门禁（Gloo + 真实 GPU/NCCL）待 torch 环境执行**（本机无 torch，计划硬性禁止安装/升级 torch，故 `mp.spawn` 门禁需在带 torch 的目标机跑）。
+
+新增：`resihp/recovery.py`、`tests/test_recovery.py`。改动：`resihp/parallel/tp.py`（TP 模块参数化为**唯一的 stage 类**）、`resihp/parallel/pp.py`（删掉重复的 `PipelineStage`）、`resihp/parallel/dp.py`（运行时接真实 TP stage + TP 感知的 stage 边界）、`resihp/parallel/reshard.py`（donor 按分片 degree 分组 + `shard_logical_state`）、`resihp/control.py`（安全点②/⑦真正落地 + 一致停止协议 + 按 plan.stages 建组）、`resihp/checkpoint.py`（+内容摘要、+`load_anchor`）、`resihp/train.py`（入口跑真实 3D + 停止即正常退出）、`tests/test_control.py`、`tests/test_parallel_{tp,pp,dp,reshard}.py`（随 stage 类统一而更新）。
+
+### T14 是编排层，不是第二套 PP/DP
+
+唯一恢复路径**完全由新 `ExecutionPlan` 驱动**，每个环节交给它的属主模块：
+
+| 关注点 | 来源 | 由谁执行 |
+|---|---|---|
+| TP 成员 / degree | `StagePlan.tp_members` / `tp_degree` | T11 `reshard_tp_state`（健康 peer 优先 → checkpoint 兜底 → 按新 degree 重切） |
+| stage 层归属与变化 | `StagePlan.layer_range`（新旧两版计划） | T12 `LayerPlacement` / `reshard_layout` |
+| micro-batch·stage executor | `ExecutionPlan.placements` | T13 `DataParallelRuntime`（`dp_assignment(plan)` 直接把计划的 placements 还原成 `DPAssignment`） |
+| 训练通信组 | `plan.stages` / `plan.active_ranks` | `ControlPlane.build_training_groups` |
+| stage 实例化 | 上面三者的组合 | T10 `TensorParallelStage` |
+
+`recovery.py` 里没有任何前反向、调度或通信原语；`ControlPlane.training_step()` 就是 `PlannedRun.step()` → `DataParallelRuntime.train_step()`。**不存在 PP=1 假设**：布局一律由 `stage_layout(plan, stage)` 从 `layer_range` 推出，embedding / LM head 归属该 replica 的首 / 末**可执行** stage。
+
+### 唯一的 stage 类（本轮最大的结构改动）
+
+改前 T10 的 `TensorParallelTransformer` 是「TP 分片但整模型」，T12 的 `PipelineStage` 是「层子集但不分片」——两者的 forward 逻辑重复，且**没有任何类能同时表达「PP 层子集 + TP 分片」**，这正是上一版 T14 只能退化成「每 rank 整模型」的根因。
+
+改法：把 T10 的类参数化为 `TensorParallelStage(config, *, vocab_size, sequence_length, layer_ids, is_first, is_last, local_state, group)`，删除 `PipelineStage`，`PipelineRuntime` / `DataParallelRuntime` 一律驱动它。整模型 TP run = 「拥有全部层且首尾皆是」的 stage；TP degree 1 的流水 stage = 同一个类跑在单 rank 组上（T10 已证明 degree 1 时集合通信是 no-op、与参考逐比特一致）。**不保留兼容层**：`source_state`（构造函数内部分片）改为 `local_state`（**本 rank 的分片**，正是 `reshard_tp_state` 的返回形状），调用方需要时用新增的 `shard_logical_state(full, layout=, tp_rank=, tp_size=)` 自己切——于是「stage 永远按当前计划给的布局实例化」是构造函数层面的事实，而不是约定。
+
+### 恢复链路（安全点②/⑦/⑧）
+
+- **②提交 checkpoint**：全体 rank 用整模型布局做一次 `reshard_tp_state(new_size=1)`，各 stage / 各 replica 的分片并起来就是完整逻辑态；仅 rank 0 原子落盘，磁盘恒为唯一文件。
+- **⑦恢复**：`load_anchor` 读 checkpoint → `acquire_layout` 算出**本 stage 必须重新获取**的名字 → `reshard_tp_state` 按新 degree 取回 → 与「本 rank 已持有且布局未变」的名字合并 → 用 `TensorParallelStage` 按 `layer_range` + TP 组实例化 → 用 `DataParallelRuntime` 按 `plan.placements` 建运行时 → 装回 AdamW 矩状态与 `cursor`。
+- **`acquire_layout` 就是 T12 的迁移视图**：`LayerPlacement` 由**新旧两版计划**读出（不重跑 `repartition_pp`，避免出现第二个布局权威），交给 `reshard_layout` 选出「换了 stage **或** 换了 degree」的层；`reshard_layout` 按设计不含 embedding / LM head，而首 / 末可执行 stage 变更时这两者的 owner 会变——**这正是 T12 明确留给 T14 的口子**，在此补齐。没被选中的名字本 rank 已按正确布局持有，**一个字节都不搬**（`active_ranks` 单调收缩这一计划不变量保证了「degree 不变 ⇒ 成员与分片下标都不变」，已写进 docstring）。
+- **⑧校验**：把**实际装好**的分片再 gather 回完整逻辑态，与 anchor 逐张量 `torch.equal`（计划 3.3 第 5 步 = 停止条件「状态重切后完整逻辑张量不一致」），其摘要即步骤⑧的 state digest，因构造相同故各 rank 天然一致。⑦的 acquire 那次重切因此不再重复校验（`verify=False`），不做两遍。
+
+### 六条一致停止条件
+
+`STOP_CODES` 六项：`no_feasible_tp` / `no_executable_pp` / `no_feasible_dp_target`（planner 原码原文透传）+ `checkpoint_unusable` / `plan_disagreement` / `state_mismatch`（控制面自己观测）。
+
+- **共识而非本地判定**：`ControlPlane.agree(reason, **digests)` 在**常驻控制组**上 `all_gather_object`，任一 rank 报出的原因、或任一摘要不一致，都让**每个** rank 抛出**同一个** `ConsistentStop`——原因取自 gather 到的列表（最低报告 rank / 摘要集合），不取本地视角，否则「rank 3 与其余不一致」会让双方各报各的。
+- **计划摘要必须在建组之前对**：计划 3.2 把摘要校验放在第⑧步，但**用互不相同的计划去建组本身就是死锁**（`new_group` 是全局集合调用且成员表不同）。所以第⑤步重规划后立刻 `agree(reason, plan=digest)`；第⑧步再对 plan + state 双摘要。同一个 `agree`，不是第二条路径。
+- **无半完成组/计划**：⑤处停止时新组根本没建；⑦/⑧处停止时 `except ConsistentStop` 先 `destroy_training_groups()` 再抛。门禁统一断言「组要么原封不动是故障前那对，要么已销毁」。
+- **故障前 checkpoint 完好**：停止路径在第②步之后不再写盘；除 `checkpoint_unusable`（注入手段本身就是删掉它）外均断言仍可 `load_checkpoint` 回 `(1, 0)`。
+- **只指根因**：`_recovery_stop` 只把 `CheckpointError` / `ReshardError` 归为停止条件，其它异常原样上抛——那是 bug 不是资源条件。
+
+### 其它必要改动
+
+- **训练组按计划建两类**：每个 active stage 一个 **TP 子组**（stage 分片执行用），外加一个覆盖 `plan.active_ranks` 的 **executor 组**（assignment 驱动的流水 P2P 与 DP 梯度合并用）。全体 rank 按 `(replica_id, stage_id)` 顺序对每组调 `new_group`，只留自己那个。
+- **`DataParallelRuntime` 的 stage 边界改为 TP 感知**：原实现 `route["downstream"][0]` 只发给下游 stage 的第一个 executor——TP degree > 1 时其余 TP rank 收不到激活。改为「两侧 **leader** 之间搬**一份**权威副本 + 接收方在自己的 TP 组内 `broadcast`」：既不像 all-reduce 那样重复累加，也不会让非 leader 挨饿；反向同理（stage 输入的梯度经 `_CopyToRegion` 已在 TP 组内 all-reduce 过，各 TP rank 一致，leader 直接回送即可）。degree 1 时 broadcast 跳过，行为与改前逐字相同。`executor_route` 相应多返回 `executors`（本 `(micro, stage)` 的整组 executor）。
+- **`_combine_and_step` 用真实分片元数据**：原来硬编码 `shard_dim=None, old_size=1`（只对 TP1 成立）；改为取自 stage 的 `local_shards()` / `tp_rank` / `tp_size`——`dp_combine_gradients` 本就按「每 replica 重建完整逻辑梯度 → 跨 replica 求和 → 按各自布局重切」写成通用形态，这里只是把真实值喂进去。`self.rank` 也由 `get_rank(group)` 改为**全局** rank：assignment 说的就是全局 rank，传子组时原写法会查错。
+- **异 degree donor 分组**（承上一版）：贡献按 `(shard_count, shard_index)` 归档，`_reconstruct` 按确定顺序挑第一个完整 donor 集。单 rank 逐次失效下 replica A 已是 TP1、replica B 仍是 TP2 时，degree-1 的 index 0 是整份、degree-2 的 index 0 是一半，平铺合并会拼出乱码。
+- **`reconfigure` 接入显存门**；**checkpoint 内容摘要 + `load_anchor`**（缺失/损坏/摘要不匹配分别指名根因，摘要校验放在结构校验**之后**，让「缺参数/形状错/游标不一致」仍报各自根因）。
+- **入口 `resihp/train.py` 跑真实 3D**：建初始计划 → 建组 → `initial_run` 按计划实例化本 rank 的 stage → 循环 `training_step()`；`VOCAB_SIZE` / `SEQUENCE_LENGTH` 作为运行常量（训练配置 schema 由 T1 锁定，不含这两项）。`ConsistentStop` 打印结构化根因后正常退出。
+- **删除被本次改动孤立的符号**：`PipelineStage`、`ControlError`、`agree_on_digest`（并入 `agree`）、`_state_digest()`（改为 `state_digest` 属性）、`training_step(plan)` 的 T9 all-reduce 占位分支。
+
+### 本机可做的验证（无 torch）
+
+- `python -m py_compile`（全包 + 全部测试）：通过。全量 `python -m pytest -q`：**75 passed, 8 skipped**，既有 75 项无回归。
+- **离线仿真 1**（假 torch，1-D FakeTensor 跑 `_merge`/`_reconstruct` 真身）：同构 degree-2 拼接；**异构 degree（1 与 2 并存、degree-2 缺 index 1）落到 degree-1 完整集**；全缺失落 checkpoint；两处都无则抛 `ReshardError`；旧格式按 `old_size` 归档；复制张量任取一份。全过。
+- **离线仿真 2**（线程扮演 rank + 假 `torch.distributed`，跑 `ControlPlane.safe_point` 真身，集合通信按真实 rendezvous 语义实现）：四类停止（`no_feasible_tp` 走真实 `build_plan` 显存门、`plan_disagreement` 只改 rank 1 的重规划、`checkpoint_unusable`/`state_mismatch` 在⑦处抛）**全部：无 rank 阻塞、码与消息各 rank 完全一致、`published == []`、组不残留**；逐类核对建组次数——⑤处停止时新组**一次都没建**，⑦处停止时新组建了又被销毁。健康路径：一个新版本、摘要唯一、只有幸存 rank 拿到新组。
+- **离线仿真 3（本轮新增）**：线程扮演 4 个 rank，假 P2P 按**严格 rendezvous**（送出必须等到对端 post 对应 recv 才完成，即 NCCL 侧最保守的模型）跑 `DataParallelRuntime.train_step` **真身**，拓扑 `TP2 × PP2`。结果：**无死锁**；各 rank 恰好执行 assignment 给它的 `(micro, stage)`；首 stage 走 `tokens=` 分支、后续 stage 走 `hidden=`；activation 峰值 2、结束清空；每 rank 恰一次 WeightUpdate；**P2P 只由两侧 leader（rank 0 与 rank 2）承担**，TP peer 靠组内 broadcast 拿到副本——即每个边界跳只有一份权威副本。
+- **planner 层预期值核对**（真实 `build_plan`，无 torch）：`PIPELINE`（TP2×PP2×DP1，6 层）掉 rank 1 → stage0 degree 2→1 且层 0-2 缩为 0-1，**层 2 迁到 stage1**（2-5）；`REPLICATED`（TP2×PP1×DP2）掉 rank 1 → replica0 degree 1 而 replica1 不变（**未受影响的 replica 一个字节不搬**），再掉 rank 3 → 两 replica 在事件②时 degree 各为 1 与 2（异构 donor 路径）；`test_control` 的 8 进程 3D 布局逐 rank 层归属亦逐项核对。
+- 另外确认：`tp=4` 且连续两次故障会命中 T6 的 `active ranks must shrink monotonically` 不变量（`choose_tp` 会想启用一个先前 idle 的 rank），`build_plan` 直接抛 `PlanInvariantError`。它在各 rank 上确定且一致，不会脑裂；但它既不是计划也不是六条停止之一，记为遗留。
+
+### 待目标机（带 torch）执行的门禁
+
+`python3 -m pytest -q tests/`（重点 `tests/test_recovery.py`、`tests/test_control.py`，以及随 stage 类统一而改动的 T10/T11/T12/T13 用例），Gloo/NCCL 双后端跑同一 runner（控制组两种后端下都是 Gloo——它必须常驻且要跑对象集合；只有训练组切 NCCL）：
+
+- **纯函数**：`stage_layout` 按 `layer_range` 给出层归属、embedding/LM head 落在首/末可执行 stage、两 stage 不相交；`acquire_layout` 在 `PIPELINE` 事件下对 stage0 给出「层 0,1 + embedding」、对 stage1 给出「只有迁入的层 2」且真子集于其拥有集；未受影响的 replica 取到 `{}`；peer 与 checkpoint 同时可用时 **peer 胜出**；checkpoint 缺失 / 不可读 / 篡改后摘要不匹配分别指名根因；三个 planner 码由真实 planner 抛出。
+- **恢复（4 rank）**：`pipeline`（TP2×PP2×DP1）——一次事件同时覆盖 TP 重切、**真实 PP 层迁移**、embedding 重切、以及「原地不动因而不搬」的层；`replicated`（TP2×PP1×DP2）——连续两次 fail-stop，事件①从 peer replica 收集且该 replica 自身零搬运，事件②两 replica degree 不同。两者都断言：恢复后各 rank **持有的名字恰好是其新 stage 该拥有的**（不多不少，即不再是每 rank 整模型），且逐张量 `torch.equal` 等于 checkpoint 在新 degree 下的切片（原则 A 恢复前口径）；被踢 rank 不持有任何状态；每事件只产生一个新版本；恢复后继续训练；最后 checkpoint 可重载。
+- **停止（2 rank，六条各一个用例，参数化）**：全体同码同消息 / 无新计划外泄 / 无属于被否决计划的活组 / 无残留进程组 / 故障前 checkpoint 可重载 / 消息不提第二个条件；并用带超时的 `mp.spawn(join=False)` 轮询确保**超时前全体退出**而不是卡在集合通信里。
+- **GPU/NCCL**：与 Gloo 同全部场景，在真实 GPU 张量 + 真实 NCCL 训练组上重跑（断言 `torch.cuda.current_device()==rank`、参数 `is_cuda`、`get_backend(tp_group)=="nccl"`）。恢复用例需 **4 GPU**，六条停止用例只需 **2 GPU**。
+- **回归**：`tests/test_control.py` 现在是真实 `TP2×PP2×DP2` 8 进程运行（每 rank 只持自己 stage 的层），仍锁定「每事件一个版本 / 失效 rank 永久退出 / 各 rank 摘要一致 / 无残留组」。
+
+通过后本节状态改为「实现完成，待审核」。
+
+### 遗留问题
+
+- ~~`no_executable_pp` / `no_feasible_dp_target` 不可达~~ —— **已解决**，见下节「遗留问题清算」第 1 条。
+- ~~`tp≥4` 连续故障撞上 `PlanInvariantError`~~ —— **已解决**，见下节「遗留问题清算」第 2 条。
+- **`PipelineRuntime`（T12 的 1F1B）未被控制面使用**：安全点接的是 T13 的 assignment 驱动运行时（micro-batch·stage executor 是它的职责）。1F1B 与 assignment 路由在同一 run 内合流属 T15 两两组合。
+- **`_recovery_stop` 只认两类异常**：其它异常照常上抛，此时该 rank 会离开而其余 rank 仍等在 `agree` 上——门禁的超时轮询会判失败而不是无限挂起。这是刻意的：把任意 bug 包装成「干净停止」会掩盖问题。
+- 每个安全点有三次全局对象 gather（②提交、⑦获取、⑧校验），各自对应计划里一个明确步骤，未做合并；本复现模型极小，未做性能优化。
+
+### 遗留问题清算（本轮：两条遗留全部解决，不再推给 T15/T16）
+
+#### 1. `no_executable_pp` / `no_feasible_dp_target` 不可达 —— 结论：**是 build_plan 掩盖了根因，非语义冗余**
+
+逐条分析后，两者都属「前面的 planner 仍可行、当前 planner 独立不可行」的**合法输入**，此前不可达是 `build_plan` 的提前过滤与状态传递造成的：
+
+- **`no_executable_pp`**：`if not any(new_tp): continue` 把「整组失效的 replica」静默跳过，并在**所有** replica 都死时另起炉灶报一个自造码 `no_surviving_replica`（该码甚至不在 `STOP_CODES` 里）。修正：把被清空的 replica 的 `(old_layers, old_tp, new_tp)` 记下来，循环结束若无任何存活 replica，就把它交回 `repartition_pp`——全零 capacity 下它必然抛出自己的 `no_executable_pp`。自造码 `no_surviving_replica` 随之删除，`STOP_CODES` 六项恰好等于可达集合。
+  - 附带修正（本轮自查发现的**新缺陷**）：第一版把 `wiped_out[0]` 无条件取第一个记录，而**上一轮事件就已清空**的 replica 在 `old_layout` 里没有任何层，`repartition_pp` 会以 `ValueError: old_stage_layers must contain at least one layer` 拒绝**输入**而不是报告条件——又一个未分类逃逸。改为只记录 `any(old_tp)` 的 replica：本次事件才被打空的那个才是证据。实测 `TP2×PP1×DP2` 依次杀 0→1→2→3 现在给出 `no_executable_pp`。
+- **`no_feasible_dp_target`**：`build_plan` 建 `DPTopology` 时**根本没传 `memory_budget`**，于是计划 3.5 明写的 `MemoryFeasible` 判定从未运行。这不是冗余检查：`choose_tp` 只能用每个 stage 的**旧**层数把关（重分层需要新 degree，顺序上必须在后），而 `repartition_pp` 可以把**更多**层交给某个 stage——TP 门放行的和最终发布的不是同一个布局。数值搜索确认存在这样的输入（`L=4, pp=2, tp=2, dp=1`，杀 2 再杀 3：TP 只按 3 层校验过，最终 stage 要装 4 层）。修正：把 `memory_budget` / `sequence_length` / `vocab_size` / `in_flight_micro_batches` 透传给 `DPTopology`，并把 `InfeasibleDP` 包成 `InfeasiblePlan`（此前**根本没包**，会以裸异常逃逸）。DP 于是成为唯一看得见最终布局的关口，正是计划 3.5 的原文。
+- 六条停止条件与当前 planner 模型**不冗余**：三个 planner 码各自对应一个真实且互不蕴含的失败面（degree 无解 / 无流水可排 / 最终布局装不下）。
+
+#### 2. `active ranks must shrink monotonically` —— 语义错误，已换成真正的 fail-stop 表述
+
+最小复现（`TP4×PP1×DP1`，world 4）：
+
+```
+v0  failed=()      active=(0,1,2,3)  members=(0,1,2,3)
+v1  failed=(0,)    active=(1,2)      members=(1,2)      <- 健康的 rank 3 被闲置
+v2  planner 想要   members=(2,3)                        <- rank 3 从未失效，只是上一版没被选中
+    assert_invariants: active(2,3) ⊄ previous.active(1,2)  -> PlanInvariantError
+```
+
+根因：`choose_tp` 取存活者里**最大 2 的幂前缀**，因此会合法地闲置健康 rank；旧不变量把「本版未被使用」等同于「永久失效」，于是禁止了完全合法的重新启用。
+
+修正后的语义：`failed_ranks` 严格累计（`previous.failed ⊆ failed`），且 `active ∩ failed == ∅`——**两者合起来就是「失效 rank 永不重回训练路径」**，同时不再限制健康闲置 rank 被重新选中。
+
+- 关于「换一条不变量」而不是删除：先写成 `active ⊆ previous.live_ranks`，随后证明它**恒真、不可达**——`active ∩ failed == ∅` 且 `previous.failed ⊆ failed` 即可推出 `active ∩ previous.failed == ∅`，写不出任何能触发它却通过前两条的计划（回归测试也因此写不出来）。为避免留下一行永不执行的断言，改为**删除该行并把保证写在承载它的两条检查处**；回归测试从两条**可达**路径钉死：把 rank 从 failed 里摘掉 → `failed ranks must grow`；留在 failed 里却仍排它上阵 → `active and failed ranks overlap`。
+
+#### 3. 上述改动连带暴露并修掉的两个真实缺陷
+
+- **`recovery.acquire_layout` 的保留规则不再成立**：它原先依赖被删掉的那条不变量，论证「degree 不变 ⇒ 成员与分片下标不变」。允许重新启用后，`(1,2)@2 → (2,3)@2` 里 rank 2 的 shard index 从 1 变 0、rank 3 全新入座——前者会**静默保留错误的分片**（只能在第⑧步被当成 `state_mismatch` 误报），后者直接 KeyError。改为显式判据 `_keeps_its_shard(previous, plan, stage, rank)`：只有「同 stage、同 degree、同 index」才算已持有正确形状，否则整段重取。边界条件里的 degree 比较随之成为死代码，一并删除。
+- **checkpoint writer 写死 rank 0**：`writer=self.rank == 0` 且 cursor 取自 rank 0 的 run。累计故障下 rank 0 本身可能已失效而不再持有状态，于是会写出 `completed_steps=0` 的**损坏 checkpoint**（下次 load 报「游标不一致」）。改为 `writer=self.rank == plan.active_ranks[0]`——各 rank 从同一计划推出、且必然是一个真正持有状态的 rank。
+- **cursor 来源**：新入座的 rank 没有自己的 cursor 可继承。`load_anchor` 改为返回 `(anchor, completed_steps)`，恢复一律以 checkpoint 的迭代号为准（它本就是计划 3.1 定义的恢复点与数据游标），特判随之消失。
+
+#### 本轮验证
+
+- 全量 `python -m pytest -q`：**81 passed, 8 skipped**（较上轮 75 增 6 项回归用例）。
+- **分类完备性扫描**：6018 条故障顺序（world ≤ 4 穷举、world 8 定种子抽样），有/无显存预算各跑一遍，共 **19884 次合法重规划**；停止分布 `{no_executable_pp: 3018, no_feasible_dp_target: 30, no_feasible_tp: 2970}`，**未分类逃逸 0 次**。
+- 三个离线仿真（异 degree donor 分组 / `safe_point` 一致停止 / `TP2×PP2` 的 `DataParallelRuntime` 严格 rendezvous 收发）全部无回归。
+- 新增回归用例：`tests/test_plan.py` —— 全灭由 PP planner 命名、早已清空的 replica 不作为证据、DP 拒绝装不下的最终布局、失效 rank 两条复活路径均被拒、健康闲置 rank 可被重新选中、累计故障序列不掉出六条分类、同故障序列摘要逐版本一致；`tests/test_recovery.py` —— 失去座位的 rank 一律整段重取、三个 planner 码由**真实重规划**产生（同时校验 `STOP_SCENARIOS` 表诚实）。
+- 六条一致停止的分布式门禁现在**全部走真实 `safe_point → build_plan`**：`no_executable_pp`（world 2，杀 1 再杀 0）与 `no_feasible_dp_target`（`TP1×PP2×DP1`，stage 1 死后 stage 0 吃下全部层并越过预算）不再注入 reason 对象；仅 `plan_disagreement` 仍注入——确定性重规划无法自己和自己不一致，被测的是控制面的反应。
+- 新增恢复门禁 `*_reseat`（`TP4×PP1×DP1`，连杀 0、1）：断言健康闲置 rank 3 被重新启用、rank 2 与 rank 3 在事件②整段重取、且所有在座 rank 恢复到**同一个 cursor**。

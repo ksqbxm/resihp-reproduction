@@ -1,8 +1,10 @@
 """Tests for the fail-stop control plane and nine-step safe point (T9).
 
-The pure ``reconfigure`` test runs anywhere. The eight-process Gloo test needs
-torch and is skipped without it (the plan forbids installing torch on this
-machine, so that gate runs on the target box).
+The pure ``reconfigure`` test runs anywhere. The eight-process Gloo test runs a real
+``TP2 x PP2 x DP2`` layout -- every rank holds the stage its plan gives it and steps
+through the plan's own micro-batch assignment -- and needs torch, so it is skipped
+without it (the plan forbids installing torch on this machine, so that gate runs on
+the target box).
 """
 
 import importlib.util
@@ -29,6 +31,8 @@ CONFIG = TrainConfig(
     dp=2,
     iterations=6,
 )
+VOCAB = 32
+SEQLEN = 8
 FAILURES = {2: 1, 4: 5}  # after_iteration -> failed_rank
 requires_torch = pytest.mark.skipif(
     importlib.util.find_spec("torch") is None, reason="torch not installed"
@@ -66,16 +70,32 @@ def _worker(rank, world_size, result_dir, port):
     import torch.distributed as dist
 
     from resihp.control import ControlPlane
+    from resihp.recovery import initial_run, stage_of
     from resihp.train import build_initial_plan
 
-    control = ControlPlane.initialize(training_backend="gloo")
+    control = ControlPlane.initialize(
+        training_backend="gloo", vocab_size=VOCAB, sequence_length=SEQLEN
+    )
     plan = build_initial_plan(CONFIG)
-    control.build_training_group(plan)
+    control.build_training_groups(plan)
+    control.attach_run(
+        initial_run(
+            plan,
+            rank=rank,
+            vocab_size=VOCAB,
+            sequence_length=SEQLEN,
+            tp_group=control.tp_group,
+            executor_group=control.executor_group,
+        ),
+        checkpoint_path=Path(result_dir, "ckpt.pt"),
+    )
+
     failed = ()
-    versions, digests, trained = [], [], []
+    versions, digests, trained, layers = [], [], [], []
     for step in range(CONFIG.iterations):
         iteration = step + 1
-        if control.training_step(plan) is not None:
+        if control.training_run is not None:
+            control.training_step()
             trained.append(iteration)
         failed_rank = FAILURES.get(iteration)
         if failed_rank is not None:
@@ -84,6 +104,8 @@ def _worker(rank, world_size, result_dir, port):
             )
             versions.append(plan.version)
             digests.append(plan.digest)
+            stage = stage_of(plan, rank)
+            layers.append(None if stage is None else list(range(*stage.layer_range)))
     control.shutdown()
 
     Path(result_dir, f"result_{rank}.json").write_text(
@@ -92,6 +114,7 @@ def _worker(rank, world_size, result_dir, port):
                 "versions": versions,
                 "digests": digests,
                 "trained": trained,
+                "layers": layers,
                 "final_failed": list(plan.failed_ranks),
                 "final_live": list(plan.live_ranks),
                 "still_initialized": dist.is_initialized(),
@@ -130,6 +153,16 @@ def test_control_plane_eight_process_gloo(tmp_path):
     # Every rank agrees on each event's plan digest.
     for event in range(2):
         assert len({results[rank]["digests"][event] for rank in results}) == 1
+
+    # Real PP ownership: each rank keeps only its stage's contiguous layers, and a
+    # rank the plan drops keeps none at all.
+    for rank in (0, 2, 4, 6):
+        assert results[rank]["layers"] == [[0, 1], [0, 1]] or results[rank]["layers"] == [
+            [2, 3],
+            [2, 3],
+        ], results[rank]
+    assert results[1]["layers"] == [None, None]
+    assert results[5]["layers"][1] is None
 
     # Consistent final topology and no residual process group anywhere.
     for result in results.values():

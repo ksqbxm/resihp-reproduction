@@ -23,7 +23,7 @@ from a fixed topology (plan 3.2):
   than a second all-reduce, so heterogeneous replicas combine uniformly.
 
 Only the DP dimension lives here. Sharded TP forward/backward is T10
-(:class:`resihp.parallel.tp.TensorParallelTransformer`) and the 1F1B schedule is T12
+(:class:`resihp.parallel.tp.TensorParallelStage`) and the 1F1B schedule is T12
 (:class:`resihp.parallel.pp.PipelineRuntime`); :func:`dp_combine_gradients` is written
 generally so a TP-degree-heterogeneous DP combine reuses it directly. Micro-batching
 reorders the FP32 reduction, so results match the single-process reference within the
@@ -51,7 +51,9 @@ def executor_route(assignment, rank):
     ``(micro_batch, stage)`` this rank executes, it gives the upstream and downstream
     executor ranks taken straight from the assignment -- the neighbour may sit in a
     different replica, which is exactly how a rerouted micro-batch crosses replicas.
-    ``upstream``/``downstream`` are ``None`` at the pipeline ends.
+    ``executors`` are the ranks running this ``(micro_batch, stage)`` -- the whole TP
+    group of the executing stage; ``upstream``/``downstream`` are ``None`` at the
+    pipeline ends.
     """
     routes = []
     for micro_batch in sorted(assignment.by_micro_batch):
@@ -65,6 +67,7 @@ def executor_route(assignment, rank):
                 {
                     "micro_batch": micro_batch,
                     "stage_id": placement.stage_id,
+                    "executors": placement.executor_ranks,
                     "upstream": upstream,
                     "downstream": downstream,
                 }
@@ -158,14 +161,18 @@ def dp_combine_gradients(local, *, group=None):
 
 
 class DataParallelRuntime:
-    """Cross-replica execution of one iteration for a TP-unsharded stage.
+    """Cross-replica execution of one iteration for one stage.
 
-    ``stage`` is this rank's :class:`resihp.parallel.pp.PipelineStage` (it owns a
-    contiguous layer slice plus, on the ends, the embeddings / LM head). The runtime
-    runs only the micro-batches the assignment routes to this rank, exchanging
-    activations and gradients with the *actual* neighbour executors, then combines
-    gradients across DP replicas and applies one AdamW update. TP sharding is out of
-    scope here (that combine is :func:`dp_combine_gradients`, exercised directly).
+    ``stage`` is this rank's :class:`resihp.parallel.tp.TensorParallelStage` (it owns
+    a contiguous layer slice plus, on the ends, the embeddings / LM head, each
+    sharded over its TP group). The runtime runs only the micro-batches the
+    assignment routes to this rank, exchanging activations and gradients with the
+    *actual* neighbour executors, then combines gradients across DP replicas and
+    applies one AdamW update.
+
+    ``group`` is the process group the transfers and the combine ride on -- it must
+    contain every rank the assignment places. Ranks are **global** throughout, since
+    that is what the assignment names.
     """
 
     def __init__(self, stage, *, replica_id, assignment, group=None):
@@ -173,7 +180,7 @@ class DataParallelRuntime:
         self.replica_id = int(replica_id)
         self.assignment = assignment
         self.group = group
-        self.rank = dist.get_rank(group) if group is not None else dist.get_rank()
+        self.rank = dist.get_rank()
         self.routes = executor_route(assignment, self.rank)
         self.micro_total = global_micro_count(assignment)
         self.activation_log = ActivationLog()
@@ -185,15 +192,30 @@ class DataParallelRuntime:
             weight_decay=WEIGHT_DECAY,
         )
 
-    def _recv(self, peer, shape, device):
+    def _recv(self, route, key, shape, device):
+        """Pull one boundary tensor in and give every TP rank of this stage a copy.
+
+        A stage's activation (and the gradient of its input) is replicated across its
+        TP group, so the boundary moves exactly one authoritative copy between the two
+        stages' leaders and the receiving group replicates it -- never a per-rank sum,
+        which would double-count, and never a single rank holding it, which would
+        starve the others.
+        """
         buffer = torch.empty(shape, device=device)
-        op = dist.P2POp(dist.irecv, buffer, peer, self.group)
-        for work in dist.batch_isend_irecv([op]):
-            work.wait()
+        leader = route["executors"][0]
+        if self.rank == leader:
+            op = dist.P2POp(dist.irecv, buffer, route[key][0], self.group)
+            for work in dist.batch_isend_irecv([op]):
+                work.wait()
+        if self.stage.tp_size > 1:
+            dist.broadcast(buffer, src=leader, group=self.stage.group)
         return buffer
 
-    def _send(self, tensor, peer):
-        op = dist.P2POp(dist.isend, tensor.contiguous(), peer, self.group)
+    def _send(self, route, key, tensor):
+        """Push one authoritative copy from this stage's leader to the peer's."""
+        if self.rank != route["executors"][0]:
+            return
+        op = dist.P2POp(dist.isend, tensor.contiguous(), route[key][0], self.group)
         for work in dist.batch_isend_irecv([op]):
             work.wait()
 
@@ -221,7 +243,7 @@ class DataParallelRuntime:
                 received = None
                 output = self.stage(tokens=chunks[index].to(device))
             else:
-                received = self._recv(route["upstream"][0], shape, device).requires_grad_(True)
+                received = self._recv(route, "upstream", shape, device).requires_grad_(True)
                 output = self.stage(hidden=received)
             self.activation_log.retain(index)
             if self.stage.is_last:
@@ -232,7 +254,7 @@ class DataParallelRuntime:
                 total_loss = total_loss + loss.detach()
                 held[index] = {"received": received, "output": loss}
             else:
-                self._send(output.detach(), route["downstream"][0])
+                self._send(route, "downstream", output.detach())
                 held[index] = {"received": received, "output": output}
 
         # --- backward: return each gradient to the actual upstream executor ----------
@@ -242,29 +264,35 @@ class DataParallelRuntime:
             if self.stage.is_last:
                 context["output"].backward()
             else:
-                grad = self._recv(route["downstream"][0], shape, device)
+                grad = self._recv(route, "downstream", shape, device)
                 context["output"].backward(grad)
             if not self.stage.is_first:
-                self._send(context["received"].grad, route["upstream"][0])
+                self._send(route, "upstream", context["received"].grad)
             self.activation_log.release(index)
 
         self._combine_and_step(device)
         return float(total_loss) if self.stage.is_last else None
 
     def _combine_and_step(self, device):
-        owned = self.stage.logical_state_dict()
+        """Sum each logical gradient across replicas, then apply one AdamW update.
+
+        The shard metadata is the stage's own, so a replica running a different TP
+        degree (or a different PP layering) still combines through the one
+        reconstruct-sum-rechunk path.
+        """
+        shards = self.stage.local_shards()
         local = {
             name: {
                 "grad": param.grad if param.grad is not None else torch.zeros_like(param),
-                "shard_dim": None,   # PipelineStage layers are TP-unsharded here
-                "shard_index": 0,
-                "old_size": 1,
+                "shard_dim": shard_dim,
+                "shard_index": self.stage.tp_rank,
+                "old_size": self.stage.tp_size,
                 "replica": self.replica_id,
             }
-            for name, param in owned.items()
+            for name, (param, shard_dim) in shards.items()
         }
         combined = dp_combine_gradients(local, group=self.group)
         with torch.no_grad():
-            for name, param in owned.items():
+            for name, (param, _dim) in shards.items():
                 param.grad = combined[name].to(device)
         self.optimizer.step()

@@ -66,7 +66,7 @@ def shard_dims(layer_ids) -> dict[str, int | None]:
     """Logical name -> shard dim (``None`` = replicated) for the whole model.
 
     The single source of truth for the TP shard layout, matching
-    :meth:`resihp.parallel.tp.TensorParallelTransformer.local_shards`; a torch-gated
+    :meth:`resihp.parallel.tp.TensorParallelStage.local_shards`; a torch-gated
     test asserts the two agree so they cannot drift apart.
     """
     dims = dict(_GLOBAL_SHARD_DIMS)
@@ -106,6 +106,18 @@ def local_slice(full, shard_dim, new_rank, new_size):
     return torch.chunk(full, new_size, dim=shard_dim)[new_rank].contiguous().clone()
 
 
+def shard_logical_state(full_state, *, layout, tp_rank, tp_size):
+    """Cut a full logical state down to one rank's shards, following ``layout``.
+
+    The bridge from a full logical anchor (a reference model, a checkpoint) to the
+    ``local_state`` a :class:`resihp.parallel.tp.TensorParallelStage` is built from.
+    """
+    return {
+        name: local_slice(full_state[name], dim, tp_rank, tp_size)
+        for name, dim in layout.items()
+    }
+
+
 def _to_cpu(state):
     """Canonicalize a rank's shards to CPU before the object gather.
 
@@ -125,17 +137,46 @@ def _to_cpu(state):
     }
 
 
-def _merge(gathered):
-    """Fold per-rank contributions into ``{name: {field: {shard_index: tensor}}}``."""
-    merged: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
+def _merge(gathered, default_count):
+    """Fold contributions into ``{name: {field: {shard_count: {shard_index: tensor}}}}``.
+
+    Peer DP replicas may already be running *different* TP degrees after an earlier
+    repartition, so a contribution is keyed by the degree it was sharded under as
+    well as by its index: index 0 of a degree-1 replica is a whole tensor while index
+    0 of a degree-2 replica is a half, and splicing the two would produce nonsense. A
+    contribution that does not declare ``shard_count`` came from a caller whose whole
+    group shares one degree, so it is filed under ``default_count``.
+    """
+    merged: dict[str, dict[str, dict[int, dict[int, torch.Tensor]]]] = {}
     for contribution in gathered:
         for name, entry in contribution.items():
             index = entry["shard_index"]
+            count = entry.get("shard_count", default_count)
             fields = merged.setdefault(name, {})
             for field in _ALL_FIELDS:
                 if field in entry:
-                    fields.setdefault(field, {})[index] = entry[field]
+                    fields.setdefault(field, {}).setdefault(count, {})[index] = entry[field]
     return merged
+
+
+def _reconstruct(name, shard_dim, preferred, by_count, checkpoint_full):
+    """Rebuild one tensor from the first complete donor set, else the checkpoint.
+
+    Any complete set of shards reconstructs the identical logical tensor, whatever
+    degree it was sharded under, so the degrees are tried in a deterministic order --
+    ``preferred`` (this reshard's own old degree) first, then ascending -- and the
+    checkpoint is consulted only when no degree offers a complete set.
+    """
+    for count in [preferred] + sorted(count for count in by_count if count != preferred):
+        contributions = by_count.get(count)
+        if not contributions:
+            continue
+        try:
+            return reconstruct_full(name, shard_dim, count, contributions)
+        except ReshardError:
+            continue
+    checkpoint = None if checkpoint_full is None else {name: checkpoint_full}
+    return reconstruct_full(name, shard_dim, preferred, {}, checkpoint)
 
 
 def reshard_tp_state(
@@ -151,11 +192,12 @@ def reshard_tp_state(
 ):
     """Reshard param/grad/AdamW state across a TP degree or membership change.
 
-    ``local_state`` is ``{name: {"shard_index": int, "param": T, "grad": T,
-    "exp_avg": T, "exp_avg_sq": T, "step": T}}`` for the shards this rank holds; a
-    brand-new replacement rank passes ``{}``. Every rank in ``group`` (all healthy
-    ranks, across DP replicas) joins the ``all_gather_object`` so each reconstructs
-    the identical full logical state. ``new_rank`` is this rank's index in the new
+    ``local_state`` is ``{name: {"shard_index": int, "shard_count": int, "param": T,
+    "grad": T, "exp_avg": T, "exp_avg_sq": T, "step": T}}`` for the shards this rank
+    holds; a rank holding nothing passes ``{}``. ``shard_count`` may be omitted when
+    every contributor shares one degree, in which case ``old_size`` is assumed. Every
+    rank in ``group`` (all healthy ranks, across DP replicas) joins the
+    ``all_gather_object`` so each reconstructs the identical full logical state. ``new_rank`` is this rank's index in the new
     TP group, or ``None`` if it is being dropped -- dropped ranks still gather (so
     their shards feed peers) but receive nothing back.
 
@@ -166,22 +208,21 @@ def reshard_tp_state(
     """
     gathered: list = [None] * dist.get_world_size(group)
     dist.all_gather_object(gathered, _to_cpu(local_state), group=group)
-    merged = _merge(gathered)
+    merged = _merge(gathered, old_size)
 
     new_local: dict[str, dict[str, torch.Tensor]] = {}
     for name, shard_dim in layout.items():
         rebuilt = {}
         ckpt_entry = None if checkpoint is None else checkpoint.get(name)
         for field in _ALL_FIELDS:
-            contributions = merged.get(name, {}).get(field, {})
+            by_count = merged.get(name, {}).get(field, {})
             # Consult the checkpoint for this field only if it carries it: a real
             # checkpoint has no ``grad``, so a peer-supplied grad must not KeyError.
             ckpt_full = None if ckpt_entry is None else ckpt_entry.get(field)
-            if not contributions and ckpt_full is None:
+            if not by_count and ckpt_full is None:
                 continue  # field absent from the run (e.g. no grad) and from checkpoint
             dim = None if field in _REPLICATED_FIELDS else shard_dim
-            ckpt = None if ckpt_full is None else {name: ckpt_full}
-            full, source = reconstruct_full(name, dim, old_size, contributions, ckpt)
+            full, source = _reconstruct(name, dim, old_size, by_count, ckpt_full)
             if verify and source == "peer" and ckpt_full is not None:
                 if not torch.equal(full, ckpt_full):
                     raise ReshardError(f"reshard verify failed for {name}.{field}")

@@ -5,12 +5,18 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 
 from resihp.config import TrainConfig
+from resihp.control import STOP_CODES
+from resihp.memory import estimate_memory
 from resihp.plan import (
     InfeasiblePlan,
     PlanInvariantError,
     assert_invariants,
     build_plan,
 )
+
+
+VOCAB = 32
+SEQLEN = 8
 
 
 CONFIG = TrainConfig(
@@ -82,11 +88,118 @@ def test_losing_a_stage_in_every_replica_is_still_feasible():
     assert plan.active_ranks == (2, 3, 6, 7)
 
 
-def test_only_a_total_wipeout_is_no_surviving_replica():
+def test_a_total_wipeout_is_named_by_the_pp_planner():
+    # No replica survived, so there is no pipeline left to lay out. That is the PP
+    # planner's own condition and it reports it under its own code -- the plan layer
+    # does not invent a second name for it.
     with pytest.raises(InfeasiblePlan) as error:
         build_plan(CONFIG, step=0, version=1, failed_ranks=tuple(range(8)))
 
-    assert error.value.reason.code == "no_surviving_replica"
+    assert error.value.reason.code == "no_executable_pp"
+
+
+def test_a_replica_emptied_by_an_earlier_event_is_not_the_evidence():
+    # Replica 0 dies first, then replica 1. At the last event replica 0 has no layers
+    # left to reason about, so the reason must come from the replica this event killed.
+    config = replace(CONFIG, pp=1, dp=2)
+    plan = build_plan(config, step=0, version=0)
+    for version, failed in enumerate([(0,), (0, 1), (0, 1, 2)], start=1):
+        plan = build_plan(config, step=version, version=version, failed_ranks=failed, previous=plan)
+
+    with pytest.raises(InfeasiblePlan) as error:
+        build_plan(config, step=4, version=4, failed_ranks=(0, 1, 2, 3), previous=plan)
+    assert error.value.reason.code == "no_executable_pp"
+
+
+def test_dp_rejects_a_final_layout_that_no_longer_fits():
+    # ``choose_tp`` gates memory with each stage's *old* layer count, so a stage that
+    # absorbs a dead stage's layers can end up needing more than was ever checked. The
+    # DP planner sees the final layout and is the one that says so.
+    config = replace(CONFIG, tp=1, pp=2, dp=1, num_layers=4)
+    budget = estimate_memory(
+        config,
+        tp_degree=1,
+        stage_layers=3,
+        micro_batches=config.batch_size // config.micro_batch_size,
+        sequence_length=SEQLEN,
+        vocab_size=VOCAB,
+        in_flight_micro_batches=1,
+    ).total
+    gated = dict(memory_budget=budget, vocab_size=VOCAB, sequence_length=SEQLEN)
+
+    plan = build_plan(config, step=0, version=0, **gated)  # two 2-layer stages fit
+    with pytest.raises(InfeasiblePlan) as error:
+        # Rank 1 was stage 1's only rank; stage 0 absorbs all four layers and no longer fits.
+        build_plan(config, step=1, version=1, failed_ranks=(1,), previous=plan, **gated)
+    assert error.value.reason.code == "no_feasible_dp_target"
+
+
+# --- cumulative fail-stop: what the invariant may and may not forbid ---------------
+
+
+def test_a_failed_rank_never_becomes_active_again():
+    pristine = build_plan(CONFIG, step=0, version=0)  # every rank active
+    after = build_plan(CONFIG, step=1, version=1, failed_ranks=(1,), previous=pristine)
+    assert 1 not in after.active_ranks
+
+    # A resurrection can only be expressed two ways, and both are rejected. Either the
+    # plan drops rank 1 from the failed set to make room for it...
+    with pytest.raises(PlanInvariantError, match="failed ranks must grow"):
+        assert_invariants(replace(pristine, version=2), previous=after)
+    # ...or it keeps rank 1 failed and schedules it anyway.
+    with pytest.raises(PlanInvariantError, match="active and failed ranks overlap"):
+        assert_invariants(replace(pristine, version=2, failed_ranks=(1,)), previous=after)
+
+
+def test_a_healthy_rank_left_idle_can_be_selected_again():
+    # TP4: after rank 0 dies the largest power-of-two prefix of the survivors is
+    # (1, 2), leaving healthy rank 3 idle. When rank 1 then dies, the planner must be
+    # free to pick rank 3 back up -- being unused is not being failed.
+    config = replace(CONFIG, tp=4, pp=1, dp=1, num_layers=2)
+    plan = build_plan(config, step=0, version=0)
+
+    v1 = build_plan(config, step=1, version=1, failed_ranks=(0,), previous=plan)
+    assert v1.active_ranks == (1, 2) and 3 in v1.live_ranks
+
+    v2 = build_plan(config, step=2, version=2, failed_ranks=(0, 1), previous=v1)
+    assert v2.active_ranks == (2, 3)  # idle rank 3 is back in the training path
+    assert v2.failed_ranks == (0, 1)
+
+
+def test_every_cumulative_failure_sequence_stays_inside_the_taxonomy():
+    # Each event either yields a plan or one of the six consistent-stop conditions.
+    # Nothing may escape as an unclassified error.
+    for config in (
+        replace(CONFIG, tp=4, pp=1, dp=1, num_layers=2),
+        replace(CONFIG, tp=2, pp=2, dp=1, num_layers=4),
+        CONFIG,
+    ):
+        plan = build_plan(config, step=0, version=0)
+        failed = ()
+        for version in range(1, config.world_size + 1):
+            failed = tuple(range(version))
+            try:
+                plan = build_plan(
+                    config, step=version, version=version, failed_ranks=failed, previous=plan
+                )
+            except InfeasiblePlan as error:
+                assert error.reason.code in STOP_CODES, error.reason.code
+                break
+            assert set(plan.active_ranks) <= set(plan.live_ranks)
+
+
+def test_the_same_failure_sequence_yields_the_same_digests():
+    def sequence():
+        plan = build_plan(CONFIG, step=0, version=0)
+        digests = [plan.digest]
+        for version, failed in enumerate([(1,), (1, 5), (1, 3, 5)], start=1):
+            plan = build_plan(
+                CONFIG, step=version, version=version, failed_ranks=failed, previous=plan
+            )
+            digests.append(plan.digest)
+        return digests
+
+    assert sequence() == sequence()
 
 
 def test_tp_memory_infeasibility_is_reported_at_the_tp_stage():

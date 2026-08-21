@@ -18,7 +18,7 @@ from numbers import Integral
 from typing import Iterable
 
 from .config import TrainConfig
-from .planner.dp import DPPlacement, DPStage, DPTopology, assign
+from .planner.dp import DPPlacement, DPStage, DPTopology, InfeasibleDP, assign
 from .planner.pp import InfeasiblePP, repartition_pp
 from .planner.tp import InfeasibleTP, choose_tp
 
@@ -190,6 +190,16 @@ def _owner_of(stage_layout: dict[int, tuple[tuple[int, ...], tuple[int, int]]], 
     raise AssertionError("layer is not owned by any stage in the layout")
 
 
+def _repartition(old_layers, old_tp, new_tp):
+    """``repartition_pp``, with its structured reason carried into the plan's own."""
+    try:
+        return repartition_pp(old_layers, old_tp, new_tp)
+    except InfeasiblePP as error:
+        raise InfeasiblePlan(
+            PlanInfeasibleReason(error.reason.code, error.reason.message)
+        ) from error
+
+
 def _state_route(
     old_layout: dict[int, dict[int, tuple[tuple[int, ...], tuple[int, int]]]],
     replica: int,
@@ -248,6 +258,7 @@ def build_plan(
     stages: list[StagePlan] = []
     dp_stages: list[DPStage] = []
     state_routes: list[StateRoute] = []
+    wiped_out: list[tuple[list[int], list[int], list[int]]] = []
     for replica in range(config.dp):
         old_layers = [0] * config.pp
         old_tp = [0] * config.pp
@@ -284,12 +295,15 @@ def build_plan(
             new_tp[stage] = choice.degree
 
         if not any(new_tp):
-            continue  # every stage lost all ranks: this replica is truly dead
+            # Every stage of this replica lost all its ranks. Other replicas may still
+            # carry the run, so remember the input rather than deciding here -- but
+            # only from a replica that still had a pipeline, since one emptied by an
+            # earlier event holds no layers and says nothing about this one.
+            if any(old_tp):
+                wiped_out.append((old_layers, old_tp, new_tp))
+            continue
 
-        try:
-            pp_plan = repartition_pp(old_layers, old_tp, new_tp)
-        except InfeasiblePP as error:
-            raise InfeasiblePlan(PlanInfeasibleReason(error.reason.code, error.reason.message)) from error
+        pp_plan = _repartition(old_layers, old_tp, new_tp)
 
         for stage in range(config.pp):
             layer_range = pp_plan.layer_ranges[stage]
@@ -313,17 +327,34 @@ def build_plan(
                 )
 
     if not dp_stages:
-        raise InfeasiblePlan(
-            PlanInfeasibleReason(
-                "no_surviving_replica",
-                "every DP replica lost all of its ranks",
-            )
-        )
+        # No replica survived, so there is no pipeline left to lay out. That is the PP
+        # planner's own condition, so ask it rather than inventing a second name: with
+        # every stage at zero capacity it always raises ``no_executable_pp``. There is
+        # always something to ask about, because the previous plan had at least one
+        # replica with a pipeline and it either survives here or was just recorded.
+        _repartition(*wiped_out[0])
 
-    # Memory feasibility is owned by the TP stage above (choose_tp); the DP
-    # layer only distributes micro-batches across the surviving replicas.
-    topology = DPTopology(config=config, stages=tuple(dp_stages), micro_batches=micro_batches)
-    assignment = assign(step, failed, topology)
+    # ``choose_tp`` gates memory with each stage's *old* layer count -- it has to, the
+    # repartition needs the new degrees first -- so ``repartition_pp`` can hand a stage
+    # more layers than were ever checked. The DP planner is the first point that sees
+    # the final layout, which is why plan 3.5 puts a ``MemoryFeasible`` gate here, on
+    # the same calculator: a replica whose stages no longer fit stops being a target,
+    # and when none is left the plan is infeasible.
+    topology = DPTopology(
+        config=config,
+        stages=tuple(dp_stages),
+        micro_batches=micro_batches,
+        sequence_length=sequence_length,
+        vocab_size=vocab_size,
+        memory_budget=memory_budget,
+        in_flight_micro_batches=in_flight_micro_batches,
+    )
+    try:
+        assignment = assign(step, failed, topology)
+    except InfeasibleDP as error:
+        raise InfeasiblePlan(
+            PlanInfeasibleReason(error.reason.code, error.reason.message)
+        ) from error
 
     active_ranks = tuple(sorted({rank for stage in stages for rank in stage.tp_members}))
     plan = ExecutionPlan(
@@ -344,8 +375,10 @@ def assert_invariants(plan: ExecutionPlan, previous: ExecutionPlan | None = None
     """Assert every locked structural invariant (plan §4.B) for one plan.
 
     ``active_ranks`` are the ranks assigned to an active stage in this plan. When
-    ``previous`` is given, also assert the cross-plan invariants: the version
-    strictly increases, failed ranks grow, and active ranks shrink.
+    ``previous`` is given, also assert the cross-plan invariants: the version strictly
+    increases and failures accumulate, which together with the single-plan check that
+    active and failed ranks never overlap is exactly "a failed rank never re-enters
+    the training path".
     """
     config = plan.config
     pp = config.pp
@@ -415,7 +448,12 @@ def assert_invariants(plan: ExecutionPlan, previous: ExecutionPlan | None = None
     if previous is not None:
         if plan.version <= previous.version:
             raise PlanInvariantError("plan version must strictly increase")
-        if not active <= set(previous.active_ranks):
-            raise PlanInvariantError("active ranks must shrink monotonically")
+        # Fail-stop's cross-plan guarantee is that a *failed* rank never returns to
+        # the training path. This check plus the ``active & failed`` one above carry
+        # it between them: failures accumulate, and no accumulated failure is active.
+        # It is deliberately not "the active set only ever shrinks" -- a healthy rank
+        # the previous plan left idle (``choose_tp`` takes the largest power-of-two
+        # prefix of a stage's survivors, so it can leave one out) is a resource a later
+        # plan may legitimately pick up again, which is not a resurrection.
         if not set(previous.failed_ranks) <= failed:
             raise PlanInvariantError("failed ranks must grow monotonically")

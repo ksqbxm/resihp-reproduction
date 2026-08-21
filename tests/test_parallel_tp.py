@@ -74,7 +74,8 @@ def _compare(rank, world_size, device):
 
     from resihp.model import ReferenceTransformer
     from resihp.reference import ADAM_BETAS, ADAM_EPS, LEARNING_RATE, WEIGHT_DECAY
-    from resihp.parallel.tp import TensorParallelTransformer
+    from resihp.parallel.reshard import shard_dims, shard_logical_state
+    from resihp.parallel.tp import TensorParallelStage
 
     def adamw(params):
         return torch.optim.AdamW(
@@ -86,8 +87,21 @@ def _compare(rank, world_size, device):
 
     torch.manual_seed(CONFIG.seed)
     reference = ReferenceTransformer(CONFIG, vocab_size=VOCAB, sequence_length=SEQLEN)
-    tp = TensorParallelTransformer(
-        CONFIG, vocab_size=VOCAB, sequence_length=SEQLEN, source_state=reference.logical_state_dict()
+    # A whole-model TP run is the stage that owns every layer and both boundaries.
+    layer_ids = range(CONFIG.num_layers)
+    tp = TensorParallelStage(
+        CONFIG,
+        vocab_size=VOCAB,
+        sequence_length=SEQLEN,
+        layer_ids=layer_ids,
+        is_first=True,
+        is_last=True,
+        local_state=shard_logical_state(
+            reference.logical_state_dict(),
+            layout=shard_dims(layer_ids),
+            tp_rank=rank,
+            tp_size=world_size,
+        ),
     )
     reference = reference.to(device).train()
     tp = tp.to(device).train()
@@ -108,7 +122,7 @@ def _compare(rank, world_size, device):
     ref_opt.step()
     ref_updated = {name: param.detach().clone() for name, param in reference.logical_state_dict().items()}
 
-    tp_logits = tp(tokens)
+    tp_logits = tp(tokens=tokens)
     tp_loss = loss_of(tp_logits)
     tp_opt.zero_grad()
     tp_loss.backward()
@@ -227,27 +241,59 @@ def test_indivisible_degree_is_rejected():
         _require_divisible(CONFIG, VOCAB, 3)  # 4 heads / 16 dim / 32 vocab not divisible by 3
 
 
-@requires_torch
-def test_control_plane_commits_real_state(tmp_path):
+def _commit_worker(rank, world_size, result_dir, port):
+    """Safe-point step 2 over a real (single-rank) plan, on real planned state."""
+    import os
+
+    os.environ.update(
+        MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE=str(world_size)
+    )
+    from dataclasses import replace
+
+    import torch.distributed as dist
+
     from resihp.checkpoint import load_checkpoint
     from resihp.control import ControlPlane
-    from resihp.reference import ReferenceRun, logical_state_digest
+    from resihp.plan import build_plan
+    from resihp.recovery import initial_run
+    from resihp.reference import ReferenceRun
 
-    run = ReferenceRun(CONFIG, vocab_size=VOCAB, sequence_length=SEQLEN)
-    run.step()
-    control = ControlPlane(0, 1, None, "gloo")
+    dist.init_process_group(backend="gloo")
+    config = replace(CONFIG, tp=1, pp=1, dp=1)
+    control = ControlPlane(
+        rank, world_size, dist.group.WORLD, "gloo", vocab_size=VOCAB, sequence_length=SEQLEN
+    )
+    plan = build_plan(config, step=0, version=0)
+    control.build_training_groups(plan)
+    path = Path(result_dir) / "ckpt.pt"
 
-    # With no state attached the call points stay the T9 no-op / empty digest.
-    assert control._state_digest() == ""
-    control._commit_checkpoint(0)  # no path attached -> no file written
-
-    # Attaching real training state (T10) wires safe-point steps 2 and 8 to it.
-    path = tmp_path / "ckpt.pt"
-    control.training_run = run
-    control.checkpoint_path = path
-    control._commit_checkpoint(7)
+    control.attach_run(
+        initial_run(
+            plan,
+            rank=rank,
+            vocab_size=VOCAB,
+            sequence_length=SEQLEN,
+            tp_group=control.tp_group,
+            executor_group=control.executor_group,
+        ),
+        checkpoint_path=path,
+    )
+    control.training_step()
+    control._commit_checkpoint(plan)  # gathers the shards into one logical checkpoint
     assert path.exists()
-    assert control._state_digest() == logical_state_digest(run.model)
 
-    fresh = ReferenceRun(CONFIG, vocab_size=VOCAB, sequence_length=SEQLEN)
-    assert load_checkpoint(path, fresh) == (1, 7)
+    fresh = ReferenceRun(config, vocab_size=VOCAB, sequence_length=SEQLEN)
+    assert load_checkpoint(path, fresh) == (1, plan.version)
+    dist.destroy_process_group()
+
+
+@requires_torch
+def test_control_plane_commits_real_state(tmp_path):
+    """Step 2 writes the attached planned run, not a second checkpoint path.
+
+    Recovery, the state digest, and the stop conditions that read this file are
+    exercised in ``tests/test_recovery.py``; this pins the commit call point only.
+    """
+    import torch.multiprocessing as mp
+
+    mp.spawn(_commit_worker, args=(1, str(tmp_path), _free_port()), nprocs=1, join=True)

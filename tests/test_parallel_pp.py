@@ -158,8 +158,12 @@ def _compare_pp(rank, num_stages, device):
     import torch
     from torch.nn import functional as F
 
+    import torch.distributed as dist
+
     from resihp.model import ReferenceTransformer
-    from resihp.parallel.pp import PipelineRuntime, PipelineStage, balanced_layers
+    from resihp.parallel.pp import PipelineRuntime, balanced_layers
+    from resihp.parallel.reshard import shard_dims, shard_logical_state
+    from resihp.parallel.tp import TensorParallelStage
     from resihp.reference import ADAM_BETAS, ADAM_EPS, LEARNING_RATE, WEIGHT_DECAY
 
     def adamw(params):
@@ -174,14 +178,20 @@ def _compare_pp(rank, num_stages, device):
     source = {name: param.detach().clone() for name, param in reference.logical_state_dict().items()}
 
     groups = balanced_layers(CONFIG.num_layers, num_stages)
-    stage = PipelineStage(
+    # One TP rank per stage: every rank builds every solo group, in the same order,
+    # because ``new_group`` is collective over the world.
+    solo = [dist.new_group([peer]) for peer in range(num_stages)][rank]
+    stage = TensorParallelStage(
         CONFIG,
         vocab_size=VOCAB,
         sequence_length=SEQLEN,
         layer_ids=groups[rank],
         is_first=rank == 0,
         is_last=rank == num_stages - 1,
-        source_state=source,
+        local_state=shard_logical_state(
+            source, layout=shard_dims(groups[rank]), tp_rank=0, tp_size=1
+        ),
+        group=solo,
     ).to(device)
     stage.train()
 
