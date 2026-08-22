@@ -43,10 +43,14 @@ than for one event):
   reference afterwards;
 * the data cursor advances once per iteration, with no replay and no skip.
 
-**Leaks** (四.D): after every event a rank the plan places holds exactly its TP group
-and its executor group on top of the baseline measured before any training group was
-built, and a dropped rank holds nothing beyond that baseline, so a rebuild neither
-accumulates groups nor leaves half a set; the checkpoint directory holds exactly one
+**Leaks** (四.D): after every event a rank holds exactly the training groups the
+current plan gives it -- its TP group, its executor group, and one two-rank group per
+pipeline hop it is a leader of -- on top of the baseline measured before any training
+group was built, and a dropped rank holds nothing beyond that baseline, so a rebuild
+neither accumulates groups nor leaves half a set. The expected count is read from the
+control plane itself rather than written down, because it varies with the topology: a
+PP1 replica has no hop at all, a PP2 stage leader has one, and a middle stage of a
+deeper pipeline has two; the checkpoint directory holds exactly one
 file and never a leftover
 ``.tmp``; and no process group survives shutdown. That a reconfiguration *replaces*
 a generation rather than accumulating one is asserted on the generation itself -- the
@@ -296,10 +300,19 @@ def _resources(label, control, result_dir, device) -> dict:
     # invisible from anywhere else, which is exactly what has to be checked here.
     from torch.distributed.distributed_c10d import _world
 
+    # What the current plan entitles this rank to hold, counted from the control plane
+    # rather than assumed: TP group + executor group + one per pipeline hop it leads.
+    # Reading it live is also what makes the snapshot right at a *stopped* plan, where
+    # the groups still held are the previous plan's.
+    training_group_count = (
+        int(control.tp_group is not None)
+        + int(control.executor_group is not None)
+        + len(control.boundary_groups)
+    )
     return {
         "at": label,
         "groups": len(_world.pg_map),
-        "holds_groups": control.tp_group is not None or control.executor_group is not None,
+        "training_group_count": training_group_count,
         "files": sorted(path.name for path in Path(result_dir).glob("ckpt.pt*")),
         "cuda_bytes": torch.cuda.memory_allocated(device) if device.type == "cuda" else None,
     }
@@ -705,11 +718,11 @@ def _assert_no_leaks(results, case, label):
             if snapshot["at"] == "shutdown":
                 assert snapshot["groups"] == 0, (label, result["rank"], snapshot)
             else:
-                # Exactly this rank's two training groups on top of the control group
-                # when the plan places it, and none when it does not: one rebuild's
-                # worth, never two, and never half a set.
-                want = baseline + (2 if snapshot["holds_groups"] else 0)
-                assert snapshot["groups"] == want, (label, result["rank"], snapshot)
+                # Exactly the training groups this rank is entitled to on top of the
+                # control group, and none when the plan places it nowhere: one
+                # rebuild's worth, never two, and never half a set.
+                expected = baseline + snapshot["training_group_count"]
+                assert snapshot["groups"] == expected, (label, result["rank"], snapshot)
             expected = [] if snapshot["at"] in ("init", "start") else ["ckpt.pt"]
             assert snapshot["files"] == expected, (label, result["rank"], snapshot)
         assert result["initialized"] is False, (label, result["rank"])
