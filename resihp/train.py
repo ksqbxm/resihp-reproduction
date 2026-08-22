@@ -50,6 +50,12 @@ def run_distributed(loaded):
     plan, or ``None`` when a consistent stop ended the run: every rank then keeps the
     pre-failure checkpoint, prints the one structured root cause, and exits normally
     (plan 3.6).
+
+    A run that reaches the end prints one ``{"acceptance": ...}`` line per rank: the
+    iterations this rank actually executed, every plan version and digest it acted
+    on, and the ranks that ended up failed. That is what makes the launched command
+    checkable from outside the job (T18): the exit code alone cannot show that the
+    scheduled fail-stops happened and that training carried on past them.
     """
     from .control import ConsistentStop, ControlPlane
     from .recovery import initial_run
@@ -75,21 +81,47 @@ def run_distributed(loaded):
         device=device,
     )
     failed: tuple[int, ...] = ()
+    trained: list[int] = []
+    versions = [plan.version]
+    digests = [plan.digest]
 
     try:
         for step in range(config.iterations):
             iteration = step + 1
+            # Holding a run *is* being on the training path: a rank the current plan
+            # places nowhere holds none and executes nothing (plan 3.2, step 4).
+            if control.training_run is not None:
+                trained.append(iteration)
             control.training_step()  # step 1: complete and commit this iteration
             failed_rank = failures_by_iteration.get(iteration)
             if failed_rank is not None:
                 plan, failed = control.safe_point(
                     config, plan, failed, failed_rank, next_step=iteration
                 )
+                versions.append(plan.version)
+                digests.append(plan.digest)
     except ConsistentStop as stop:
         print(json.dumps({"stopped": stop.reason.code, "reason": stop.reason.message}, ensure_ascii=False))
         control.shutdown()
         return None
 
+    print(
+        json.dumps(
+            {
+                "acceptance": {
+                    "rank": control.rank,
+                    "device": device.type,
+                    "training_backend": control.training_backend,
+                    "trained_iterations": trained,
+                    "plan_versions": versions,
+                    "plan_digests": digests,
+                    "failed_ranks": list(failed),
+                }
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,  # one small write per rank, so the merged stdout stays parseable
+    )
     control.shutdown()
     return plan
 

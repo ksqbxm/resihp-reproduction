@@ -938,3 +938,80 @@ runtime = control.training_run.runtime
 ### 本机验证
 
 `python -m pytest -q`：**81 passed, 11 skipped**；离线回放五场景健康流水全过、变异测试 **25/25 全捕获**；28 个计划的集合通信顺序静态核对通过；上述强引用机制的同构复现两种写法结论相反，证明修法针对的就是它。
+
+
+---
+
+## T18：GPU/NCCL 验收与结项自检
+
+状态：**门禁与报告编写完成，GPU/NCCL 验收本身待 8 卡目标机执行**（本机无 torch、无 GPU）。
+
+新增：`tests/test_acceptance.py`、`docs/ACCEPTANCE.md`。改动：`resihp/train.py`（唯一的生产改动，见下）。
+
+### 为什么必须动一行生产代码
+
+任务 1 要求「用 `torchrun ... -m resihp.train ...` 在 GPU/NCCL 下做验收，≥2 次连续 fail-stop 并继续训练」。
+原来的 `run_distributed` **只在一致停止时打印**，跑成功时一个字都不输出——退出码 0 只说明「没崩」，
+证明不了「两次故障发生过、失效 rank 退出了、幸存者继续训练到最后」。所以 `run_distributed` 在跑完时
+每个 rank 打印一行 `{"acceptance": {...}}`：rank / device / training_backend / **实际执行的轮次** /
+每一版计划的版本与 digest / 最终失效 rank 集合。除此之外 `resihp/` 未动一个字节。
+
+「实际执行的轮次」记的是 `control.training_run is not None`——**运行时事实**（该 rank 手上有没有 stage），
+不是从计划推出来的。门禁那边则用纯 planner 独立算出「应该是谁」，两边对上才通过；否则这条断言就是自证。
+（`initial_run` / `recover` 对计划未安置的 rank 都返回 `None`，`plan.active_ranks` 又恰是各 stage 成员的并集，
+所以这个等价关系本身就是「失效 rank 永久退出训练路径」这条要求的运行时形态。）
+
+### 门禁一：`test_torchrun_nccl_acceptance`（需 8 GPU）
+
+用 `sys.executable -m torch.distributed.run` 发起——`torchrun` 控制台脚本就是这个模块的薄包装，走
+`sys.executable` 是为了保证 job 跑在被测解释器里，而不是 `PATH` 上碰巧排第一的那个 `torchrun`；
+`--standalone` 之后的 argv 与计划文档逐字相同，工作目录是仓库根，所以相对配置路径也一并被验证。
+
+断言全部基于 job 自己吐出的证据，并与**纯 planner 对同一配置算出的计划序列**对照：退出码 0 且无
+`{"stopped": ...}`；八个 rank 全部 `device == "cuda"` 且 `training_backend == "nccl"`；各 rank
+`plan_versions == [0,1,2]` 且 `plan_digests` 逐版相等、并等于 planner 的 digest；`failed_ranks == [1,5]`；
+**各 rank 实际执行的轮次逐 rank 等于各版计划的 active 集合**（rank 1 停在第 2 轮、rank 5 停在第 4 轮、
+其余跑满 6 轮）；跑完后 `checkpoint.pt` 在、`checkpoint.pt.tmp` 不在。
+
+两条前置条件放在最前面，防止「继续训练」被一个配置改动**空洞地满足**：故障事件数 ≥ 2，且最后一个事件的
+`after_iteration < iterations`（加载器只校验严格递增与 rank 合法，不管这一条）。
+
+### 门禁二：`test_no_banned_constructs`（不依赖 torch，本机每次都跑）
+
+七类禁用构造（Detector / pᵢ / 速度降速分支 / standby / Algorithm 1 / 旧入口 / 前向兼容层）逐行匹配
+`resihp/**/*.py` + `configs/*.json` + 根目录 `*.py`，**命中数全为 0**；另外确认 `hello_dist.py` /
+`nccl_test.py` 在整个仓库任何位置都不存在。匹配式一律做词首锚定（`\blegacy` 而不是 `\blegacy\b`），
+否则 `legacy_layout`、`p_i_score`、`speed_ratio` 这类标识符形态会整片漏过。
+
+`tests/` 不在扫描范围内，原因写在门禁 docstring 里：那里唯一的命中是 `test_config.py` 把
+`speed`/`p_i`/`detector` 参数化为**加载器必须拒绝**的字段（守卫，不是实现），以及
+`test_parallel_reshard.py` 用 `degrade` 指 **TP degree 减半**。把它们纳入就得按文件名开白名单，
+而白名单在测试改名那一刻就失效。这两处与 `reshard.py` 的 "checkpoint-fallback"（计划 3.3 明文规定的
+分支）、`pp.py` 的 "no old-layout compatibility is kept"（否定陈述）一起，在 `docs/ACCEPTANCE.md`
+第 2 节逐条记录为「已人工复核、非违规」。
+
+### 本机能做到的验证（无 torch）
+
+1. **计划序列实机核对**：planner 不依赖 torch，直接对 `configs/train.json` + `configs/failures.json`
+   跑 `build_plan`，确认两次事件分别把 replica 0 / replica 1 的 stage 0 降到 TP1、层区间不动，
+   active ranks 8 → 7 → 6，最后一次故障后仍有 2 轮训练。
+2. **离线回放 + 变异测试**（scratch 脚本不入库）：用真实 planner 合成一份健康 run 的 stdout 喂给门禁自身的
+   断言块（只替换 `_launch` 与 GPU skip），健康流水通过；再逐一注入 **18 种缺陷**——少报一个 rank、
+   重复上报、落在 CPU、训练组是 Gloo、两次故障只出一个计划、版本重复、单 rank digest 不同、
+   八 rank 一致但不等于 planner、第二次故障没生效、失效 rank 继续训练、失效 rank 多跑一轮、
+   幸存者最后一次故障后停训、幸存者漏一轮、出现一致停止行、退出码非零、没有 checkpoint、残留 `.tmp`、
+   最后一次故障落在最后一轮——**18/18 全部被捕获**，无空转检查。
+3. **匹配式检出力核对**：18 条典型违规写法全部命中；11 条易被粗糙匹配式误伤的真实代码行
+   （`_step_int`、`tp_index`、`p_int`、`pipeline`、`algorithm 10` 等）全部不命中。
+4. `python -m pytest -q`：**82 passed, 12 skipped**（此前 81 / 11；新增的扫描门禁本机执行，GPU 门禁
+   因缺 torch 在 `_skip_unless_gpus` 处 skip）。
+
+### 结项自检报告
+
+`docs/ACCEPTANCE.md`：A–F 六组测试的覆盖与状态、完成标准七条逐条结论与依据、全仓扫描结果、
+目标机待执行清单，以及「已知边界」（重结合容差带、`highest` 精度契约、单 rank 故障粒度）。
+报告对每条结论都标注证据来源，凡本机跑不了的一律写「待目标机执行」，不以实现看着对代替执行结果。
+
+遗留问题：GPU/NCCL 验收（`tests/test_acceptance.py::test_torchrun_nccl_acceptance` 与那条 `torchrun`
+命令本身）需在 8 卡目标机执行；连同 T15 的 14 项组合门禁、T17 的 10 项序列门禁跑完后，才能把
+`docs/ACCEPTANCE.md` 第 1、4 节的「待目标机执行」改为「已验证」。
