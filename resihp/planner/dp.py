@@ -6,6 +6,7 @@ from typing import Iterable
 
 from ..config import TrainConfig
 from ..memory import memory_feasible
+from .pp import peak_in_flight
 
 
 @dataclass(frozen=True)
@@ -30,7 +31,6 @@ class DPTopology:
     sequence_length: int = 1
     vocab_size: int = 1
     memory_budget: int | None = None
-    in_flight_micro_batches: int = 1
 
 
 @dataclass(frozen=True)
@@ -103,9 +103,6 @@ def _validate_topology(topology: DPTopology) -> None:
     _integer("micro_batches", topology.micro_batches, positive=True)
     _integer("sequence_length", topology.sequence_length, positive=True)
     _integer("vocab_size", topology.vocab_size, positive=True)
-    _integer("in_flight_micro_batches", topology.in_flight_micro_batches, positive=True)
-    if topology.in_flight_micro_batches > topology.micro_batches:
-        raise ValueError("in_flight_micro_batches cannot exceed micro_batches")
     if topology.memory_budget is not None:
         _integer("memory_budget", topology.memory_budget, positive=True)
     if not topology.stages:
@@ -128,7 +125,15 @@ def _validate_topology(topology: DPTopology) -> None:
             _integer("capacity", stage.capacity, positive=True)
 
 
-def _stage_capacity(topology: DPTopology, stage: DPStage) -> int:
+def _stage_capacity(topology: DPTopology, stage: DPStage, *, index: int, num_stages: int) -> int:
+    """Micro-batches this stage can take, or 0 when the budget cannot hold it.
+
+    This is the first point that sees the layout actually being published, which is why
+    plan 3.5 puts the ``MemoryFeasible`` gate here -- on the very calculator the TP
+    ``k_min`` search uses, never a second formula. The stage's in-flight activation
+    count is replayed from its own position in the 1F1B schedule the runtime executes,
+    so the budget and the runtime speak about the same peak.
+    """
     if topology.memory_budget is not None and not memory_feasible(
         topology.config,
         tp_degree=stage.tp_degree,
@@ -137,7 +142,9 @@ def _stage_capacity(topology: DPTopology, stage: DPStage) -> int:
         sequence_length=topology.sequence_length,
         vocab_size=topology.vocab_size,
         memory_budget=topology.memory_budget,
-        in_flight_micro_batches=topology.in_flight_micro_batches,
+        in_flight_micro_batches=peak_in_flight(
+            topology.micro_batches, stage_index=index, num_stages=num_stages
+        ),
     ):
         return 0
     return stage.capacity if stage.capacity is not None else topology.micro_batches
@@ -190,7 +197,10 @@ def assign(
         pipeline = tuple(stage for _, stage in sorted(replicas[replica_id].items()))
         if any(failed.intersection(stage.ranks) for stage in pipeline):
             continue
-        capacity = min(_stage_capacity(active_topology, stage) for stage in pipeline)
+        capacity = min(
+            _stage_capacity(active_topology, stage, index=index, num_stages=len(pipeline))
+            for index, stage in enumerate(pipeline)
+        )
         if capacity > 0:
             candidates.append((pipeline, capacity))
 
@@ -226,6 +236,3 @@ def assign(
         placements=tuple(placements),
     )
 
-
-# A descriptive alias for callers that prefer the plan terminology.
-reroute = assign

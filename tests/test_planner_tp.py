@@ -94,3 +94,36 @@ def test_invalid_active_rank_values_are_rejected(bad_rank):
 def test_duplicate_active_ranks_are_rejected():
     with pytest.raises(ValueError, match="duplicate"):
         feasible_degrees(CONFIG, active_ranks=[0, 0, 1], min_degree=1)
+
+
+def test_vocab_parallel_divisibility_filters_candidate_degrees():
+    """A degree that does not divide the vocabulary cannot build the stage at all.
+
+    The token embedding and the LM head are vocab-parallel, so
+    ``TensorParallelStage`` rejects such a degree outright. Catching it here is what
+    turns a runtime ``ValueError`` into the structured ``no_feasible_tp`` reason.
+    """
+    # 24 = 8 * 3: divisible by 1, 2, 4, 8; 12 = 4 * 3: only by 1, 2, 4.
+    assert feasible_degrees(
+        CONFIG, active_ranks=range(8), min_degree=1, vocab_size=24
+    ) == (1, 2, 4, 8)
+    assert feasible_degrees(
+        CONFIG, active_ranks=range(8), min_degree=1, vocab_size=12
+    ) == (1, 2, 4)
+    # Left out entirely, only the dimension constraints apply -- pure planning tests
+    # that never build a stage keep working unchanged.
+    assert feasible_degrees(CONFIG, active_ranks=range(8), min_degree=1) == (1, 2, 4, 8)
+
+
+def test_vocab_divisibility_picks_the_largest_buildable_degree():
+    assert choose_tp(CONFIG, active_ranks=range(8), min_degree=1, vocab_size=12).degree == 4
+    assert choose_tp(CONFIG, active_ranks=range(8), min_degree=1, vocab_size=24).degree == 8
+
+
+def test_an_indivisible_vocabulary_is_a_structured_reason_not_a_crash():
+    """A vocabulary no candidate divides must stop the run, not crash the runtime."""
+    with pytest.raises(InfeasibleTP) as error:
+        choose_tp(CONFIG, active_ranks=range(8), min_degree=2, vocab_size=7)
+
+    assert error.value.reason.code == "no_feasible_tp"
+    assert "vocabulary" in error.value.reason.message

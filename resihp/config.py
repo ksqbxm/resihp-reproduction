@@ -22,6 +22,12 @@ class TrainConfig:
     pp: int
     dp: int
     iterations: int
+    #: Per-rank resident-byte ceiling the analytical memory model gates plans against
+    #: (:mod:`resihp.memory`). ``None`` imposes no artificial limit and every plan is
+    #: chosen on topology alone; a positive integer turns on the feasibility gate that
+    #: TP candidate selection and DP rerouting share. Never a measured GPU figure --
+    #: nothing in this project reads the hardware.
+    memory_budget_bytes: int | None = None
 
     @property
     def world_size(self) -> int:
@@ -52,6 +58,8 @@ _TRAIN_FIELDS = {
     "dp",
     "iterations",
 }
+#: Optional training fields: absent or ``null`` is a valid, meaningful value.
+_OPTIONAL_TRAIN_FIELDS = {"memory_budget_bytes"}
 _EVENT_FIELDS = {"after_iteration", "failed_rank"}
 
 
@@ -72,14 +80,25 @@ def _positive_int(values: dict[str, Any], field: str, label: str) -> int:
     return value
 
 
+def _optional_positive_int(values: dict[str, Any], field: str, label: str) -> int | None:
+    """An absent field and an explicit ``null`` both mean "not set"; anything else must
+    be a positive integer, so a typo can never be read as "no limit"."""
+    if values.get(field) is None:
+        return None
+    return _positive_int(values, field, label)
+
+
 def _parse_train(raw: dict[str, Any]) -> TrainConfig:
     missing = _TRAIN_FIELDS - raw.keys()
     if missing:
         raise ConfigError(f"训练配置缺少字段: {sorted(missing)}")
-    unknown = raw.keys() - _TRAIN_FIELDS
+    unknown = raw.keys() - _TRAIN_FIELDS - _OPTIONAL_TRAIN_FIELDS
     if unknown:
         raise ConfigError(f"训练配置包含未知字段: {sorted(unknown)}")
     values = {field: _positive_int(raw, field, "训练配置") for field in _TRAIN_FIELDS}
+    values["memory_budget_bytes"] = _optional_positive_int(
+        raw, "memory_budget_bytes", "训练配置"
+    )
     if values["model_dim"] % values["num_heads"]:
         raise ConfigError("训练配置字段 model_dim 必须能被 num_heads 整除")
     if values["batch_size"] % values["micro_batch_size"]:

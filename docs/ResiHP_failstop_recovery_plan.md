@@ -57,6 +57,30 @@ torchrun --standalone --nproc_per_node=8 -m resihp.train \
 
 ---
 
+## 二·补 — 恢复状态的边界：`grad` 不是持久状态
+
+> 本节是对 3.3 / 3.4 中「迁移 param/grad/exp_avg/exp_avg_sq」一句的收口修正，以真实执行语义为准。
+
+安全点只出现在「当前迭代完成 → AdamW step 完成 → 原子 checkpoint」之后，且不存在跨安全点的
+gradient accumulation：下一迭代必然先 `zero_grad` 再重新 forward/backward。因此安全点时刻驻留的
+`param.grad` 是**已经被消费掉的**旧值，搬运它没有任何语义价值。
+
+**持久恢复状态（唯一定义）**：
+
+```text
+param
+exp_avg
+exp_avg_sq
+step
+iteration（= 数据游标）
+RNG
+```
+
+`grad` 既不进 checkpoint，也不进 `ExecutionPlan.state_routes`，也不进任何 reshard/迁移传输；
+下一迭代重新计算。若将来引入跨安全点的梯度累积，本节必须先改。
+
+---
+
 ## 三、实现方案（附实现细节）
 
 ### 3.1 确定性训练基线
@@ -94,7 +118,7 @@ torchrun --standalone --nproc_per_node=8 -m resihp.train \
 - degree/成员变化时重切：
   1. 从其他健康 DP replica 收集完整逻辑张量；
   2. 某 shard 在所有健康 replica 均缺失时从故障前 checkpoint 恢复；
-  3. 按新 degree 重切 `param/grad/exp_avg/exp_avg_sq`；
+  3. 按新 degree 重切 `param/exp_avg/exp_avg_sq`（**不含 `grad`**，见下）；
   4. 分发新 TP 组；
   5. gather 后与 checkpoint 完整逻辑状态逐张量校验。
 - **异构 TP 边界（功能正确即可，不做 P2P 性能优化）**：前向用 leader gather → 计算 → scatter/broadcast；反向对应 scatter-reduce，确保梯度不重复累加/不丢失。此路径单列测试。
@@ -105,7 +129,7 @@ torchrun --standalone --nproc_per_node=8 -m resihp.train \
 - `new_tp_degrees` 是每个既有 PP stage 的新 TP degree，不是目标层数；目标层数：`L_target = floor(L_old × TP_new / TP_old)`；有 TP 组的 stage 至少 1 层，TP 组完全失效的 stage 为 0 层。旧布局可包含已清空 stage，以支持连续重分层。
 - 调整初始目标层数以守恒原模型总层数：正差值逐层分配给当前“层数/TP degree”最小者，平局按 stage ID 升序；负差值从该比值最大者逐层收回，平局按 stage ID 降序，且 active stage 至少保留 1 层。比例比较使用整数交叉乘法，避免浮点溢出。
 - 每 stage 连续区间；所有全局 layer 恰好出现一次，连续、不重叠、不遗漏，且返回前必须验证总层数守恒。
-- 迁移 layer 一并迁移 `param/grad/exp_avg/exp_avg_sq/step` 与元数据；接收 stage TP degree 不同则**直接按目标布局重切，不留旧布局兼容**。embedding/LM head 归属首/尾可执行 stage。
+- 迁移 layer 一并迁移 `param/exp_avg/exp_avg_sq/step` 与元数据（**不含 `grad`**，见下）；接收 stage TP degree 不同则**直接按目标布局重切，不留旧布局兼容**。embedding/LM head 归属首/尾可执行 stage。
 - 运行时由计划生成 Forward/Backward/Send/Recv/WeightUpdate 原语，统一 **1F1B 功能调度**（内部保留 F/B/W 三类）。
 - **测试**：论文示例 `(4,4,4)→(5,2,5)`；奇数余层与确定性余数；首/中/末 stage 故障；stage 清空；连续多次重分层；layer 连续唯一完整；embedding/LM head owner；每层所有训练状态迁移前后逐张量一致；PP 两阶段前反向与一步更新**与参考一致**；TP 重切 + PP 移层组合验证 shard/owner/通信边界一致。
 

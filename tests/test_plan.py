@@ -5,12 +5,19 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 
 from resihp.config import TrainConfig
+from resihp.control import STOP_CODES
+from resihp.memory import estimate_memory
 from resihp.plan import (
     InfeasiblePlan,
     PlanInvariantError,
     assert_invariants,
+    boundary_pairs,
     build_plan,
 )
+
+
+VOCAB = 32
+SEQLEN = 8
 
 
 CONFIG = TrainConfig(
@@ -82,11 +89,118 @@ def test_losing_a_stage_in_every_replica_is_still_feasible():
     assert plan.active_ranks == (2, 3, 6, 7)
 
 
-def test_only_a_total_wipeout_is_no_surviving_replica():
+def test_a_total_wipeout_is_named_by_the_pp_planner():
+    # No replica survived, so there is no pipeline left to lay out. That is the PP
+    # planner's own condition and it reports it under its own code -- the plan layer
+    # does not invent a second name for it.
     with pytest.raises(InfeasiblePlan) as error:
         build_plan(CONFIG, step=0, version=1, failed_ranks=tuple(range(8)))
 
-    assert error.value.reason.code == "no_surviving_replica"
+    assert error.value.reason.code == "no_executable_pp"
+
+
+def test_a_replica_emptied_by_an_earlier_event_is_not_the_evidence():
+    # Replica 0 dies first, then replica 1. At the last event replica 0 has no layers
+    # left to reason about, so the reason must come from the replica this event killed.
+    config = replace(CONFIG, pp=1, dp=2)
+    plan = build_plan(config, step=0, version=0)
+    for version, failed in enumerate([(0,), (0, 1), (0, 1, 2)], start=1):
+        plan = build_plan(config, step=version, version=version, failed_ranks=failed, previous=plan)
+
+    with pytest.raises(InfeasiblePlan) as error:
+        build_plan(config, step=4, version=4, failed_ranks=(0, 1, 2, 3), previous=plan)
+    assert error.value.reason.code == "no_executable_pp"
+
+
+def test_dp_rejects_a_final_layout_that_no_longer_fits():
+    # ``choose_tp`` gates memory with each stage's *old* layer count, so a stage that
+    # absorbs a dead stage's layers can end up needing more than was ever checked. The
+    # DP planner sees the final layout and is the one that says so.
+    config = replace(CONFIG, tp=1, pp=2, dp=1, num_layers=4)
+    budget = estimate_memory(
+        config,
+        tp_degree=1,
+        stage_layers=3,
+        micro_batches=config.batch_size // config.micro_batch_size,
+        sequence_length=SEQLEN,
+        vocab_size=VOCAB,
+        in_flight_micro_batches=1,
+    ).total
+    gated = dict(memory_budget=budget, vocab_size=VOCAB, sequence_length=SEQLEN)
+
+    plan = build_plan(config, step=0, version=0, **gated)  # two 2-layer stages fit
+    with pytest.raises(InfeasiblePlan) as error:
+        # Rank 1 was stage 1's only rank; stage 0 absorbs all four layers and no longer fits.
+        build_plan(config, step=1, version=1, failed_ranks=(1,), previous=plan, **gated)
+    assert error.value.reason.code == "no_feasible_dp_target"
+
+
+# --- cumulative fail-stop: what the invariant may and may not forbid ---------------
+
+
+def test_a_failed_rank_never_becomes_active_again():
+    pristine = build_plan(CONFIG, step=0, version=0)  # every rank active
+    after = build_plan(CONFIG, step=1, version=1, failed_ranks=(1,), previous=pristine)
+    assert 1 not in after.active_ranks
+
+    # A resurrection can only be expressed two ways, and both are rejected. Either the
+    # plan drops rank 1 from the failed set to make room for it...
+    with pytest.raises(PlanInvariantError, match="failed ranks must grow"):
+        assert_invariants(replace(pristine, version=2), previous=after)
+    # ...or it keeps rank 1 failed and schedules it anyway.
+    with pytest.raises(PlanInvariantError, match="active and failed ranks overlap"):
+        assert_invariants(replace(pristine, version=2, failed_ranks=(1,)), previous=after)
+
+
+def test_a_healthy_rank_left_idle_can_be_selected_again():
+    # TP4: after rank 0 dies the largest power-of-two prefix of the survivors is
+    # (1, 2), leaving healthy rank 3 idle. When rank 1 then dies, the planner must be
+    # free to pick rank 3 back up -- being unused is not being failed.
+    config = replace(CONFIG, tp=4, pp=1, dp=1, num_layers=2)
+    plan = build_plan(config, step=0, version=0)
+
+    v1 = build_plan(config, step=1, version=1, failed_ranks=(0,), previous=plan)
+    assert v1.active_ranks == (1, 2) and 3 in v1.live_ranks
+
+    v2 = build_plan(config, step=2, version=2, failed_ranks=(0, 1), previous=v1)
+    assert v2.active_ranks == (2, 3)  # idle rank 3 is back in the training path
+    assert v2.failed_ranks == (0, 1)
+
+
+def test_every_cumulative_failure_sequence_stays_inside_the_taxonomy():
+    # Each event either yields a plan or one of the six consistent-stop conditions.
+    # Nothing may escape as an unclassified error.
+    for config in (
+        replace(CONFIG, tp=4, pp=1, dp=1, num_layers=2),
+        replace(CONFIG, tp=2, pp=2, dp=1, num_layers=4),
+        CONFIG,
+    ):
+        plan = build_plan(config, step=0, version=0)
+        failed = ()
+        for version in range(1, config.world_size + 1):
+            failed = tuple(range(version))
+            try:
+                plan = build_plan(
+                    config, step=version, version=version, failed_ranks=failed, previous=plan
+                )
+            except InfeasiblePlan as error:
+                assert error.reason.code in STOP_CODES, error.reason.code
+                break
+            assert set(plan.active_ranks) <= set(plan.live_ranks)
+
+
+def test_the_same_failure_sequence_yields_the_same_digests():
+    def sequence():
+        plan = build_plan(CONFIG, step=0, version=0)
+        digests = [plan.digest]
+        for version, failed in enumerate([(1,), (1, 5), (1, 3, 5)], start=1):
+            plan = build_plan(
+                CONFIG, step=version, version=version, failed_ranks=failed, previous=plan
+            )
+            digests.append(plan.digest)
+        return digests
+
+    assert sequence() == sequence()
 
 
 def test_tp_memory_infeasibility_is_reported_at_the_tp_stage():
@@ -104,14 +218,35 @@ def test_tp_memory_infeasibility_is_reported_at_the_tp_stage():
 
 
 def test_tp_change_emits_a_donor_target_reshard_state_route():
+    """A route carries both layouts, so recovery can execute it without re-deriving one."""
     plan = build_plan(CONFIG, step=2, version=2, failed_ranks=(1,))
 
     route = next(r for r in plan.state_routes if r.replica_id == 0 and r.layer == 0)
-    assert route.target_ranks == (0,)
+    assert route.boundary == ""
+    assert route.target_ranks == (0,) and route.target_degree == 1
     assert route.donor_kind == "peer_replica"
-    assert route.donor_ranks == (4, 5)
+    assert route.donor_ranks == (4, 5) and route.donor_degree == 2
     assert route.reshard == "gather_reshard"
-    assert set(route.states) == {"param", "grad", "exp_avg", "exp_avg_sq", "step"}
+    # Gradients are not persistent state: they are recomputed by the next iteration.
+    assert set(route.states) == {"param", "exp_avg", "exp_avg_sq", "step"}
+    assert "grad" not in route.states
+
+
+def test_boundary_tensors_are_routed_when_their_owning_stage_changes():
+    """The embedding and LM head follow the first / last executable stage (plan 3.4).
+
+    They belong to no layer, so a per-layer route table cannot express them -- and a
+    recovery that never fetched them would leave a resharded boundary stage holding the
+    old layout.
+    """
+    plan = build_plan(CONFIG, step=2, version=2, failed_ranks=(1,))
+
+    boundaries = {r.boundary: r for r in plan.state_routes if r.replica_id == 0 and r.layer is None}
+    # Replica 0's stage 0 halved to TP1, so its embedding shard must be rebuilt.
+    assert boundaries["embedding"].target_ranks == (0,)
+    assert boundaries["embedding"].donor_kind == "peer_replica"
+    # Its last stage was untouched, so the head does not move at all.
+    assert "head" not in boundaries
 
 
 def test_consecutive_failures_route_from_the_previous_plan_not_the_initial_config():
@@ -120,13 +255,108 @@ def test_consecutive_failures_route_from_the_previous_plan_not_the_initial_confi
     third = build_plan(CONFIG, step=4, version=3, failed_ranks=(1, 3), previous=second)
 
     # Layers 0-1 have stayed on rank 0 since the second plan, so nothing routes
-    # them; only the freshly degraded stage (layers 2-3) migrates.
-    assert {r.layer for r in third.state_routes if r.replica_id == 0} == {2, 3}
+    # them; only the freshly degraded stage (layers 2-3, and the LM head it owns)
+    # migrates.
+    groups = {(r.layer, r.boundary) for r in third.state_routes if r.replica_id == 0}
+    assert groups == {(2, ""), (3, ""), (None, "head")}
 
     # Rebuilding the same failure from the initial config would wrongly claim the
-    # already-settled layers 0-1 migrate again.
+    # already-settled layers 0-1 -- and the embedding with them -- migrate again.
     from_initial = build_plan(CONFIG, step=4, version=3, failed_ranks=(1, 3))
-    assert {r.layer for r in from_initial.state_routes if r.replica_id == 0} == {0, 1, 2, 3}
+    assert {(r.layer, r.boundary) for r in from_initial.state_routes if r.replica_id == 0} == {
+        (0, ""), (1, ""), (2, ""), (3, ""), (None, "embedding"), (None, "head"),
+    }
+
+
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        # A route must name exactly one state group -- neither both nor neither, or
+        # ``route_names`` cannot expand it into logical tensors.
+        ("layer", None, "exactly one layer or boundary"),
+        ("boundary", "embedding", "exactly one layer or boundary"),
+        # Recovery reads these two degrees as the source and target TP layouts, so a
+        # degree that disagrees with its rank tuple would reshard to the wrong shape.
+        ("target_degree", 99, "target degree"),
+        ("donor_degree", 99, "donor degree"),
+        # Plan principle A: gradients are not persistent state and never travel.
+        ("states", ("param", "grad"), "gradients are not persistent state"),
+    ],
+)
+def test_invariants_reject_a_malformed_state_route(field, value, message):
+    """Every field recovery relies on is checked before the plan can be published."""
+    plan = build_plan(CONFIG, step=2, version=2, failed_ranks=(1,))
+    route = next(r for r in plan.state_routes if r.layer == 0)
+    broken = replace(
+        plan,
+        state_routes=tuple(
+            replace(r, **{field: value}) if r is route else r for r in plan.state_routes
+        ),
+    )
+
+    with pytest.raises(PlanInvariantError, match=message):
+        assert_invariants(broken)
+
+
+def test_routing_is_stage_granular_even_when_one_member_keeps_its_seat():
+    """The rule is per state group, not per rank -- deliberately, and this pins it.
+
+    TP4 -> TP2 twice: rank 3 dies, leaving members ``(0, 1)``; then rank 1 dies and the
+    planner seats rank 2 in its place, giving ``(0, 2)``. Rank 0 comes through that
+    holding exactly what it held before -- same stage, same degree, same shard index --
+    yet it is still a target of the routes, because the *group's* owning members changed.
+
+    That is a superset of the strictly necessary set, and it is the right trade: the
+    acquisition pass is one collective over the control group whatever the layout holds,
+    so re-fetching a shard costs local reconstruction, not another transfer -- while the
+    per-rank alternative would put a second seat-tracking rule in the planner beside the
+    one recovery already reads.
+    """
+    config = replace(CONFIG, tp=4, pp=1, dp=1)
+    plan = build_plan(config, step=0, version=0)
+    v1 = build_plan(config, step=1, version=1, failed_ranks=(3,), previous=plan)
+    v2 = build_plan(config, step=2, version=2, failed_ranks=(1, 3), previous=v1)
+
+    assert [list(s.tp_members) for s in v1.stages] == [[0, 1]]
+    assert [list(s.tp_members) for s in v2.stages] == [[0, 2]]  # rank 2 replaces rank 1
+
+    # Rank 0 kept its seat exactly, and is routed all the same.
+    def seat(plan, rank):
+        stage = next(s for s in plan.stages if rank in s.tp_members)
+        return stage.stage_id, stage.tp_degree, stage.tp_members.index(rank)
+
+    assert seat(v1, 0) == seat(v2, 0)
+    routed = {(r.layer, r.boundary) for r in v2.state_routes if 0 in r.target_ranks}
+    assert routed == {
+        (0, ""), (1, ""), (2, ""), (3, ""), (None, "embedding"), (None, "head"),
+    }
+    # Both members of the new group are targets: the group moves as a unit.
+    assert all(set(r.target_ranks) == {0, 2} for r in v2.state_routes)
+
+
+def test_invariants_reject_an_unknown_boundary_group():
+    """``route_names`` can only expand the boundary groups it knows, so say so here."""
+    plan = build_plan(CONFIG, step=2, version=2, failed_ranks=(1,))
+    boundary = next(r for r in plan.state_routes if r.layer is None)
+    broken = replace(
+        plan,
+        state_routes=tuple(
+            replace(r, boundary="lm_head") if r is boundary else r for r in plan.state_routes
+        ),
+    )
+
+    with pytest.raises(PlanInvariantError, match="unknown boundary"):
+        assert_invariants(broken)
+
+
+def test_invariants_reject_the_same_state_group_routed_twice():
+    """Two routes for one group would fetch it twice, from possibly different donors."""
+    plan = build_plan(CONFIG, step=2, version=2, failed_ranks=(1,))
+    route = next(r for r in plan.state_routes if r.layer == 0)
+    broken = replace(plan, state_routes=plan.state_routes + (route,))
+
+    with pytest.raises(PlanInvariantError, match="routed more than once"):
+        assert_invariants(broken)
 
 
 def test_cross_replica_heterogeneous_stages_pass_the_invariants():
@@ -207,3 +437,50 @@ def test_out_of_range_and_duplicate_failures_are_rejected():
 
     with pytest.raises(ValueError, match="duplicate"):
         build_plan(CONFIG, step=0, version=1, failed_ranks=(1, 1))
+
+
+def test_an_indivisible_vocabulary_stops_the_plan_instead_of_crashing_the_runtime():
+    """Every static constraint that would make the layout unbuildable is a plan reason.
+
+    ``TensorParallelStage`` refuses a TP degree that does not divide the vocabulary, so
+    a planner blind to it would publish a plan the runtime cannot construct. With
+    ``vocab_size`` passed -- as the launched entrypoint always does -- no such degree is
+    ever selected, and when none survives the plan is infeasible with a root cause.
+    """
+    # 6 is divisible by 2 but not by 4: TP2 is buildable, TP4 is not.
+    config = replace(CONFIG, tp=4, pp=1, dp=1)
+    plan = build_plan(config, step=0, version=0, vocab_size=6, sequence_length=SEQLEN)
+    assert [s.tp_degree for s in plan.stages] == [2]
+
+    # Without the vocabulary the planner would have taken the largest degree the
+    # dimensions allow -- 4 -- which ``TensorParallelStage`` then refuses to build.
+    # That difference is the whole point of the gate.
+    blind = build_plan(config, step=0, version=0, sequence_length=SEQLEN)
+    assert [s.tp_degree for s in blind.stages] == [4]
+
+    # Degree 1 divides every vocabulary, so a plan is never infeasible on vocabulary
+    # alone; the structured ``no_feasible_tp`` reason belongs to a stage whose ``k_min``
+    # rules degree 1 out as well, which ``test_planner_tp.py`` covers directly.
+    odd = build_plan(config, step=0, version=0, vocab_size=7, sequence_length=SEQLEN)
+    assert [s.tp_degree for s in odd.stages] == [1]
+
+
+def test_boundary_pairs_name_every_pipeline_hop_the_assignment_creates():
+    """The two-rank groups the 1F1B boundary transfers ride on, read from the plan."""
+    plan = build_plan(CONFIG, step=0, version=0)
+    # TP2 x PP2 x DP2: one hop per replica, between the two stages' leaders.
+    assert boundary_pairs(plan) == ((0, 2), (4, 6))
+
+    # Rank 1 dies: replica 0's stage 0 keeps leader 0, so its hop is unchanged.
+    degraded = build_plan(CONFIG, step=1, version=1, failed_ranks=(1,), previous=plan)
+    assert boundary_pairs(degraded) == ((0, 2), (4, 6))
+
+    # Rank 4 dies too: replica 1's stage 0 leader becomes rank 5, and the hop follows.
+    moved = build_plan(CONFIG, step=2, version=2, failed_ranks=(1, 4), previous=degraded)
+    assert boundary_pairs(moved) == ((0, 2), (5, 6))
+
+
+def test_a_single_stage_replica_has_no_pipeline_hop():
+    """Nothing to transfer when a replica runs one stage, so no boundary group exists."""
+    config = replace(CONFIG, pp=1, dp=2, tp=2)
+    assert boundary_pairs(build_plan(config, step=0, version=0)) == ()

@@ -1,7 +1,82 @@
-"""Deterministic pipeline-parallel repartition planning."""
+"""Deterministic pipeline-parallel repartition planning and the 1F1B schedule.
+
+The 1F1B schedule lives here, not in the runtime, because three callers must agree
+on it and only one of them may import torch: :class:`resihp.parallel.pp.PipelineRuntime`
+executes it, :mod:`resihp.plan` and :mod:`resihp.planner.dp` size peak activation
+memory from it. Deriving :func:`peak_in_flight` from :func:`pipeline_schedule` rather
+than from a closed form is what keeps the memory model and the runtime one semantics
+(plan 3.4/3.5): change the schedule and the budget follows automatically.
+"""
 
 from dataclasses import dataclass
 from numbers import Integral
+
+
+def balanced_layers(num_layers: int, num_stages: int) -> tuple[tuple[int, ...], ...]:
+    """Contiguous global layer ids per stage, the remainder going to earlier stages.
+
+    The base partition a run starts from, before any fail-stop repartition. The one
+    definition of that split: :func:`resihp.plan.build_plan` derives the initial
+    layer counts from it too, so the pristine topology cannot drift between the
+    planner and the plan.
+    """
+    if num_stages < 1 or num_layers < num_stages:
+        raise ValueError("need at least one layer per stage")
+    base, remainder = divmod(num_layers, num_stages)
+    stages = []
+    start = 0
+    for stage in range(num_stages):
+        count = base + (1 if stage < remainder else 0)
+        stages.append(tuple(range(start, start + count)))
+        start += count
+    return tuple(stages)
+
+
+def pipeline_phases(num_micro_batches: int, *, stage_index: int, num_stages: int) -> tuple[int, int]:
+    """``(warmup, steady)`` micro-batch counts of one stage's 1F1B schedule.
+
+    A stage warms up with one forward per stage still downstream of it (capped by the
+    micro-batches it runs), then alternates one forward with one backward, then drains
+    the warmup backwards. The last stage has no warmup and alternates throughout.
+    """
+    if num_stages < 1 or not 0 <= stage_index < num_stages:
+        raise ValueError("stage_index must identify a stage of the pipeline")
+    if not isinstance(num_micro_batches, Integral) or isinstance(num_micro_batches, bool):
+        raise ValueError("num_micro_batches must be an integer")
+    if num_micro_batches < 0:
+        raise ValueError("num_micro_batches must not be negative")
+    warmup = min(num_stages - 1 - stage_index, num_micro_batches)
+    return warmup, num_micro_batches - warmup
+
+
+def pipeline_schedule(num_micro_batches: int, *, stage_index: int, num_stages: int) -> tuple[str, ...]:
+    """The forward/backward order one stage issues: warmup -> steady 1F1B -> cooldown.
+
+    ``"F"``/``"B"`` in issue order, which is exactly what
+    :meth:`resihp.parallel.pp.PipelineRuntime.train_step` emits (a torch-gated test
+    compares the two element for element, so they cannot drift).
+    """
+    warmup, steady = pipeline_phases(
+        num_micro_batches, stage_index=stage_index, num_stages=num_stages
+    )
+    return ("F",) * warmup + ("F", "B") * steady + ("B",) * warmup
+
+
+def peak_in_flight(num_micro_batches: int, *, stage_index: int, num_stages: int) -> int:
+    """Most activations one stage holds at once, replayed from :func:`pipeline_schedule`.
+
+    An activation is retained at its forward and released at its matching backward
+    (plan 3.5), so replaying the schedule as +1/-1 gives the high-water mark the
+    analytical memory model must budget. Derived rather than asserted, so the figure
+    is the runtime's own behaviour and not a constant that can fall out of date.
+    """
+    live = peak = 0
+    for operation in pipeline_schedule(
+        num_micro_batches, stage_index=stage_index, num_stages=num_stages
+    ):
+        live += 1 if operation == "F" else -1
+        peak = max(peak, live)
+    return peak
 
 
 @dataclass(frozen=True)

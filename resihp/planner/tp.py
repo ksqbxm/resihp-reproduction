@@ -31,7 +31,6 @@ class TPChoice:
 
 class _MemoryInputs(NamedTuple):
     sequence_length: int
-    vocab_size: int
     memory_budget: int
     in_flight_micro_batches: int
 
@@ -76,7 +75,7 @@ def _validated_inputs(
     vocab_size: int | None,
     memory_budget: int | None,
     in_flight_micro_batches: int | None,
-) -> tuple[tuple[int, ...], int, int, _MemoryInputs | None]:
+) -> tuple[tuple[int, ...], int, int, int | None, _MemoryInputs | None]:
     min_degree = _positive_integer("min_degree", min_degree)
     ranks = _normalize_active_ranks(active_ranks)
     if config.model_dim % config.num_heads:
@@ -87,29 +86,28 @@ def _validated_inputs(
     layers = _positive_integer("stage_layers", layers)
     batches = _positive_integer("micro_batches", batches)
 
+    vocab = None if vocab_size is None else _positive_integer("vocab_size", vocab_size)
+
     if memory_budget is None:
         if sequence_length is not None:
             _positive_integer("sequence_length", sequence_length)
-        if vocab_size is not None:
-            _positive_integer("vocab_size", vocab_size)
         if in_flight_micro_batches is not None:
             _positive_integer("in_flight_micro_batches", in_flight_micro_batches)
-        return ranks, layers, batches, None
+        return ranks, layers, batches, vocab, None
 
     budget = _positive_integer("memory_budget", memory_budget)
-    if sequence_length is None or vocab_size is None or in_flight_micro_batches is None:
+    if sequence_length is None or vocab is None or in_flight_micro_batches is None:
         raise ValueError(
             "sequence_length, vocab_size, and in_flight_micro_batches are required when memory_budget is set"
         )
     memory_inputs = _MemoryInputs(
         sequence_length=_positive_integer("sequence_length", sequence_length),
-        vocab_size=_positive_integer("vocab_size", vocab_size),
         memory_budget=budget,
         in_flight_micro_batches=_positive_integer(
             "in_flight_micro_batches", in_flight_micro_batches
         ),
     )
-    return ranks, layers, batches, memory_inputs
+    return ranks, layers, batches, vocab, memory_inputs
 
 
 def _feasible_degrees(
@@ -119,19 +117,34 @@ def _feasible_degrees(
     min_degree: int,
     stage_layers: int,
     micro_batches: int,
+    vocab_size: int | None,
     memory_inputs: _MemoryInputs | None,
 ) -> tuple[int, ...]:
+    """Degrees a stage could actually be built at, ascending.
+
+    Every static topology constraint that would make the new TP layout unbuildable is
+    applied here, so an infeasible degree becomes the structured ``no_feasible_tp``
+    reason instead of a ``ValueError`` when the runtime tries to construct the stage:
+    the attention heads and the TP-sharded model dimensions must divide by the degree,
+    and so must the vocabulary, because the token embedding and the LM head are
+    vocab-parallel (:class:`resihp.parallel.tp.TensorParallelStage`).
+    """
     result = []
     for degree in _powers_of_two_between(len(ranks), min_degree):
         if config.model_dim % degree or config.num_heads % degree:
             continue
+        if vocab_size is not None and vocab_size % degree:
+            continue
+        # Every resident term the budget checks -- including the embedding/LM-head
+        # boundary_parameters -- is sharded by ``degree``, so the whole footprint
+        # scales with k. None of it is a fixed per-rank overhead in this k_min search.
         if memory_inputs is not None and not memory_feasible(
             config,
             tp_degree=degree,
             stage_layers=stage_layers,
             micro_batches=micro_batches,
             sequence_length=memory_inputs.sequence_length,
-            vocab_size=memory_inputs.vocab_size,
+            vocab_size=vocab_size,
             memory_budget=memory_inputs.memory_budget,
             in_flight_micro_batches=memory_inputs.in_flight_micro_batches,
         ):
@@ -159,12 +172,14 @@ def feasible_degrees(
     sorts that set and chooses deterministic members from it; it does not infer
     stage membership or physical domains from global ranks. ``min_degree`` is a
     lower bound, so non-power-of-two values select the next power-of-two TP
-    candidate that satisfies ``k >= min_degree``. When ``memory_budget`` is set,
-    callers must explicitly pass ``sequence_length``, ``vocab_size``, and the
+    candidate that satisfies ``k >= min_degree``. ``vocab_size``, when given, also
+    filters degrees that do not divide the vocabulary -- the embedding and LM head are
+    vocab-parallel, so such a degree cannot be built at all. When ``memory_budget`` is
+    set, callers must explicitly pass ``sequence_length``, ``vocab_size``, and the
     stage-specific 1F1B ``in_flight_micro_batches`` to avoid undercounting peak
     activation memory.
     """
-    ranks, layers, batches, memory_inputs = _validated_inputs(
+    ranks, layers, batches, vocab, memory_inputs = _validated_inputs(
         config,
         active_ranks=active_ranks,
         min_degree=min_degree,
@@ -181,6 +196,7 @@ def feasible_degrees(
         min_degree=min_degree,
         stage_layers=layers,
         micro_batches=batches,
+        vocab_size=vocab,
         memory_inputs=memory_inputs,
     )
 
@@ -198,7 +214,7 @@ def choose_tp(
     in_flight_micro_batches: int | None = None,
 ) -> TPChoice:
     """Choose the maximum eligible degree and ascending stage-local members."""
-    ranks, layers, batches, memory_inputs = _validated_inputs(
+    ranks, layers, batches, vocab, memory_inputs = _validated_inputs(
         config,
         active_ranks=active_ranks,
         min_degree=min_degree,
@@ -215,12 +231,16 @@ def choose_tp(
         min_degree=min_degree,
         stage_layers=layers,
         micro_batches=batches,
+        vocab_size=vocab,
         memory_inputs=memory_inputs,
     )
     if not degrees:
         reason = TPInfeasibleReason(
             code="no_feasible_tp",
-            message="no TP degree satisfies active-rank, divisibility, and memory constraints",
+            message=(
+                "no TP degree satisfies active-rank, divisibility (heads, model "
+                "dimension, vocabulary), and memory constraints"
+            ),
             active_ranks=ranks,
         )
         raise InfeasibleTP(reason)
