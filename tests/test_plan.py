@@ -268,6 +268,97 @@ def test_consecutive_failures_route_from_the_previous_plan_not_the_initial_confi
     }
 
 
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        # A route must name exactly one state group -- neither both nor neither, or
+        # ``route_names`` cannot expand it into logical tensors.
+        ("layer", None, "exactly one layer or boundary"),
+        ("boundary", "embedding", "exactly one layer or boundary"),
+        # Recovery reads these two degrees as the source and target TP layouts, so a
+        # degree that disagrees with its rank tuple would reshard to the wrong shape.
+        ("target_degree", 99, "target degree"),
+        ("donor_degree", 99, "donor degree"),
+        # Plan principle A: gradients are not persistent state and never travel.
+        ("states", ("param", "grad"), "gradients are not persistent state"),
+    ],
+)
+def test_invariants_reject_a_malformed_state_route(field, value, message):
+    """Every field recovery relies on is checked before the plan can be published."""
+    plan = build_plan(CONFIG, step=2, version=2, failed_ranks=(1,))
+    route = next(r for r in plan.state_routes if r.layer == 0)
+    broken = replace(
+        plan,
+        state_routes=tuple(
+            replace(r, **{field: value}) if r is route else r for r in plan.state_routes
+        ),
+    )
+
+    with pytest.raises(PlanInvariantError, match=message):
+        assert_invariants(broken)
+
+
+def test_routing_is_stage_granular_even_when_one_member_keeps_its_seat():
+    """The rule is per state group, not per rank -- deliberately, and this pins it.
+
+    TP4 -> TP2 twice: rank 3 dies, leaving members ``(0, 1)``; then rank 1 dies and the
+    planner seats rank 2 in its place, giving ``(0, 2)``. Rank 0 comes through that
+    holding exactly what it held before -- same stage, same degree, same shard index --
+    yet it is still a target of the routes, because the *group's* owning members changed.
+
+    That is a superset of the strictly necessary set, and it is the right trade: the
+    acquisition pass is one collective over the control group whatever the layout holds,
+    so re-fetching a shard costs local reconstruction, not another transfer -- while the
+    per-rank alternative would put a second seat-tracking rule in the planner beside the
+    one recovery already reads.
+    """
+    config = replace(CONFIG, tp=4, pp=1, dp=1)
+    plan = build_plan(config, step=0, version=0)
+    v1 = build_plan(config, step=1, version=1, failed_ranks=(3,), previous=plan)
+    v2 = build_plan(config, step=2, version=2, failed_ranks=(1, 3), previous=v1)
+
+    assert [list(s.tp_members) for s in v1.stages] == [[0, 1]]
+    assert [list(s.tp_members) for s in v2.stages] == [[0, 2]]  # rank 2 replaces rank 1
+
+    # Rank 0 kept its seat exactly, and is routed all the same.
+    def seat(plan, rank):
+        stage = next(s for s in plan.stages if rank in s.tp_members)
+        return stage.stage_id, stage.tp_degree, stage.tp_members.index(rank)
+
+    assert seat(v1, 0) == seat(v2, 0)
+    routed = {(r.layer, r.boundary) for r in v2.state_routes if 0 in r.target_ranks}
+    assert routed == {
+        (0, ""), (1, ""), (2, ""), (3, ""), (None, "embedding"), (None, "head"),
+    }
+    # Both members of the new group are targets: the group moves as a unit.
+    assert all(set(r.target_ranks) == {0, 2} for r in v2.state_routes)
+
+
+def test_invariants_reject_an_unknown_boundary_group():
+    """``route_names`` can only expand the boundary groups it knows, so say so here."""
+    plan = build_plan(CONFIG, step=2, version=2, failed_ranks=(1,))
+    boundary = next(r for r in plan.state_routes if r.layer is None)
+    broken = replace(
+        plan,
+        state_routes=tuple(
+            replace(r, boundary="lm_head") if r is boundary else r for r in plan.state_routes
+        ),
+    )
+
+    with pytest.raises(PlanInvariantError, match="unknown boundary"):
+        assert_invariants(broken)
+
+
+def test_invariants_reject_the_same_state_group_routed_twice():
+    """Two routes for one group would fetch it twice, from possibly different donors."""
+    plan = build_plan(CONFIG, step=2, version=2, failed_ranks=(1,))
+    route = next(r for r in plan.state_routes if r.layer == 0)
+    broken = replace(plan, state_routes=plan.state_routes + (route,))
+
+    with pytest.raises(PlanInvariantError, match="routed more than once"):
+        assert_invariants(broken)
+
+
 def test_cross_replica_heterogeneous_stages_pass_the_invariants():
     # build_plan runs assert_invariants internally, so a successful return means
     # the heterogeneous topology (replica 0 single-stage, replica 1 two-stage)

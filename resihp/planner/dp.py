@@ -125,7 +125,7 @@ def _validate_topology(topology: DPTopology) -> None:
             _integer("capacity", stage.capacity, positive=True)
 
 
-def _stage_capacity(topology: DPTopology, pipeline: tuple[DPStage, ...], index: int) -> int:
+def _stage_capacity(topology: DPTopology, stage: DPStage, *, index: int, num_stages: int) -> int:
     """Micro-batches this stage can take, or 0 when the budget cannot hold it.
 
     This is the first point that sees the layout actually being published, which is why
@@ -134,7 +134,6 @@ def _stage_capacity(topology: DPTopology, pipeline: tuple[DPStage, ...], index: 
     count is replayed from its own position in the 1F1B schedule the runtime executes,
     so the budget and the runtime speak about the same peak.
     """
-    stage = pipeline[index]
     if topology.memory_budget is not None and not memory_feasible(
         topology.config,
         tp_degree=stage.tp_degree,
@@ -144,7 +143,7 @@ def _stage_capacity(topology: DPTopology, pipeline: tuple[DPStage, ...], index: 
         vocab_size=topology.vocab_size,
         memory_budget=topology.memory_budget,
         in_flight_micro_batches=peak_in_flight(
-            topology.micro_batches, stage_index=index, num_stages=len(pipeline)
+            topology.micro_batches, stage_index=index, num_stages=num_stages
         ),
     ):
         return 0
@@ -199,7 +198,8 @@ def assign(
         if any(failed.intersection(stage.ranks) for stage in pipeline):
             continue
         capacity = min(
-            _stage_capacity(active_topology, pipeline, index) for index in range(len(pipeline))
+            _stage_capacity(active_topology, stage, index=index, num_stages=len(pipeline))
+            for index, stage in enumerate(pipeline)
         )
         if capacity > 0:
             candidates.append((pipeline, capacity))

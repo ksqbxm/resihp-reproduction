@@ -197,12 +197,13 @@ def reshard_tp_state(
     """Reshard param and AdamW state across a TP degree or membership change.
 
     ``local_state`` is ``{name: {"shard_index": int, "shard_count": int, "param": T,
-    "exp_avg": T, "exp_avg_sq": T, "step": T}}`` for the shards this rank holds; a rank holding nothing passes ``{}``. ``shard_count`` may be omitted when
-    every contributor shares one degree, in which case ``old_size`` is assumed. Every
-    rank in ``group`` (all healthy ranks, across DP replicas) joins the
-    ``all_gather_object`` so each reconstructs the identical full logical state. ``new_rank`` is this rank's index in the new
-    TP group, or ``None`` if it is being dropped -- dropped ranks still gather (so
-    their shards feed peers) but receive nothing back.
+    "exp_avg": T, "exp_avg_sq": T, "step": T}}`` for the shards this rank holds; a rank
+    holding nothing passes ``{}``. ``shard_count`` may be omitted when every contributor
+    shares one degree, in which case ``old_size`` is assumed. Every rank in ``group``
+    (all healthy ranks, across DP replicas) joins the ``all_gather_object`` so each
+    reconstructs the identical full logical state. ``new_rank`` is this rank's index in
+    the new TP group, or ``None`` if it is being dropped -- dropped ranks still gather
+    (so their shards feed peers) but receive nothing back.
 
     ``checkpoint`` (when given) is ``{name: {field: full_tensor}}``; it supplies any
     shard missing from all peers and, with ``verify``, is checked tensor by tensor

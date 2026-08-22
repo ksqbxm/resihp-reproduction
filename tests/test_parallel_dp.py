@@ -145,7 +145,9 @@ def test_a_micro_batch_split_mid_pipeline_is_rejected_not_executed():
     from resihp.parallel.pp import PipelineRuntime
 
     class _StubStage:
-        """Enough of a stage to build the optimizer; the routing check runs first."""
+        """Enough of a stage to construct the runtime: its ends and one parameter."""
+
+        is_first, is_last = True, False
 
         def parameters(self):
             return [torch.nn.Parameter(torch.zeros(1))]

@@ -88,6 +88,15 @@ class PipelineRuntime:
         self.activation_log = ActivationLog()
         self.stage_index, self.num_stages = self._position()
         self.executors, self.upstream, self.downstream = self._neighbours()
+        # The stage's ends come from the plan and its neighbours from the assignment;
+        # the plan invariants make them agree. A mismatch would not deadlock -- it would
+        # silently feed the first stage a received activation instead of its tokens, or
+        # drop one -- so it is rejected here rather than left to show up as numerics.
+        if self.routes and (
+            (self.upstream is None) != stage.is_first
+            or (self.downstream is None) != stage.is_last
+        ):
+            raise ValueError("the stage's pipeline ends disagree with the assignment")
         self.optimizer = torch.optim.AdamW(
             stage.parameters(),
             lr=LEARNING_RATE,
@@ -138,11 +147,7 @@ class PipelineRuntime:
 
     def _hop(self, peer_leader: int):
         """The two-rank process group this rank's hop to ``peer_leader`` rides on."""
-        key = (min(self.rank, peer_leader), max(self.rank, peer_leader))
-        try:
-            return self.boundary_groups[key]
-        except KeyError:
-            raise KeyError(f"no boundary group was built for the hop {key}") from None
+        return self.boundary_groups[(min(self.rank, peer_leader), max(self.rank, peer_leader))]
 
     # --- Send / Recv primitives ----------------------------------------------------
 
@@ -225,14 +230,6 @@ class PipelineRuntime:
         """
         if tokens.shape[0] % self.micro_total:
             raise ValueError("batch size must be divisible by the micro-batch count")
-        # The stage's ends come from the plan and its neighbours from the assignment;
-        # the plan invariants make them agree, and a mismatch would silently feed the
-        # first stage a received activation (or drop one) instead of failing.
-        if self.micro_batches and (
-            (self.upstream is None) != self.stage.is_first
-            or (self.downstream is None) != self.stage.is_last
-        ):
-            raise ValueError("the stage's pipeline ends disagree with the assignment")
         device = next(self.stage.parameters()).device
         chunks = tokens.chunk(self.micro_total, dim=0)
         shape = (chunks[0].shape[0], self.stage.sequence_length, self.stage.dim)

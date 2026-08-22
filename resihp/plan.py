@@ -434,10 +434,16 @@ def build_plan(
             for stage in range(config.pp)
             if pp_plan.layer_ranges[stage] is not None
         }
-        # A state group needs a route exactly when the TP members owning it change:
-        # different stages hold disjoint rank domains, so that single test covers a
+        # A state group needs a route exactly when the TP members owning it change.
+        # Different stages hold disjoint rank domains, so that single test covers a
         # layer moving stage, a stage changing degree, a rank changing seat within its
         # stage, and a boundary tensor following a new first / last executable stage.
+        # It is deliberately *stage*-granular, not per-rank: when one member of a group
+        # is replaced, every member re-acquires it, including one whose own shard index
+        # never moved. That is a superset of the strictly necessary set and it is the
+        # cheaper one to be right about -- recovery gathers once per source layout
+        # whatever the layout holds, so the extra names cost local reconstruction and no
+        # transfer, while narrowing them would need a second seat-tracking rule here.
         for layer, boundary in _state_groups(config.num_layers):
             old_members = _group_owner(old_layout[replica], layer, boundary)
             new_owner = _group_owner(new_stage_layout, layer, boundary)

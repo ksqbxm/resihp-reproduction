@@ -427,21 +427,16 @@ def recover(
 
     recovered = None
     if stage is not None:
-        # Every name the plan routed here has to have arrived. The passes are grouped by
-        # source layout, so a route filed under a degree this rank never ran would fetch
-        # nothing at all -- silently, and only visible later as a stale shard.
-        wanted = acquire_layout(plan, rank)
-        unfetched = sorted(set(wanted) - set(acquired))
-        if unfetched:
-            raise ReshardError(f"routed state never arrived for rank {rank}: {unfetched}")
         owned = stage_layout(plan, stage)
-        # What this stage keeps: every owned name no route moved, which it must already
-        # hold in the right shape. A gap here would mean the plan routed less than the
-        # stage owns, so name it rather than letting it surface as a KeyError.
-        missing = [name for name in owned if name not in acquired and name not in local]
+        # The plan decides what moves, so it also decides what stays: a name it did not
+        # route is one this rank must already hold in the right shape. If it holds
+        # neither, the routes cover less than the stage owns -- name that rather than
+        # letting it surface as a KeyError inside the stage constructor.
+        wanted = acquire_layout(plan, rank)
+        missing = [name for name in owned if name not in wanted and name not in local]
         if missing:
             raise ReshardError(f"no state route covers {sorted(missing)} for rank {rank}")
-        state = {name: local[name] for name in owned if name not in acquired}
+        state = {name: local[name] for name in owned if name not in wanted}
         state.update({name: fields for name, fields in acquired.items() if name in owned})
         recovered = PlannedRun(
             plan,

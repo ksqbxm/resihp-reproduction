@@ -1088,7 +1088,13 @@ TP 选 degree 时只能用旧流水的形状（重分层需要新 degree，顺�
   根本表达不了「首/尾可执行 stage 换人」。
 - 生成规则收敛成一条：**某个 state group 的属主 TP 成员变了就发一条 route**。不同 stage 的
   rank 域互斥，所以这一条同时覆盖了「层换 stage」「stage 降 degree」「rank 换座位」
-  「边界张量换属主」四种情况——与原来 `acquire_layout` 的输出集合等价，但由计划给出。
+  「边界张量换属主」四种情况。
+  **它是 stage 粒度而非 rank 粒度**：某个成员被替换时，同组每个成员都重取，包括自己下标
+  没动的那个。这是原 `acquire_layout` 结果的**超集**而非等价集——11760 组
+  `(plan, rank)` 的穷举比对里有 27 组属于这种情形，方向全部是「新的多取」，从无「新的少取」。
+  这样取舍是对的：recovery 每个来源布局只做**一次**集合通信，layout 里多几个名字只增加本地
+  重构、不增加传输；要收窄就得在 planner 里再放一套「谁还坐在原位」的规则，与 route 本身重复。
+  `test_plan.py::test_routing_is_stage_granular_even_when_one_member_keeps_its_seat` 钉死此行为。
 - `recovery.recover` 改为**执行 route**：按 route 声明的 `donor_degree` 分组，每组一次集合收集
   （轮次序列由 plan 推出，各 rank 一致，所以不会有人多做少做一次 collective）。
   运行时只保留**安全检查**，不再有独立 routing policy：donor 集合真的不完整时才落 checkpoint
@@ -1174,7 +1180,7 @@ TP 在 v1/v2/v4 降 degree，PP 在 v1/v2 搬层、v3 清空一个 stage，DP �
 Windows，**无 torch**（计划硬性禁止安装/升级 torch，且本机不是目标机）：
 
 ```text
-python -m pytest -q  ->  117 passed, 12 skipped
+python -m pytest -q  ->  125 passed, 12 skipped
 ```
 
 12 项 skip 是 10 个 torch 门禁模块整模块 skip + 2 项 GPU/torch 条件 skip。分布式与数值门禁

@@ -6,9 +6,14 @@
 
 - 每条结论都标出**证据在哪、由谁产生**。凡本机（Windows，**无 torch**，计划硬性禁止安装/升级 torch）
   跑不了的，一律写「待 8 卡目标机执行」，不以「实现看起来对」代替执行结果。
-- 本机可执行部分：`python -m pytest -q` → **117 passed, 12 skipped**。12 项 skip 全部是分布式 / GPU
+- 本机可执行部分：`python -m pytest -q` → **125 passed, 12 skipped**。12 项 skip 全部是分布式 / GPU
   模块在收集阶段整模块 skip（`torch` 不可导入），不是被跳过的断言。
 - 本报告不复述各任务的实现细节，那些在 `docs/PROGRESS.md`；这里只回答「完成标准成立没有、凭什么」。
+
+> **本轮全量审阅使此前的目标机确认全部失效。** 生产运行时已从「全前向→全反向」换成统一的 1F1B，
+> stage 边界改走每跳两 rank 的进程组，recovery 改为执行 `ExecutionPlan.state_routes`，默认配置与
+> 故障序列也换了。旧结论是针对**已经不存在的代码**取得的，因此第 3、4 节里凡涉及分布式或数值的行
+> 一律降级为「待目标机复跑」。下面保留的「已确认」只限于本机可执行、且本轮实跑过的纯函数门禁。
 
 ## 1. GPU/NCCL 验收（完成标准：≥2 次连续 fail-stop 并继续）
 
@@ -107,23 +112,23 @@ checkpoint、残留 `.tmp`、以及配置层面的「最后一次故障落在最
 
 | 组 | 覆盖 | 文件 | 状态 |
 |---|---|---|---|
-| **A 模块级** | 配置/故障 JSON 校验、显存模型、TP 候选与成员、PP 分层、DP 容量与重路由、ExecutionPlan 与不变量、checkpoint 读写 | `test_config.py`、`test_memory.py`、`test_planner_{tp,pp,dp}.py`、`test_plan.py`、`test_checkpoint.py`、`test_entrypoint.py` | 纯函数部分**本机全绿**；`test_checkpoint.py` 需 torch，待目标机 |
-| **B 不变量** | active/assigned 一一对应、层归属唯一连续、micro-batch·stage 恰一次、版本递增与 digest 一致、重路由幂等 | `test_plan.py::assert_invariants` 系列 + `test_end_to_end.py` + `test_fault_sequences.py` 每次重配后强制校验 | 纯函数部分本机全绿；分布式部分待目标机 |
-| **C 对比验收** | 恢复前逐张量等于 checkpoint；恢复后与「同 checkpoint 起点 + 新拓扑 + 新配置实际 batch + 同种子」参考一致；多故障点位（每 N / 每 2N / 随机）与多次序列回归 | `test_recovery.py`、`test_end_to_end.py`、`test_fault_sequences.py`（5 条序列 × Gloo/NCCL） | 目标机：T16 两项已确认全过；T17 五条 Gloo 已确认全过，NCCL 待复跑 |
-| **D 组合与端到端** | 七项两两组合（均执行真实前反向）× Gloo/NCCL = 14 项；完整 3D `TP2×PP2×DP2` 8 进程 2 项 | `test_combinations.py`、`test_end_to_end.py` | T16 两项目标机已确认；14 项组合待目标机执行 |
-| **E 资源耗尽与错误注入** | 六条一致停止条件各一项 + 「健康 donor 全失但 checkpoint 可用」 | `test_recovery.py`（六条）、`test_fault_sequences.py::donor_exhaustion` | 目标机：Gloo 已确认，NCCL 待复跑 |
-| **F 显存公式专项** | 两组已知配置逐项手算核对字节数 + 「刚好满足 / 超一字节」边界 | `test_memory.py` | **本机全绿** |
+| **A 模块级** | 配置/故障 JSON 校验（含 `memory_budget_bytes`）、显存模型（in-flight 由 1F1B 调度导出）、TP 候选与成员（含 vocab 整除）、PP 分层与 1F1B 调度、DP 容量与重路由、ExecutionPlan / state route 不变量、checkpoint 读写 | `test_config.py`、`test_memory.py`、`test_planner_{tp,pp,dp}.py`、`test_plan.py`、`test_checkpoint.py`、`test_entrypoint.py`、`test_acceptance.py` | 纯函数部分**本机全绿（本轮实跑）**；`test_checkpoint.py` 需 torch，待目标机 |
+| **B 不变量** | active/assigned 一一对应、层归属唯一连续、micro-batch·stage 恰一次、版本递增与 digest 一致、重路由幂等 | `test_plan.py::assert_invariants` 系列 + `test_end_to_end.py` + `test_fault_sequences.py` 每次重配后强制校验 | 纯函数部分本机全绿（本轮实跑）；分布式部分**待目标机复跑** |
+| **C 对比验收** | 恢复前逐张量等于 checkpoint；恢复后与「同 checkpoint 起点 + 新拓扑 + 新配置实际 batch + 同种子」参考一致；多故障点位（每 N / 每 2N / 随机）与多次序列回归 | `test_recovery.py`、`test_end_to_end.py`、`test_fault_sequences.py`（5 条序列 × Gloo/NCCL） | **全部待目标机复跑**：recovery 现在执行 state route，比对口径统一到 `resihp/verify.py` |
+| **D 组合与端到端** | 七项两两组合（均执行真实前反向）× Gloo/NCCL = 14 项；完整 3D `TP2×PP2×DP2` 8 进程 2 项 | `test_combinations.py`、`test_end_to_end.py` | **全部待目标机复跑**：四项组合改由统一的 `PipelineRuntime` 驱动，TP+PP 走真实 leader 跳 |
+| **E 资源耗尽与错误注入** | 六条一致停止条件各一项 + 「健康 donor 全失但 checkpoint 可用」 | `test_recovery.py`（六条）、`test_fault_sequences.py::donor_exhaustion` | **待目标机复跑**（停止条件本身未改，但恢复路径改了） |
+| **F 显存公式专项** | 两组已知配置逐项手算核对字节数 + 「刚好满足 / 超一字节」边界 | `test_memory.py`（含 1 stage / 2 stage / 深流水的逐 stage 峰值与边界） | **本机全绿（本轮实跑）** |
 
 ## 4. 完成标准逐条
 
 | 完成标准（计划六） | 结论 | 依据 |
 |---|---|---|
-| A–F 全部测试通过 | **部分待执行**：无 torch 的 A/F 与 B 的纯函数部分本机全绿；分布式与 GPU 门禁见第 3 节状态列 | `python -m pytest -q` = 117 passed / 12 skipped |
+| A–F 全部测试通过 | **部分待执行**：无 torch 的 A/F 与 B 的纯函数部分本机全绿；分布式与 GPU 门禁见第 3 节状态列 | `python -m pytest -q` = 125 passed / 12 skipped |
 | GPU/NCCL 下 ≥2 次连续 fail-stop 并继续 | **待目标机执行** | 第 1 节：命令、期望计划序列、门禁与 18 项变异核对均已就位 |
-| TP/PP/DP 均真实执行（非仅元数据） | 成立（凭已确认的目标机结果） | T16 两项在目标机全过：真实 TP all-reduce 分片前反向、1F1B 层迁移、跨 replica activation/gradient；T15 的七项组合明确要求「执行真实前反向」 |
-| 参数 / AdamW / 迭代号 / 数据游标无丢失 | 成立（同上） | 恢复后各分片与 anchor 逐张量 `torch.equal`（含 `exp_avg`/`exp_avg_sq`/`step`）；cursor 逐轮等于 `iteration-1`，恢复后等于 checkpoint 的 `completed_steps`。**`grad` 不在其中**：安全点只出现在 AdamW step 之后、无跨安全点梯度累积，下一轮 `zero_grad` 后重算（计划文档「二·补」） |
-| 恢复前精确等于 checkpoint、恢复后与新配置参考一致 | 成立（同上，NCCL 侧 T17 待复跑） | 原则 A 双口径：前半段 `torch.equal`，后半段对「同起点 + 新拓扑 + 新 batch + 同种子」参考 `allclose`（NCCL 上梯度差已降到 ~1e-08–3e-08） |
-| 资源不足时全体一致退出、最后 checkpoint 完整 | 成立（Gloo 已确认，NCCL 待复跑） | 六条停止条件各一项门禁；随机序列一路注入到资源耗尽后以 `no_executable_pp` 全体一致退出，故障前 checkpoint 仍可重载 |
+| TP/PP/DP 均真实执行（非仅元数据） | **待目标机复跑** | 计划序列层面已由 `test_acceptance.py::test_the_shipped_schedule_exercises_tp_pp_and_dp` 本机证明三维都变；但「真实执行」这半边依赖分布式门禁，本轮改动后尚未跑过 |
+| 参数 / AdamW / 迭代号 / 数据游标无丢失 | **待目标机复跑** | 恢复后各分片与 anchor 逐张量 `torch.equal`（含 `exp_avg`/`exp_avg_sq`/`step`）；cursor 逐轮等于 `iteration-1`，恢复后等于 checkpoint 的 `completed_steps`。**`grad` 不在其中**：安全点只出现在 AdamW step 之后、无跨安全点梯度累积，下一轮 `zero_grad` 后重算（计划文档「二·补」） |
+| 恢复前精确等于 checkpoint、恢复后与新配置参考一致 | **待目标机复跑** | 原则 A 双口径：前半段 `torch.equal`，后半段对「同起点 + 新拓扑 + 新 batch + 同种子」参考 `allclose`（NCCL 上梯度差已降到 ~1e-08–3e-08） |
+| 资源不足时全体一致退出、最后 checkpoint 完整 | **待目标机复跑** | 六条停止条件各一项门禁；随机序列一路注入到资源耗尽后以 `no_executable_pp` 全体一致退出，故障前 checkpoint 仍可重载 |
 | 代码中不存在 Detector / pᵢ / 速度分支 / standby / Algorithm 1 / 旧入口 / 前向兼容 | **成立，本机已执行** | 第 2 节，7 类禁用项命中数全为 0，且匹配式的检出力经变异核对 |
 
 ## 5. 待执行清单（8 卡目标机）

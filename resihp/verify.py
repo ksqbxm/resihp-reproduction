@@ -72,13 +72,17 @@ def adamw(params):
     )
 
 
-def batch(config, index, *, vocab_size, sequence_length, device=None):
-    """Iteration ``index``'s fixed token batch -- the same stream a run consumes."""
+def batch(config, index, *, vocab_size, sequence_length, device):
+    """Iteration ``index``'s fixed token batch -- the same stream a run consumes.
+
+    ``device`` is required throughout this module: a reference that silently ran
+    somewhere other than the run it is compared against is the one mistake these
+    helpers exist to prevent.
+    """
     stream = _token_stream(
         vocab_size, sequence_length, config.batch_size, config.iterations, config.seed
     )
-    tokens = stream[index]
-    return tokens if device is None else tokens.to(device)
+    return stream[index].to(device)
 
 
 def denominator(state):
@@ -116,11 +120,12 @@ def step_record(model, optimizer, tokens, *, vocab_size) -> dict:
     }
 
 
-def reference_steps(config, *, vocab_size, sequence_length, count, device=None) -> list[dict]:
+def reference_steps(config, *, vocab_size, sequence_length, count, device) -> list[dict]:
     """The no-failure reference: ``count`` iterations from the fixed initialization."""
     torch.manual_seed(config.seed)
-    model = ReferenceTransformer(config, vocab_size=vocab_size, sequence_length=sequence_length)
-    model = model.to(device) if device is not None else model
+    model = ReferenceTransformer(
+        config, vocab_size=vocab_size, sequence_length=sequence_length
+    ).to(device)
     model.train()
     optimizer = adamw(model.parameters())
     return [
@@ -135,7 +140,7 @@ def reference_steps(config, *, vocab_size, sequence_length, count, device=None) 
 
 
 def steps_from_anchor(
-    config, anchor, *, vocab_size, sequence_length, start, count, device=None
+    config, anchor, *, vocab_size, sequence_length, start, count, device
 ) -> list[dict]:
     """Principle A2's reference: ``count`` steps from the checkpoint anchor.
 
@@ -144,22 +149,22 @@ def steps_from_anchor(
     checkpoint's full logical parameters and AdamW moments, stepped on the batches the
     resumed run consumes from cursor ``start``.
     """
-    model = ReferenceTransformer(config, vocab_size=vocab_size, sequence_length=sequence_length)
-    model = model.to(device) if device is not None else model
+    model = ReferenceTransformer(
+        config, vocab_size=vocab_size, sequence_length=sequence_length
+    ).to(device)
     model.train()
     named = model.logical_state_dict()
     with torch.no_grad():
         for name, param in named.items():
-            source = anchor[name]["param"]
-            param.copy_(source if device is None else source.to(device))
+            param.copy_(anchor[name]["param"].to(device))
     optimizer = adamw(model.parameters())
     optimizer.state.clear()
     for name, fields in anchor.items():
         if "exp_avg" not in fields:
             continue
         optimizer.state[named[name]] = {
-            "exp_avg": fields["exp_avg"].clone() if device is None else fields["exp_avg"].to(device).clone(),
-            "exp_avg_sq": fields["exp_avg_sq"].clone() if device is None else fields["exp_avg_sq"].to(device).clone(),
+            "exp_avg": fields["exp_avg"].to(device).clone(),
+            "exp_avg_sq": fields["exp_avg_sq"].to(device).clone(),
             "step": fields["step"].clone(),  # AdamW keeps its step count on the CPU
         }
     return [
