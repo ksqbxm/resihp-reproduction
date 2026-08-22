@@ -30,7 +30,7 @@ import pytest
 
 from resihp.config import load_config
 from resihp.plan import build_plan
-from resihp.train import CHECKPOINT_PATH, SEQUENCE_LENGTH, VOCAB_SIZE
+from resihp.train import CHECKPOINT_PATH, SEQUENCE_LENGTH, VOCAB_SIZE, build_initial_plan
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,8 +38,9 @@ CONFIG_PATH = "configs/train.json"
 FAILURES_PATH = "configs/failures.json"
 #: Section 六: "GPU/NCCL 下 ≥2 次连续 fail-stop 并继续".
 REQUIRED_FAILSTOPS = 2
-#: Eight tiny iterations plus two reconfigurations; the same bound the other
-#: multi-process gates use, so a hang fails the suite instead of hanging it.
+#: A handful of tiny iterations plus one reconfiguration per shipped event; the same
+#: bound the other multi-process gates use, so a hang fails the suite instead of
+#: hanging it.
 RUN_TIMEOUT = 600.0
 
 #: What must not exist in the implementation, and the phrase that would betray it.
@@ -97,13 +98,18 @@ def test_no_banned_constructs():
 def _expected_plans(config, events):
     """Replay the failure schedule through ``build_plan`` alone.
 
-    This is the same call ``ControlPlane.reconfigure`` makes, with the entrypoint's
-    own run constants and no memory budget, so the digests it produces are exactly
-    the ones the launched job must publish. Comparing against it -- rather than
-    against a table copied into this file -- is what turns "the run finished" into
-    "the run executed the plan the pure planner defines".
+    This is the same call the entrypoint and ``ControlPlane.reconfigure`` make, with
+    the same run constants and the same (config-supplied) memory budget, so the digests
+    it produces are exactly the ones the launched job must publish. Comparing against it
+    -- rather than against a table copied into this file -- is what turns "the run
+    finished" into "the run executed the plan the pure planner defines".
     """
-    plan = build_plan(config, step=0, version=0)
+    plan = build_initial_plan(
+        config,
+        vocab_size=VOCAB_SIZE,
+        sequence_length=SEQUENCE_LENGTH,
+        memory_budget=config.memory_budget_bytes,
+    )
     plans = [plan]
     failed: tuple[int, ...] = ()
     for version, event in enumerate(events, start=1):
@@ -114,6 +120,7 @@ def _expected_plans(config, events):
             version=version,
             failed_ranks=failed,
             previous=plan,
+            memory_budget=config.memory_budget_bytes,
             vocab_size=VOCAB_SIZE,
             sequence_length=SEQUENCE_LENGTH,
         )
@@ -132,6 +139,74 @@ def _expected_trained(plans, events, config, rank):
         for iteration in range(1, config.iterations + 1)
         if rank in _plan_in_force(plans, events, iteration).active_ranks
     ]
+
+
+def _dimension_changes(plans):
+    """Which of TP, PP and DP actually change across a plan sequence.
+
+    Read from the published plans themselves: the TP membership of each stage, the
+    layer range of each stage, and which micro-batches each replica owns.
+    """
+    def tp(plan):
+        return {(s.replica_id, s.stage_id): (s.tp_degree, s.tp_members) for s in plan.stages}
+
+    def pp(plan):
+        return {(s.replica_id, s.stage_id): s.layer_range for s in plan.stages}
+
+    def dp(plan):
+        owned: dict[int, set[int]] = {}
+        for placement in plan.placements:
+            owned.setdefault(placement.replica_id, set()).add(placement.micro_batch)
+        return {replica: sorted(micro) for replica, micro in sorted(owned.items())}
+
+    return {
+        name: any(view(a) != view(b) for a, b in zip(plans, plans[1:]))
+        for name, view in (("tp", tp), ("pp", pp), ("dp", dp))
+    }
+
+
+def test_the_shipped_schedule_exercises_tp_pp_and_dp():
+    """The default acceptance case must move all three dimensions, not just TP.
+
+    Nothing here needs a GPU: the plan sequence the launched job publishes is a pure
+    function of the two shipped config files, so whether the demonstration is real can
+    be settled on any machine. Without this, a config whose repartition happens to hand
+    every stage back the layers it already had would still "pass" the NCCL gate while
+    demonstrating only a TP degree change.
+    """
+    loaded = load_config(ROOT / CONFIG_PATH, ROOT / FAILURES_PATH)
+    plans = _expected_plans(loaded.train, loaded.failures)
+
+    assert _dimension_changes(plans) == {"tp": True, "pp": True, "dp": True}
+
+    # And each is a *real* change, not a relabelling: a stage really drops a TP rank,
+    # a layer really changes owning stage, and a micro-batch really changes replica.
+    degrees = [sorted(stage.tp_degree for stage in plan.stages) for plan in plans]
+    assert min(min(row) for row in degrees) < max(max(row) for row in degrees)
+
+    def owner_of_layer(plan, replica, layer):
+        for stage in plan.stages:
+            if stage.replica_id == replica and stage.layer_range[0] <= layer < stage.layer_range[1]:
+                return stage.stage_id
+        return None
+
+    moved = {
+        (replica, layer)
+        for replica in range(loaded.train.dp)
+        for layer in range(loaded.train.num_layers)
+        if len({owner_of_layer(plan, replica, layer) for plan in plans} - {None}) > 1
+    }
+    assert moved, "no global layer ever changes owning stage"
+
+    def replica_of(plan, micro):
+        return next(p.replica_id for p in plan.placements if p.micro_batch == micro)
+
+    rerouted = {
+        micro
+        for micro in range(loaded.train.batch_size // loaded.train.micro_batch_size)
+        if len({replica_of(plan, micro) for plan in plans}) > 1
+    }
+    assert rerouted, "no micro-batch is ever rerouted to another replica"
 
 
 # --- launching the documented command ----------------------------------------------

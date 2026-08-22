@@ -162,7 +162,7 @@
 
 > 读 `CLAUDE.md`，再读计划文档「3.3」的重切与异构边界部分。输出约束检查清单。
 >
-> 任务：实现 degree/成员变化时的重切：① 从其他健康 DP replica 收集完整逻辑张量；② 某 shard 在所有健康 replica 均缺失时才从故障前 checkpoint 恢复；③ 按新 degree 重切 `param/grad/exp_avg/exp_avg_sq`；④ 分发新 TP 组；⑤ gather 后与 checkpoint 完整逻辑状态逐张量校验。
+> 任务：实现 degree/成员变化时的重切：① 从其他健康 DP replica 收集完整逻辑张量；② 某 shard 在所有健康 replica 均缺失时才从故障前 checkpoint 恢复；③ 按新 degree 重切 `param/exp_avg/exp_avg_sq`（`grad` 不是持久状态，见计划文档「二·补」）；④ 分发新 TP 组；⑤ gather 后与 checkpoint 完整逻辑状态逐张量校验。
 > 异构 TP 边界（只要功能正确，不做 P2P 性能优化）：前向 leader gather → 计算 → scatter/broadcast；反向对应 scatter-reduce，确保梯度不重复累加、不丢失。
 >
 > 测试：`TP2→TP1`；TP 成员替换的 gather/reshard 无丢失；**异构 TP 边界反向梯度与参考逐元素一致**；donor 恢复路径与 checkpoint fallback 路径分别单测。
@@ -173,7 +173,7 @@
 
 > 读 `CLAUDE.md`，再读计划文档「3.4」。输出约束检查清单。
 >
-> 任务：实现 `resihp/parallel/pp.py`：由计划生成 Forward/Backward/Send/Recv/WeightUpdate 原语，统一 **1F1B 功能调度**（内部保留 F/B/W 三类）。实现层迁移：迁移 layer 一并迁移 `param/grad/exp_avg/exp_avg_sq/step` 与元数据；接收 stage 的 TP degree 不同则**直接按目标布局重切，不留旧布局兼容**。
+> 任务：实现 `resihp/parallel/pp.py`：由计划生成 Forward/Backward/Send/Recv/WeightUpdate 原语，统一 **1F1B 功能调度**（内部保留 F/B/W 三类）。实现层迁移：迁移 layer 一并迁移 `param/exp_avg/exp_avg_sq/step` 与元数据（`grad` 不是持久状态，见计划文档「二·补」）；接收 stage 的 TP degree 不同则**直接按目标布局重切，不留旧布局兼容**。
 >
 > 测试：每层所有训练状态迁移前后逐张量一致；PP 两阶段前反向与一步更新与参考一致；TP 重切 + PP 移层组合后 shard/owner/通信边界一致。
 >

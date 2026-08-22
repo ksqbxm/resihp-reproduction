@@ -8,10 +8,10 @@ Two process groups exist at all times:
   the recovery gather -- never deadlock.
 * the **training groups** -- built from the current
   :class:`~resihp.plan.ExecutionPlan` (NCCL on GPU, Gloo on CPU): one TP subgroup per
-  active stage, which a stage's sharded execution rides on, plus one group over every
-  rank the plan places, which the assignment-driven pipeline transfers and the DP
-  gradient combine ride on. Both are torn down and rebuilt, in unison across every
-  process, on each fail-stop.
+  active stage, which a stage's sharded execution rides on; one two-rank subgroup per
+  pipeline hop the assignment creates, which the 1F1B boundary transfers ride on; and
+  one group over every rank the plan places, which the DP gradient combine rides on.
+  All are torn down and rebuilt, in unison across every process, on each fail-stop.
 
 A fail-stop is *simulated* by exclusion: the process is not killed, it is dropped
 from the training group and stops doing training work while remaining in the
@@ -33,7 +33,7 @@ caller can exit normally with the root cause in hand.
 from dataclasses import dataclass
 
 from .config import TrainConfig
-from .plan import ExecutionPlan, InfeasiblePlan, build_plan
+from .plan import ExecutionPlan, InfeasiblePlan, boundary_pairs, build_plan
 
 
 #: The six consistent-stop conditions of plan section 3.6. The first three are the
@@ -109,7 +109,7 @@ class ControlPlane:
         control_group,
         training_backend: str,
         *,
-        vocab_size: int = 1,
+        vocab_size: int | None = None,
         sequence_length: int = 1,
         memory_budget: int | None = None,
     ):
@@ -119,6 +119,7 @@ class ControlPlane:
         self.training_backend = training_backend
         self.tp_group = None
         self.executor_group = None
+        self.boundary_groups: dict[tuple[int, int], object] = {}
         # Run-wide planning inputs: identical on every rank, so every rank replans
         # to the same plan. Per-rank state is attached separately by ``attach_run``.
         self.vocab_size = vocab_size
@@ -135,7 +136,7 @@ class ControlPlane:
         cls,
         *,
         training_backend: str | None = None,
-        vocab_size: int = 1,
+        vocab_size: int | None = None,
         sequence_length: int = 1,
         memory_budget: int | None = None,
     ) -> "ControlPlane":
@@ -178,9 +179,14 @@ class ControlPlane:
 
         ``new_group`` is collective over the control group, so every process --
         members and non-members alike -- must call it for *every* group, in the same
-        order. Non-members get a sentinel handle rather than a real group, so only the
-        groups this rank actually belongs to are kept: it neither runs training
-        collectives elsewhere nor destroys a group it never joined.
+        plan-derived order. Non-members get a sentinel handle rather than a real group,
+        so only the groups this rank actually belongs to are kept: it neither runs
+        training collectives elsewhere nor destroys a group it never joined.
+
+        The per-hop groups hold exactly two ranks -- the two stage leaders a boundary
+        connects -- because the 1F1B steady state issues a fused ``batch_isend_irecv``
+        and NCCL runs batched P2P on the group's collective communicator, which every
+        member would then have to issue in the same order.
         """
         import torch.distributed as dist
 
@@ -189,18 +195,29 @@ class ControlPlane:
             group = dist.new_group(ranks=list(stage.tp_members), backend=self.training_backend)
             if self.rank in stage.tp_members:
                 tp_group = group
+        boundaries: dict[tuple[int, int], object] = {}
+        for pair in boundary_pairs(plan):
+            group = dist.new_group(ranks=list(pair), backend=self.training_backend)
+            if self.rank in pair:
+                boundaries[pair] = group
         executors = dist.new_group(ranks=list(plan.active_ranks), backend=self.training_backend)
         self.tp_group = tp_group
+        self.boundary_groups = boundaries
         self.executor_group = executors if self.is_training_rank(plan) else None
 
     def destroy_training_groups(self) -> None:
-        """Release the current training groups in unison (safe-point step 6a)."""
+        """Release the current training groups in unison (safe-point step 6a).
+
+        ``boundary_groups`` is built in sorted-pair order, so its two members release it
+        at the same point in the sequence.
+        """
         import torch.distributed as dist
 
-        for group in (self.tp_group, self.executor_group):
+        for group in (self.tp_group, *self.boundary_groups.values(), self.executor_group):
             if group is not None:
                 dist.destroy_process_group(group)
         self.tp_group = None
+        self.boundary_groups = {}
         self.executor_group = None
 
     def training_step(self):
@@ -258,6 +275,7 @@ class ControlPlane:
             control_group=self.control_group,
             tp_group=self.tp_group,
             executor_group=self.executor_group,
+            boundary_groups=self.boundary_groups,
             device=self.device,
         )
 

@@ -8,21 +8,24 @@ under the new layout. Plan section 3.3 fixes the single recovery path:
    (shards of the same logical layer live on peer DP replicas too);
 2. only when a shard index is missing on *every* healthy rank, fall back to the
    pre-failure checkpoint;
-3. re-chunk ``param``/``grad``/``exp_avg``/``exp_avg_sq`` by the new degree;
+3. re-chunk ``param``/``exp_avg``/``exp_avg_sq`` by the new degree;
 4. hand each new-group rank its new shard;
 5. verify the reconstructed full logical state matches the checkpoint tensor by
    tensor before anyone resumes.
+
+Gradients are absent throughout, and deliberately: a safe point is reached only after
+the current iteration's AdamW step, so the resident gradients are spent values the next
+iteration recomputes. They are not persistent state, so no checkpoint stores them and
+no reshard moves them (see :mod:`resihp.recovery`).
 
 Reconstruction is a pure function (:func:`reconstruct_full`) so the donor-recovery
 and checkpoint-fallback branches are unit-testable without any process group; the
 distributed driver (:func:`reshard_tp_state`) is a thin ``all_gather_object`` on top.
 
-The heterogeneous TP boundary (:func:`cross_tp_boundary`) bridges two PP stages
-whose TP degrees differ. The activation is replicated within each stage's TP group,
-so the boundary moves one authoritative copy forward and returns one authoritative
-gradient copy backward -- never the per-rank sum -- so the boundary gradient equals
-the single-process reference element for element (functional correctness only, no
-P2P performance optimization).
+The heterogeneous TP boundary itself lives in :class:`resihp.parallel.pp.PipelineRuntime`
+and nowhere else: an activation is replicated within each stage's TP group, so the
+boundary moves one authoritative copy between the two stages' leaders and the receiving
+group broadcasts it -- never a per-rank sum, which would double-count.
 """
 
 import torch
@@ -55,8 +58,9 @@ _LAYER_SHARD_DIMS = {
     "mlp.fc2.weight": 1,
 }
 
-#: Per-parameter tensors that are resharded like the parameter itself.
-_SHARDED_FIELDS = ("param", "grad", "exp_avg", "exp_avg_sq")
+#: Per-parameter tensors that are resharded like the parameter itself. No ``grad``:
+#: gradients are not persistent state and never cross a safe point.
+_SHARDED_FIELDS = ("param", "exp_avg", "exp_avg_sq")
 #: The AdamW step count is a replicated scalar, not a shard.
 _REPLICATED_FIELDS = ("step",)
 _ALL_FIELDS = _SHARDED_FIELDS + _REPLICATED_FIELDS
@@ -190,11 +194,10 @@ def reshard_tp_state(
     checkpoint=None,
     verify=True,
 ):
-    """Reshard param/grad/AdamW state across a TP degree or membership change.
+    """Reshard param and AdamW state across a TP degree or membership change.
 
     ``local_state`` is ``{name: {"shard_index": int, "shard_count": int, "param": T,
-    "grad": T, "exp_avg": T, "exp_avg_sq": T, "step": T}}`` for the shards this rank
-    holds; a rank holding nothing passes ``{}``. ``shard_count`` may be omitted when
+    "exp_avg": T, "exp_avg_sq": T, "step": T}}`` for the shards this rank holds; a rank holding nothing passes ``{}``. ``shard_count`` may be omitted when
     every contributor shares one degree, in which case ``old_size`` is assumed. Every
     rank in ``group`` (all healthy ranks, across DP replicas) joins the
     ``all_gather_object`` so each reconstructs the identical full logical state. ``new_rank`` is this rank's index in the new
@@ -216,11 +219,11 @@ def reshard_tp_state(
         ckpt_entry = None if checkpoint is None else checkpoint.get(name)
         for field in _ALL_FIELDS:
             by_count = merged.get(name, {}).get(field, {})
-            # Consult the checkpoint for this field only if it carries it: a real
-            # checkpoint has no ``grad``, so a peer-supplied grad must not KeyError.
+            # Consult the checkpoint for this field only if it carries it, so a run
+            # that holds a field the anchor does not is never a KeyError.
             ckpt_full = None if ckpt_entry is None else ckpt_entry.get(field)
             if not by_count and ckpt_full is None:
-                continue  # field absent from the run (e.g. no grad) and from checkpoint
+                continue  # field absent from the run and from the checkpoint
             dim = None if field in _REPLICATED_FIELDS else shard_dim
             full, source = _reconstruct(name, dim, old_size, by_count, ckpt_full)
             if verify and source == "peer" and ckpt_full is not None:
@@ -236,39 +239,3 @@ def reshard_tp_state(
             for field, full in rebuilt.items()
         }
     return new_local
-
-
-class _ReplicatedBridge(torch.autograd.Function):
-    """Move a replicated activation across a TP-degree (PP stage) boundary.
-
-    Both stages hold the full activation replicated within their own TP group, so
-    forward broadcasts the authoritative copy from ``fwd_src`` (an upstream rank) to
-    every rank in ``group`` -- the downstream group thereby receives it. Backward
-    broadcasts the authoritative gradient from ``bwd_src`` (a downstream rank) back
-    to every rank, so each upstream rank gets exactly one copy of the reference
-    gradient: the per-rank duplicates a naive all-reduce would sum are never added,
-    and nothing is dropped.
-    """
-
-    @staticmethod
-    def forward(ctx, x, group, fwd_src, bwd_src):
-        ctx.group = group
-        ctx.bwd_src = bwd_src
-        y = x.contiguous().clone()
-        dist.broadcast(y, src=fwd_src, group=group)
-        return y
-
-    @staticmethod
-    def backward(ctx, grad):
-        g = grad.contiguous().clone()
-        dist.broadcast(g, src=ctx.bwd_src, group=ctx.group)
-        return g, None, None, None
-
-
-def cross_tp_boundary(x, *, upstream_leader, downstream_leader, group=None):
-    """Bridge a replicated activation from the upstream TP group to the downstream one.
-
-    ``upstream_leader``/``downstream_leader`` are the authoritative global ranks for
-    the forward value and the backward gradient respectively.
-    """
-    return _ReplicatedBridge.apply(x, group, upstream_leader, downstream_leader)

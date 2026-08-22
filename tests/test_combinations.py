@@ -9,12 +9,15 @@ recognizes. No feature is added; these are tests over the T10-T14 code as it sta
 Each gate is the *seam* between two components, chosen so it is not already locked
 elsewhere:
 
-* ``tp_pp`` -- TP2 inside PP2 through the 1F1B :class:`~resihp.parallel.pp.PipelineRuntime`.
+* ``tp_pp`` -- TP2 inside PP2 through the 1F1B :class:`~resihp.parallel.pp.PipelineRuntime`,
+  the project's one runtime: the control plane drives this same class.
   T10 runs TP with a single stage and T12 runs the pipeline at TP degree 1; nothing
   ran real TP all-reduces *inside* a 1F1B schedule. The boundary activation is
   replicated within a TP group, so the pipeline hop is per TP index: two columns,
   ``(0,2)`` and ``(1,3)``, which is how TP and PP compose.
-* ``tp_dp`` -- TP2 x DP2 through :class:`~resihp.parallel.dp.DataParallelRuntime`.
+* ``tp_dp`` -- TP2 x DP2 through the same :class:`~resihp.parallel.pp.PipelineRuntime`,
+  here as single-stage replicas: the DP dimension enters as which micro-batches a rank
+  runs and as the cross-replica gradient combine.
   T13 exercises :func:`~resihp.parallel.dp.dp_combine_gradients` on hand-built shards;
   here the whole runtime drives it, so the combine sees shards produced by its own
   sharded forward/backward.
@@ -68,26 +71,23 @@ from resihp.checkpoint import load_anchor
 from resihp.config import TrainConfig
 from resihp.control import ControlPlane
 from resihp.model import ReferenceTransformer
-from resihp.parallel.reshard import local_slice, shard_dims, shard_logical_state
+from resihp.parallel.reshard import shard_dims, shard_logical_state
 from resihp.parallel.tp import TensorParallelStage
 from resihp.plan import build_plan
 from resihp.planner.dp import DPAssignment, DPPlacement
-from resihp.recovery import initial_run, stage_layout, stage_of
-from resihp.reference import (
-    ADAM_BETAS,
-    ADAM_EPS,
-    LEARNING_RATE,
-    WEIGHT_DECAY,
-    _OPTIM_STATES,
-    _token_stream,
-)
+from resihp.plan import boundary_pairs
+from resihp.planner.pp import balanced_layers, peak_in_flight
+from resihp.recovery import dp_assignment, initial_run, stage_of
+from resihp import verify
 
 
 VOCAB = 32
 SEQLEN = 8
 #: Reassociation band: real TP all-reduce plus micro-batch splitting (T10/T12/T13).
-RTOL = 1e-4
-ATOL = 1e-5
+#: Taken from ``resihp.verify`` so this gate cannot hold a different contract from the
+#: end-to-end and fault-sequence gates.
+RTOL = verify.RTOL
+ATOL = verify.ATOL
 
 _BASE = dict(
     model_dim=16,
@@ -138,17 +138,9 @@ def _free_port() -> int:
 
 def _batch(config, index, device):
     """Iteration ``index``'s fixed token batch -- the same stream the run consumes."""
-    stream = _token_stream(VOCAB, SEQLEN, config.batch_size, config.iterations, config.seed)
-    return stream[index].to(device)
-
-
-def _adamw(params):
-    return torch.optim.AdamW(
-        params, lr=LEARNING_RATE, betas=ADAM_BETAS, eps=ADAM_EPS, weight_decay=WEIGHT_DECAY
+    return verify.batch(
+        config, index, vocab_size=VOCAB, sequence_length=SEQLEN, device=device
     )
-
-
-# --- reference anchors ------------------------------------------------------------
 
 
 def _source(config):
@@ -158,117 +150,41 @@ def _source(config):
     return {name: param.detach().clone() for name, param in model.logical_state_dict().items()}
 
 
-def _step_record(model, optimizer, tokens):
-    """One full-batch reference iteration: its gradients, new weights, new moments."""
-    logits = model(tokens)
-    loss = F.cross_entropy(logits[:, :-1].reshape(-1, VOCAB), tokens[:, 1:].reshape(-1))
-    optimizer.zero_grad()
-    loss.backward()
-    named = model.logical_state_dict()
-    grads = {name: param.grad.detach().clone() for name, param in named.items()}
-    optimizer.step()
-    return {
-        "loss": float(loss.detach()),
-        "grads": grads,
-        "params": {name: param.detach().clone() for name, param in named.items()},
-        "moments": {
-            name: {key: optimizer.state[param][key].detach().clone() for key in _OPTIM_STATES}
-            for name, param in named.items()
-            if param in optimizer.state
-        },
-    }
-
-
 def _reference_steps(config, device, steps):
     """The single-process reference over ``steps`` iterations of the fixed stream."""
-    torch.manual_seed(config.seed)
-    model = ReferenceTransformer(config, vocab_size=VOCAB, sequence_length=SEQLEN).to(device)
-    model.train()
-    optimizer = _adamw(model.parameters())
-    return [_step_record(model, optimizer, _batch(config, index, device)) for index in range(steps)]
+    return verify.reference_steps(
+        config, vocab_size=VOCAB, sequence_length=SEQLEN, count=steps, device=device
+    )
 
 
-def _reference_from_anchor(config, anchor, tokens, device):
+def _reference_from_anchor(config, anchor, start, device):
     """Principle A's after-resume reference: one step from the checkpoint anchor.
 
     The baseline is *not* an uninterrupted run from iteration 0 but "the same
     checkpoint + the new topology + the new configuration's actual batch + the same
-    seed" -- which is exactly this: the checkpoint's full logical parameters and AdamW
-    moments, stepped once on the batch the resumed run consumes.
+    seed" -- which is what :func:`resihp.verify.steps_from_anchor` builds.
     """
-    model = ReferenceTransformer(config, vocab_size=VOCAB, sequence_length=SEQLEN).to(device)
-    model.train()
-    named = model.logical_state_dict()
-    with torch.no_grad():
-        for name, param in named.items():
-            param.copy_(anchor[name]["param"].to(device))
-    optimizer = _adamw(model.parameters())
-    optimizer.state.clear()
-    for name, fields in anchor.items():
-        if "exp_avg" not in fields:
-            continue
-        optimizer.state[named[name]] = {
-            "exp_avg": fields["exp_avg"].to(device).clone(),
-            "exp_avg_sq": fields["exp_avg_sq"].to(device).clone(),
-            "step": fields["step"].clone(),  # AdamW keeps its step count on the CPU
-        }
-    return _step_record(model, optimizer, tokens)
+    return verify.steps_from_anchor(
+        config,
+        anchor,
+        vocab_size=VOCAB,
+        sequence_length=SEQLEN,
+        start=start,
+        count=1,
+        device=device,
+    )[0]
 
 
 # --- comparisons ------------------------------------------------------------------
 
-
-def _compare_shards(stage, record):
-    """Compare this rank's shards to the reference, sliced by its own TP layout."""
-    grad_close = step_close = True
-    max_grad_diff = max_param_diff = 0.0
-    for name, (param, dim) in stage.local_shards().items():
-        want_param = local_slice(record["params"][name], dim, stage.tp_rank, stage.tp_size)
-        step_close &= torch.allclose(param.detach(), want_param, rtol=RTOL, atol=ATOL)
-        max_param_diff = max(max_param_diff, (param.detach() - want_param).abs().max().item())
-        if param.grad is None:
-            grad_close = False  # every owned parameter must have taken a gradient
-            continue
-        want_grad = local_slice(record["grads"][name], dim, stage.tp_rank, stage.tp_size)
-        grad_close &= torch.allclose(param.grad, want_grad, rtol=RTOL, atol=ATOL)
-        max_grad_diff = max(max_grad_diff, (param.grad - want_grad).abs().max().item())
-    return {
-        "grad_close": bool(grad_close),
-        "step_close": bool(step_close),
-        "max_grad_diff": max_grad_diff,
-        "max_param_diff": max_param_diff,
-        "owned": sorted(stage.logical_state_dict()),
-        "tp_size": stage.tp_size,
-        "reference_loss": record["loss"],
-    }
+#: Principle A lives in one place for the whole project (``resihp.verify``); these
+#: names are only local spellings of it, so this gate and the end-to-end / fault-
+#: sequence gates cannot drift into three slightly different contracts.
+_compare_shards = verify.compare_shards
 
 
 def _matches_anchor(run, plan, rank, checkpoint):
-    """Principle A's before-resume half: exactly the checkpoint, re-sharded by the plan."""
-    stage = stage_of(plan, rank)
-    if stage is None:
-        return run is None  # a dropped rank must hold no state at all
-    layout = stage_layout(plan, stage)
-    shards = run.stage.local_shards()
-    if set(shards) != set(layout):
-        return False  # the stage holds its plan's names, no more and no fewer
-    anchor, _completed = load_anchor(checkpoint)
-    moments = run.runtime.optimizer.state
-    index = stage.tp_members.index(rank)
-    ok = True
-    for name, dim in layout.items():
-        param = shards[name][0]
-        ok &= torch.equal(
-            param.detach().cpu(), local_slice(anchor[name]["param"], dim, index, stage.tp_degree)
-        )
-        held = moments[param]
-        for field in ("exp_avg", "exp_avg_sq"):
-            ok &= torch.equal(
-                held[field].detach().cpu(),
-                local_slice(anchor[name][field], dim, index, stage.tp_degree),
-            )
-        ok &= torch.equal(held["step"].detach().cpu(), anchor[name]["step"])
-    return bool(ok)
+    return verify.matches_checkpoint(run, plan, rank, checkpoint)
 
 
 # --- distributed building blocks --------------------------------------------------
@@ -340,6 +256,7 @@ def _attach(control, plan, rank, device, checkpoint):
         sequence_length=SEQLEN,
         tp_group=control.tp_group,
         executor_group=control.executor_group,
+        boundary_groups=control.boundary_groups,
         device=device,
     )
     control.attach_run(run, checkpoint_path=checkpoint, device=device)
@@ -360,15 +277,22 @@ def _micro_batch_map(plan):
 
 
 def _run_tp_pp(rank, world_size, device, backend, result_dir):
-    """TP2 inside PP2: two pipeline columns, each carrying the replicated activation."""
-    from resihp.parallel.pp import PipelineRuntime, balanced_layers
+    """TP2 inside PP2: a heterogeneous-capable boundary between two TP2 stages.
+
+    The activation is replicated inside each stage's TP group, so the boundary moves one
+    authoritative copy between the two stage leaders (ranks 0 and 2) and each receiving
+    group broadcasts it -- the same single implementation a TP1 -> TP2 boundary uses.
+    """
+    from resihp.parallel.pp import PipelineRuntime
 
     config = _config("tp_pp")
     stage_id, tp_index = rank // config.tp, rank % config.tp
     mine = _groups(
-        [("tp0", (0, 1)), ("tp1", (2, 3)), ("pp0", (0, 2)), ("pp1", (1, 3))], backend, rank
+        [("tp0", (0, 1)), ("tp1", (2, 3)), ("hop", (0, 2)), ("exec", tuple(range(world_size)))],
+        backend,
+        rank,
     )
-    tp_group, pp_group = mine[f"tp{stage_id}"], mine[f"pp{tp_index}"]
+    tp_group, executors = mine[f"tp{stage_id}"], mine["exec"]
 
     reference = _reference_steps(config, device, 1)[0]
     stage = _stage(
@@ -382,11 +306,18 @@ def _run_tp_pp(rank, world_size, device, backend, result_dir):
         tp_size=config.tp,
         device=device,
     )
+    # Every micro-batch runs both stages; each stage's executors are its whole TP group.
+    assignment = _assignment(
+        [(micro, sid, 0, (0, 1) if sid == 0 else (2, 3)) for micro in range(MICRO) for sid in (0, 1)]
+    )
     runtime = PipelineRuntime(
         stage,
-        stage_ranks=(tp_index, tp_index + config.tp),
-        num_micro_batches=MICRO,
-        group=pp_group,
+        replica_id=0,
+        assignment=assignment,
+        # Only the two leaders join the hop group; the others reach the activation
+        # through their stage's TP broadcast and hold no hop of their own.
+        boundary_groups={(0, 2): mine["hop"]} if "hop" in mine else {},
+        group=executors,
     )
     loss = runtime.train_step(_batch(config, 0, device))
 
@@ -395,6 +326,7 @@ def _run_tp_pp(rank, world_size, device, backend, result_dir):
         loss=loss,
         schedule=list(runtime.schedule),
         pipeline_index=stage_id,
+        activation_peak=runtime.activation_log.peak,
         all_names=sorted(reference["params"]),
         backend=dist.get_backend(tp_group),
         is_cuda=bool(next(stage.parameters()).is_cuda),
@@ -404,7 +336,7 @@ def _run_tp_pp(rank, world_size, device, backend, result_dir):
 
 def _run_tp_dp(rank, world_size, device, backend, result_dir):
     """TP2 x DP2 through the assignment-driven runtime: sharded execution, then combine."""
-    from resihp.parallel.dp import DataParallelRuntime
+    from resihp.parallel.pp import PipelineRuntime
 
     config = _config("tp_dp")
     replica, tp_index = rank // config.tp, rank % config.tp
@@ -429,7 +361,10 @@ def _run_tp_dp(rank, world_size, device, backend, result_dir):
     assignment = _assignment(
         [(micro, 0, micro // 2, (0, 1) if micro < 2 else (2, 3)) for micro in range(MICRO)]
     )
-    runtime = DataParallelRuntime(stage, replica_id=replica, assignment=assignment, group=executors)
+    # Single-stage replicas: no pipeline hop exists, so no boundary group is needed.
+    runtime = PipelineRuntime(
+        stage, replica_id=replica, assignment=assignment, boundary_groups={}, group=executors
+    )
     loss = runtime.train_step(_batch(config, 0, device))
 
     result = _compare_shards(stage, reference)
@@ -447,18 +382,18 @@ def _run_tp_dp(rank, world_size, device, backend, result_dir):
 
 def _run_pp_dp(rank, world_size, device, backend, result_dir):
     """PP2 x DP2 with an imbalanced 3-vs-1 split across two pipelined replicas."""
-    from resihp.parallel.dp import DataParallelRuntime
-    from resihp.parallel.pp import balanced_layers
+    from resihp.parallel.pp import PipelineRuntime
 
     config = _config("pp_dp")
     replica, stage_id = rank // config.pp, rank % config.pp
     mine = _groups(
         [(f"solo{peer}", (peer,)) for peer in range(world_size)]
-        + [("exec", tuple(range(world_size)))],
+        + [("hop0", (0, 1)), ("hop1", (2, 3)), ("exec", tuple(range(world_size)))],
         backend,
         rank,
     )
     tp_group, executors = mine[f"solo{rank}"], mine["exec"]
+    hop = (0, 1) if replica == 0 else (2, 3)
 
     reference = _reference_steps(config, device, 1)[0]
     stage = _stage(
@@ -475,8 +410,12 @@ def _run_pp_dp(rank, world_size, device, backend, result_dir):
     # Replica 0 (ranks 0,1) takes three micro-batches, replica 1 (ranks 2,3) takes one.
     spec = [(micro, index, 0, (index,)) for micro in range(3) for index in (0, 1)]
     spec += [(3, index, 1, (2 + index,)) for index in (0, 1)]
-    runtime = DataParallelRuntime(
-        stage, replica_id=replica, assignment=_assignment(spec), group=executors
+    runtime = PipelineRuntime(
+        stage,
+        replica_id=replica,
+        assignment=_assignment(spec),
+        boundary_groups={hop: mine[f"hop{replica}"]},
+        group=executors,
     )
     loss = runtime.train_step(_batch(config, 0, device))
 
@@ -557,7 +496,7 @@ def _run_scheduler_migration(rank, world_size, device, backend, result_dir):
         "is_cuda": is_cuda,
     }
 
-    reference = _reference_from_anchor(config, anchor, _batch(config, completed, device), device)
+    reference = _reference_from_anchor(config, anchor, completed, device)
     result["loss"] = control.training_step()  # iteration 2 on the new topology
     if control.training_run is not None:
         result.update(_compare_shards(control.training_run.stage, reference))
@@ -624,7 +563,7 @@ def _run_migration_checkpoint(rank, world_size, device, backend, result_dir):
         "is_cuda": is_cuda,
     }
 
-    resumed = _reference_from_anchor(config, anchor, _batch(config, completed, device), device)
+    resumed = _reference_from_anchor(config, anchor, completed, device)
     result["loss"] = control.training_step()  # iteration 2, from the migrated state
     if control.training_run is not None:
         result.update(_compare_shards(control.training_run.stage, resumed))
@@ -658,14 +597,18 @@ def _run_dynamic_groups_pipeline(rank, world_size, device, backend, result_dir):
     layer_ids = tuple(range(*mine.layer_range))
     is_first = mine.stage_id == ordered[0].stage_id
     is_last = mine.stage_id == ordered[-1].stage_id
+    assignment = dp_assignment(plan)
 
     reference = _reference_steps(config, device, 2)
 
     def pipeline(stage):
+        # The boundary groups come from the *current* rebuild, which is the point of
+        # this gate: the runtime must ride communicators created after the run began.
         return PipelineRuntime(
             stage,
-            stage_ranks=stage_ranks,
-            num_micro_batches=MICRO,
+            replica_id=mine.replica_id,
+            assignment=assignment,
+            boundary_groups=control.boundary_groups,
             group=control.executor_group,
         )
 
@@ -767,6 +710,11 @@ def _assert_tp_pp(results, label):
     for result in results:
         assert result["tp_size"] == 2, result  # real TP inside the pipeline
         assert result["schedule"] == EXPECTED_SCHEDULE[result["pipeline_index"]], result
+        # 1F1B holds one activation per stage still downstream, not one per micro-batch.
+        assert result["activation_peak"] == peak_in_flight(
+            MICRO, stage_index=result["pipeline_index"], num_stages=2
+        ), result
+    assert [result["activation_peak"] for result in results] == [2, 2, 1, 1], results
     # TP peers of a stage own the same names; the two stages tile the model.
     assert results[1]["owned"] == results[0]["owned"], results
     assert results[3]["owned"] == results[2]["owned"], results
@@ -782,7 +730,12 @@ def _assert_tp_dp(results, label):
     for result in results:
         assert result["tp_size"] == 2, result
         assert result["activation_drained"], result
-        assert result["activation_peak"] == len(result["processed"]), result
+        # One stage per replica: each forward is retired by the next backward, so the
+        # peak is one activation regardless of how many micro-batches the rank runs.
+        assert result["activation_peak"] == peak_in_flight(
+            len(result["processed"]), stage_index=0, num_stages=1
+        ), result
+        assert result["activation_peak"] == 1, result
     assert [result["replica"] for result in results] == [0, 0, 1, 1], results
     # Each replica ran its own two micro-batches; together, every one exactly once.
     micro = {result["replica"]: sorted(pair[0] for pair in result["processed"]) for result in results}
@@ -794,9 +747,14 @@ def _assert_pp_dp(results, label):
     _assert_numerics(results, label)
     # The imbalanced split: replica 0 runs three micro-batches, replica 1 runs one.
     assert [len(result["processed"]) for result in results] == [3, 3, 1, 1], results
-    for result in results:
+    for index, result in enumerate(results):
         assert result["activation_drained"], result
-        assert result["activation_peak"] == len(result["processed"]), result
+        # 1F1B: stage 0 warms up one extra forward, stage 1 retires immediately. Under
+        # the old GPipe order replica 0's stage 0 would have held all three at once.
+        assert result["activation_peak"] == peak_in_flight(
+            len(result["processed"]), stage_index=index % 2, num_stages=2
+        ), result
+    assert [result["activation_peak"] for result in results] == [2, 1, 1, 1], results
     for indices in ((0, 1), (2, 3)):  # each replica really is a two-stage pipeline
         _assert_tiles_the_model(results, indices, results[0]["all_names"])
     # Every (micro, stage) executed exactly once across all ranks.

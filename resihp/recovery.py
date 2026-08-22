@@ -5,32 +5,45 @@ Plan section 3.6 fixes exactly one recovery chain and forbids a second:
     fail-stop -> read checkpoint / collect from healthy replicas -> restore the full
     logical state -> replan -> rebuild groups -> continue.
 
-This module is **orchestration only**. Every mechanism it drives already exists and
-is owned elsewhere; T14 wires them to the new :class:`~resihp.plan.ExecutionPlan`:
+This module is **orchestration only**, and it orchestrates what the plan already
+decided. The planner emits :class:`~resihp.plan.StateRoute` entries -- which state
+group each rank must acquire, from which donor, under which source TP layout, into
+which target layout -- and :func:`recover` executes them. There is no second routing
+policy here: nothing recomputes donors, targets, or layouts from the old and new
+topologies. What remains are execution-time safety checks the plan cannot make
+(a donor set that turns out to be incomplete falls back to the checkpoint; a stage
+whose state the routes fail to cover is a structured error, not a KeyError).
+
+Every mechanism it drives already exists and is owned elsewhere:
 
 * TP members and degree -> T11 :func:`~resihp.parallel.reshard.reshard_tp_state`
   (collect from healthy peers, fall back to the checkpoint, re-chunk);
-* stage layer ownership and its changes -> T12
-  :class:`~resihp.parallel.pp.LayerPlacement` /
-  :func:`~resihp.parallel.pp.reshard_layout`, read from the old and new plans;
-* micro-batch/stage executors -> T13 :class:`~resihp.parallel.dp.DataParallelRuntime`,
-  driven by the plan's own :class:`~resihp.planner.dp.DPAssignment`;
-* the stage itself -> T10 :class:`~resihp.parallel.tp.TensorParallelStage`, cut to
-  the plan's ``layer_range`` and sharded over the plan's TP group.
+* micro-batch/stage executors and the 1F1B schedule -> T12/T13
+  :class:`~resihp.parallel.pp.PipelineRuntime`, driven by the plan's own
+  :class:`~resihp.planner.dp.DPAssignment`;
+* the stage itself -> T10 :class:`~resihp.parallel.tp.TensorParallelStage`, cut to the
+  plan's ``layer_range`` and sharded over the plan's TP group.
 
 Nothing here re-implements TP, PP, or DP, and nothing infers a layout from an older
 one: PP ownership, TP degree, TP membership, and executors are read from the current
 plan alone. The intermediate recovery form is the full logical tensor -- the
 checkpoint's own form -- but what is finally instantiated is one stage's layer subset
 at one rank's TP shard, never the whole model per rank.
+
+**What is recovered.** ``param``, ``exp_avg``, ``exp_avg_sq``, ``step``, plus the
+iteration count / data cursor and the RNG state the checkpoint carries. Gradients are
+not persistent state: a safe point is reached only after the current iteration has
+completed *and* its AdamW step has been applied, and the next iteration calls
+``zero_grad`` before recomputing them, so the gradients resident at a safe point have
+no remaining semantic value. They are in no checkpoint, in no route, and in no
+transfer.
 """
 
 import torch
 
 from .checkpoint import load_anchor, save_checkpoint
-from .parallel.dp import DataParallelRuntime
-from .parallel.pp import LayerPlacement, reshard_layout
-from .parallel.reshard import reshard_tp_state, shard_dims, shard_logical_state
+from .parallel.pp import PipelineRuntime
+from .parallel.reshard import ReshardError, reshard_tp_state, shard_dims, shard_logical_state
 from .parallel.tp import TensorParallelStage
 from .model import ReferenceTransformer
 from .planner.dp import DPAssignment
@@ -39,9 +52,12 @@ from .reference import ReferenceRun, _digest, _OPTIM_STATES, _token_stream
 
 #: Resharding to degree 1 *is* reconstructing the full logical tensor.
 _FULL_DEGREE = 1
-#: Logical tensors that belong to a replica's first / last executable stage (plan 3.4).
-_EMBEDDING_NAMES = ("token_embedding.weight", "position_embedding.weight")
-_HEAD_NAMES = ("final_norm.weight", "final_norm.bias", "lm_head.weight")
+#: Logical tensors that belong to a replica's first / last executable stage (plan 3.4),
+#: keyed by the boundary group name the plan's routes use.
+_BOUNDARY_NAMES = {
+    "embedding": ("token_embedding.weight", "position_embedding.weight"),
+    "head": ("final_norm.weight", "final_norm.bias", "lm_head.weight"),
+}
 
 
 # --- reading the plan (the only authority on layout) ------------------------------
@@ -73,88 +89,48 @@ def stage_layout(plan, stage) -> dict[str, int | None]:
     names = [name for name in dims if name.startswith("layers.")]
     ends = _replica_stages(plan, stage.replica_id)
     if stage.stage_id == ends[0].stage_id:
-        names += list(_EMBEDDING_NAMES)
+        names += list(_BOUNDARY_NAMES["embedding"])
     if stage.stage_id == ends[-1].stage_id:
-        names += list(_HEAD_NAMES)
+        names += list(_BOUNDARY_NAMES["head"])
     return {name: dims[name] for name in names}
 
 
-def _owner_degree(plan, replica) -> dict[int, tuple[int, int]]:
+def route_names(route) -> dict[str, int | None]:
+    """The logical tensors one :class:`~resihp.plan.StateRoute` carries, with shard dims.
+
+    A route names a state group -- one global layer, or one boundary group -- and this
+    expands it into the logical names that group is made of. The plan stays free of the
+    tensor layout (it is torch-free by construction); the layout stays in
+    :func:`resihp.parallel.reshard.shard_dims`, its one definition.
+    """
+    if route.boundary:
+        dims = shard_dims(())
+        return {name: dims[name] for name in _BOUNDARY_NAMES[route.boundary]}
+    prefix = f"layers.{route.layer}."
     return {
-        layer: (stage.stage_id, stage.tp_degree)
-        for stage in _replica_stages(plan, replica)
-        for layer in range(*stage.layer_range)
+        name: dim for name, dim in shard_dims((route.layer,)).items() if name.startswith(prefix)
     }
 
 
-def layer_placements(previous, plan, replica) -> tuple[LayerPlacement, ...]:
-    """Every layer's old and new ``(owner stage, TP degree)`` for one replica.
+def routes_for(plan, rank) -> tuple:
+    """The plan's state routes that name ``rank`` among their target ranks."""
+    return tuple(route for route in plan.state_routes if rank in route.target_ranks)
 
-    T12's migration view of the repartition, *read from the two plans* rather than
-    recomputed, so the ExecutionPlan stays the only authority on who owns what.
+
+def acquire_layout(plan, rank) -> dict[str, int | None]:
+    """Everything ``rank`` must fetch under this plan, straight from its routes.
+
+    Empty when the plan routed nothing to this rank, which is exactly the case where
+    everything the stage owns it already holds in the shape the plan wants.
     """
-    old = _owner_degree(previous, replica)
-    new = _owner_degree(plan, replica)
-    return tuple(
-        LayerPlacement(
-            layer=layer,
-            old_owner=old[layer][0],
-            new_owner=new[layer][0],
-            old_degree=old[layer][1],
-            new_degree=new[layer][1],
-        )
-        for layer in sorted(new)
-    )
-
-
-def _keeps_its_shard(previous, plan, stage, rank) -> bool:
-    """True when ``rank`` already holds this stage's state in the shape the plan wants.
-
-    Only then does "not in the acquire set" mean "already correct". A rank the previous
-    plan placed on another stage, at another degree, or at another index within the
-    group holds nothing reusable -- and a rank it left idle holds nothing at all. The
-    planner takes the largest power-of-two prefix of a stage's survivors, so a later
-    failure can shift indices or draw in a rank that sat out the previous plan.
-    """
-    before = stage_of(previous, rank)
-    return (
-        before is not None
-        and before.stage_id == stage.stage_id
-        and before.tp_degree == stage.tp_degree
-        and before.tp_members.index(rank) == stage.tp_members.index(rank)
-    )
-
-
-def acquire_layout(previous, plan, stage, rank) -> dict[str, int | None]:
-    """Names ``rank`` must fetch state for -- empty when nothing about its seat changed.
-
-    A rank that did not keep its seat fetches the whole stage: nothing it holds is in
-    the right shape. Otherwise the layers come from T12's
-    :func:`~resihp.parallel.pp.reshard_layout` -- a layer needs work when it changed
-    stage or changed TP degree -- and the boundary tensors are added when this stage
-    has *become* the replica's first or last executable stage, which ``reshard_layout``
-    cannot express because it is per-layer by construction. That boundary owner move is
-    the case T12 left to this task. Everything else the stage owns, this rank already
-    holds in the right shape, so it is not moved at all.
-    """
-    if not _keeps_its_shard(previous, plan, stage, rank):
-        return dict(stage_layout(plan, stage))
-
-    placements = layer_placements(previous, plan, stage.replica_id)
-    layout = dict(reshard_layout(placements, new_owner=stage.stage_id))
-    dims = shard_dims(())
-    for names, end in ((_EMBEDDING_NAMES, 0), (_HEAD_NAMES, -1)):
-        # A degree change would already have failed ``_keeps_its_shard``, so the only
-        # boundary move left to catch is the owner stage itself changing.
-        owner_before = _replica_stages(previous, stage.replica_id)[end].stage_id
-        owner_now = _replica_stages(plan, stage.replica_id)[end].stage_id
-        if owner_now == stage.stage_id and owner_before != owner_now:
-            layout.update({name: dims[name] for name in names})
+    layout: dict[str, int | None] = {}
+    for route in routes_for(plan, rank):
+        layout.update(route_names(route))
     return layout
 
 
 def dp_assignment(plan) -> DPAssignment:
-    """The plan's micro-batch/stage executor assignment, as T13's runtime takes it."""
+    """The plan's micro-batch/stage executor assignment, as the runtime takes it."""
     return DPAssignment(
         step=plan.step, failure_signature=plan.failed_ranks, placements=plan.placements
     )
@@ -169,6 +145,19 @@ def _model_layout(config) -> dict[str, int | None]:
     return shard_dims(range(config.num_layers))
 
 
+def _donor_degrees(plan, fallback: int) -> tuple[int, ...]:
+    """Source layouts the plan's routes read under, in one order every rank shares.
+
+    Each becomes one collective acquisition pass. The sequence is derived from the plan
+    alone, so every rank makes the same number of passes in the same order however few
+    routes target it -- a rank with nothing to acquire still joins, because its own
+    shards are what the other ranks are collecting. ``donor_degree`` is 0 for a
+    checkpoint restore, which has no source layout; it rides ``fallback``, where the
+    absent peer shards make the checkpoint the only remaining source anyway.
+    """
+    return tuple(sorted({route.donor_degree or fallback for route in plan.state_routes}))
+
+
 # --- this rank's state under one plan ---------------------------------------------
 
 
@@ -176,9 +165,10 @@ class PlannedRun:
     """One rank's training state under one ExecutionPlan: its stage and its runtime.
 
     The stage owns the plan's ``layer_range`` sharded over the plan's TP group; the
-    iteration is executed by T13's assignment-driven runtime and the optimizer is
-    that runtime's. ``cursor`` is the number of completed iterations, which is also
-    the data cursor into the fixed token stream (plan 3.1).
+    iteration is executed by the 1F1B :class:`~resihp.parallel.pp.PipelineRuntime` over
+    the plan's assignment, and the optimizer is that runtime's. ``cursor`` is the number
+    of completed iterations, which is also the data cursor into the fixed token stream
+    (plan 3.1).
     """
 
     def __init__(
@@ -192,6 +182,7 @@ class PlannedRun:
         moments,
         tp_group,
         executor_group,
+        boundary_groups,
         device,
         cursor,
     ):
@@ -212,10 +203,11 @@ class PlannedRun:
             group=tp_group,
         ).to(self.device)
         self.stage.train()
-        self.runtime = DataParallelRuntime(
+        self.runtime = PipelineRuntime(
             self.stage,
             replica_id=stage_plan.replica_id,
             assignment=dp_assignment(plan),
+            boundary_groups=boundary_groups,
             group=executor_group,
         )
         self._install_moments(moments)
@@ -248,10 +240,8 @@ class PlannedRun:
     def local_state(self) -> dict:
         """This rank's shards and AdamW moments, tagged with the degree they use.
 
-        Gradients are deliberately absent. A safe point is reached only after the
-        current iteration has completed and its AdamW step has been applied, so
-        ``param.grad`` holds spent values that the next iteration recomputes; the
-        checkpoint stores none for the same reason.
+        Gradients are deliberately absent: they are not persistent state (see the module
+        docstring), so nothing carries them across a safe point.
         """
         moments = self.runtime.optimizer.state
         state = {}
@@ -269,7 +259,15 @@ class PlannedRun:
 
 
 def initial_run(
-    plan, *, rank, vocab_size, sequence_length, tp_group, executor_group, device=None
+    plan,
+    *,
+    rank,
+    vocab_size,
+    sequence_length,
+    tp_group,
+    executor_group,
+    boundary_groups=None,
+    device=None,
 ):
     """The run a rank starts with, before any fail-stop.
 
@@ -300,6 +298,7 @@ def initial_run(
         moments={},
         tp_group=tp_group,
         executor_group=executor_group,
+        boundary_groups=boundary_groups,
         device=device,
         cursor=0,
     )
@@ -382,44 +381,68 @@ def recover(
     control_group,
     tp_group,
     executor_group,
+    boundary_groups=None,
     device=None,
 ):
-    """Safe-point step 7: the whole recovery chain, driven by the new plan.
+    """Safe-point step 7: execute the new plan's state routes.
 
-    Reads the checkpoint anchor, fetches what this rank's new stage must acquire
-    (healthy peers first, checkpoint only for what survives nowhere), instantiates the
-    stage at the plan's PP ownership and TP layout, and re-verifies the result: the
-    installed shards are gathered back into the full logical state and checked tensor
-    by tensor against the anchor (plan 3.3 step 5), which is also safe-point step 8's
-    state digest -- identical on every rank by construction.
+    Reads the checkpoint anchor, then runs one collective acquisition pass per source
+    layout the plan's routes declare, fetching exactly the state groups those routes
+    target at this rank. Healthy peers supply what they still hold and the checkpoint
+    supplies only what survives nowhere -- the order the plan itself chose. The stage is
+    then instantiated at the plan's PP ownership and TP layout, and the result is
+    re-verified: the installed shards are gathered back into the full logical state and
+    checked tensor by tensor against the anchor (plan 3.3 step 5), which is also
+    safe-point step 8's state digest -- identical on every rank by construction.
 
-    Returns ``(run, digest)``; ``run`` is ``None`` for a rank the new plan places on
-    no stage. Every rank calls this: the collectives inside are how a dead rank's
-    shard reaches the peers that must rebuild it.
+    Returns ``(run, digest)``; ``run`` is ``None`` for a rank the new plan places on no
+    stage. Every rank calls this: the collectives inside are how a dead rank's shard
+    reaches the peers that must rebuild it.
     """
     anchor, completed_steps = load_anchor(checkpoint_path)
     stage = stage_of(plan, rank)
     holds_state = run is not None and rank not in set(plan.failed_ranks)
     local = run.local_state() if holds_state else {}
 
-    acquire = {} if stage is None else acquire_layout(previous, plan, stage, rank)
-    acquired = reshard_tp_state(
-        local,
-        layout=acquire,
-        old_size=_gather_degree(previous),
-        new_size=1 if stage is None else stage.tp_degree,
-        new_rank=0 if stage is None else stage.tp_members.index(rank),
-        group=control_group,
-        checkpoint=anchor,
-        verify=False,  # verified below, on what actually landed
-    )
+    fallback = _gather_degree(previous)
+    routes = routes_for(plan, rank) if stage is not None else ()
+    acquired: dict[str, dict] = {}
+    for degree in _donor_degrees(plan, fallback):
+        layout: dict[str, int | None] = {}
+        for route in routes:
+            if (route.donor_degree or fallback) == degree:
+                layout.update(route_names(route))
+        acquired.update(
+            reshard_tp_state(
+                local,
+                layout=layout,
+                old_size=degree,
+                new_size=1 if stage is None else stage.tp_degree,
+                new_rank=0 if stage is None else stage.tp_members.index(rank),
+                group=control_group,
+                checkpoint=anchor,
+                verify=False,  # verified below, on what actually landed
+            )
+        )
 
     recovered = None
     if stage is not None:
-        # What this stage keeps: names it already holds in the right shape, i.e. every
-        # owned name that neither moved stage nor changed degree.
-        state = {name: local[name] for name in stage_layout(plan, stage) if name not in acquire}
-        state.update(acquired)
+        # Every name the plan routed here has to have arrived. The passes are grouped by
+        # source layout, so a route filed under a degree this rank never ran would fetch
+        # nothing at all -- silently, and only visible later as a stale shard.
+        wanted = acquire_layout(plan, rank)
+        unfetched = sorted(set(wanted) - set(acquired))
+        if unfetched:
+            raise ReshardError(f"routed state never arrived for rank {rank}: {unfetched}")
+        owned = stage_layout(plan, stage)
+        # What this stage keeps: every owned name no route moved, which it must already
+        # hold in the right shape. A gap here would mean the plan routed less than the
+        # stage owns, so name it rather than letting it surface as a KeyError.
+        missing = [name for name in owned if name not in acquired and name not in local]
+        if missing:
+            raise ReshardError(f"no state route covers {sorted(missing)} for rank {rank}")
+        state = {name: local[name] for name in owned if name not in acquired}
+        state.update({name: fields for name, fields in acquired.items() if name in owned})
         recovered = PlannedRun(
             plan,
             rank=rank,
@@ -429,6 +452,7 @@ def recover(
             moments={name: fields for name, fields in state.items() if "exp_avg" in fields},
             tp_group=tp_group,
             executor_group=executor_group,
+            boundary_groups=boundary_groups,
             device=device,
             # The checkpoint is the resume point, so it is also the cursor -- a rank the
             # previous plan left idle has no cursor of its own to carry forward.

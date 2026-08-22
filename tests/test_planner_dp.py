@@ -91,19 +91,33 @@ def test_memory_budget_rejects_all_targets_with_structured_reason():
 
 
 def test_memory_budget_boundary_is_accepted():
+    """The gate sizes each stage by its own 1F1B peak, so stage 0 is the binding one.
+
+    Two stages, four micro-batches: stage 0 holds two activations at its peak and
+    stage 1 holds one, so a budget cut to stage 1's footprint would wrongly admit
+    stage 0. Budgeting the deeper peak is what makes the boundary meaningful.
+    """
     from resihp.memory import estimate_memory
+    from resihp.planner.pp import peak_in_flight
 
-    budget = estimate_memory(
-        CONFIG,
-        tp_degree=1,
-        stage_layers=1,
-        micro_batches=4,
-        sequence_length=2,
-        vocab_size=8,
-    ).total
-    result = assign(0, (), topology(budget=budget))
+    def total(stage_index):
+        return estimate_memory(
+            CONFIG,
+            tp_degree=1,
+            stage_layers=1,
+            micro_batches=4,
+            sequence_length=2,
+            vocab_size=8,
+            in_flight_micro_batches=peak_in_flight(4, stage_index=stage_index, num_stages=2),
+        ).total
 
-    assert len(result.placements) == 8
+    budget = max(total(0), total(1))
+    assert total(0) > total(1)  # the warmup stage really is the expensive one
+    assert len(assign(0, (), topology(budget=budget)).placements) == 8
+    # One byte short of the deepest stage and no replica can host the pipeline.
+    with pytest.raises(InfeasibleDP) as error:
+        assign(0, (), topology(budget=budget - 1))
+    assert error.value.reason.code == "no_feasible_dp_target"
 
 
 def test_invalid_failure_signature_and_duplicate_stage_are_rejected():

@@ -3,15 +3,15 @@
 Three families of gates.
 
 **Plan reading** (pure) -- that PP ownership, TP layout, and "what actually changed"
-are all read from the ExecutionPlan, and that the acquire set is T12's migration
-view of it: a layer is fetched when it changed stage or changed degree, the boundary
-tensors when their owner stage or its degree changed, and a replica nothing happened
-to fetches nothing at all.
+are all read from the ExecutionPlan, and specifically that the acquire set *is* the
+plan's own ``state_routes``: recovery makes no routing decision of its own, so a layer
+is fetched when the plan routed it, the boundary tensors when the plan routed them, and
+a replica nothing happened to fetches nothing at all.
 
 **Recovery** -- the single path of plan 3.6 driven through the real nine-step safe
-point, with the run executing through the plan's own micro-batch assignment
-(T13's ``DataParallelRuntime``) over stages cut to the plan's ``layer_range`` and
-sharded to its TP degree (T10's ``TensorParallelStage``):
+point, with the run executing through the plan's own micro-batch assignment on the 1F1B
+``PipelineRuntime``, over stages cut to the plan's ``layer_range`` and sharded to its TP
+degree (T10's ``TensorParallelStage``):
 
 * ``*_pipeline`` (4 ranks, ``TP2 x PP2 x DP1``, 6 layers) -- dropping one rank of
   stage 0 halves its degree *and* moves layer 2 across the stage boundary, so one
@@ -65,9 +65,10 @@ torch = pytest.importorskip("torch")
 from resihp.checkpoint import CheckpointError, load_anchor
 from resihp.config import TrainConfig
 from resihp.control import STOP_CODES, ConsistentStop, ControlPlane
-from resihp.parallel.reshard import local_slice, reconstruct_full
+from resihp.parallel.reshard import reconstruct_full
 from resihp.plan import build_plan
 from resihp.recovery import acquire_layout, stage_layout, stage_of
+from resihp.verify import matches_checkpoint
 
 
 #: TP2 x PP2 x DP1 over 6 layers: dropping a rank of stage 0 both halves its degree
@@ -127,7 +128,15 @@ def _config(kind):
 
 
 def _budget(config, tp_degree, stage_layers) -> int:
-    """The analytic budget for one stage at ``(tp_degree, stage_layers)``."""
+    """The analytic budget for one stage at ``(tp_degree, stage_layers)``.
+
+    The in-flight count here is the *gate's* knob, not the planner's: what each
+    scenario needs is a budget the pristine layout fits and the post-failure one does
+    not, and one in-flight activation gives that. The planner derives its own in-flight
+    counts from the 1F1B schedule (``resihp.planner.pp.peak_in_flight``), which is
+    strictly larger for a warmup stage -- so these budgets are, if anything, the harder
+    side of the boundary.
+    """
     from resihp.memory import estimate_memory
 
     return estimate_memory(
@@ -183,7 +192,8 @@ def test_stage_layout_follows_the_plan_not_the_whole_model():
 
 
 @requires_torch
-def test_acquire_layout_is_the_migration_view_of_the_two_plans():
+def test_the_acquire_set_is_exactly_what_the_plan_routed():
+    """Recovery fetches the plan's routes and nothing else -- one authority, not two."""
     config = _config("pipeline")
     before = build_plan(config, step=0, version=0)
     after = build_plan(config, step=1, version=1, failed_ranks=(1,), previous=before)
@@ -194,16 +204,27 @@ def test_acquire_layout_is_the_migration_view_of_the_two_plans():
 
     # Stage 0 lost a TP rank: the layers it keeps must be re-chunked, and so must the
     # embeddings it owns -- their owner stage is unchanged but its degree is not.
-    acquired = acquire_layout(before, after, shrunk, 0)
+    acquired = acquire_layout(after, 0)
     assert _layers_in(acquired) == [0, 1]
     assert "token_embedding.weight" in acquired and "lm_head.weight" not in acquired
 
     # Stage 1 fetches only the layer that moved into it; its own layers and its LM
     # head neither moved nor changed degree, so they are not moved at all.
-    arriving = acquire_layout(before, after, grown, 2)
+    arriving = acquire_layout(after, 2)
     assert _layers_in(arriving) == [2]
     assert "lm_head.weight" not in arriving  # its owner stage and degree are unchanged
     assert set(arriving) < set(stage_layout(after, grown))  # it keeps the rest in place
+
+    # Every name came from a route that names this rank as a target, and every route
+    # carries the two layouts the transfer needs -- nothing is re-derived at run time.
+    from resihp.recovery import route_names, routes_for
+
+    for rank, expected in ((0, acquired), (2, arriving)):
+        routes = routes_for(after, rank)
+        assert {name for route in routes for name in route_names(route)} == set(expected)
+        for route in routes:
+            assert route.donor_degree > 0 or route.donor_kind == "checkpoint"
+            assert route.target_degree == stage_of(after, rank).tp_degree
 
 
 @requires_torch
@@ -212,8 +233,8 @@ def test_an_untouched_replica_acquires_nothing():
     before = build_plan(config, step=0, version=0)
     after = build_plan(config, step=1, version=1, failed_ranks=(1,), previous=before)
 
-    assert acquire_layout(before, after, stage_of(after, 2), 2) == {}  # replica 1 untouched
-    assert acquire_layout(before, after, stage_of(after, 0), 0) != {}  # replica 0 halved
+    assert acquire_layout(after, 2) == {}  # replica 1 untouched
+    assert acquire_layout(after, 0) != {}  # replica 0 halved
 
 
 @requires_torch
@@ -229,7 +250,7 @@ def test_a_rank_that_lost_its_seat_keeps_nothing():
     assert stage_of(v1, 3) is None and 3 in v1.live_ranks  # healthy, just unused
     for rank in (2, 3):
         stage = stage_of(v2, rank)
-        assert acquire_layout(v1, v2, stage, rank) == stage_layout(v2, stage)
+        assert acquire_layout(v2, rank) == stage_layout(v2, stage)
 
 
 @requires_torch
@@ -319,43 +340,21 @@ def test_the_planner_stop_codes_come_out_of_a_real_replan():
 
 
 def _matches_checkpoint(control, plan, rank) -> bool:
-    """Principle A, before-resume half: exactly the checkpoint, re-sharded by the plan."""
-    stage = stage_of(plan, rank)
-    if stage is None:
-        return control.training_run is None  # a dropped rank must hold no state at all
-
-    layout = stage_layout(plan, stage)
-    index = stage.tp_members.index(rank)
-    shards = control.training_run.stage.local_shards()
-    if set(shards) != set(layout):
-        return False  # the stage must hold its plan's names, no more and no fewer
-
-    anchor, _completed = load_anchor(control.checkpoint_path)
-    moments = control.training_run.runtime.optimizer.state
-    ok = True
-    for name, dim in layout.items():
-        param = shards[name][0]
-        ok &= torch.equal(
-            param.detach().cpu(), local_slice(anchor[name]["param"], dim, index, stage.tp_degree)
-        )
-        held = moments[param]
-        for field in ("exp_avg", "exp_avg_sq"):
-            ok &= torch.equal(
-                held[field].detach().cpu(),
-                local_slice(anchor[name][field], dim, index, stage.tp_degree),
-            )
-        ok &= torch.equal(held["step"].detach().cpu(), anchor[name]["step"])
-    return bool(ok)
+    """Principle A, before-resume half -- the project's one definition of it."""
+    return matches_checkpoint(control.training_run, plan, rank, control.checkpoint_path)
 
 
-def _snapshot(control, plan, rank, previous):
+def _snapshot(control, plan, rank):
     """Per-event view of what this rank ended up owning and what it had to fetch."""
     stage = stage_of(plan, rank)
     return {
         "degree": None if stage is None else stage.tp_degree,
         "layers": None if stage is None else _layers_in(stage_layout(plan, stage)),
         "owned": None if stage is None else sorted(stage_layout(plan, stage)),
-        "acquired": None if stage is None else sorted(acquire_layout(previous, plan, stage, rank)),
+        # Read from the plan alone -- there is no "previous" to consult, because the
+        # plan already carries the routes recovery executed.
+        "acquired": None if stage is None else sorted(acquire_layout(plan, rank)),
+        "donors": sorted({route.donor_kind for route in plan.state_routes}),
         "matches_checkpoint": _matches_checkpoint(control, plan, rank),
     }
 
@@ -371,6 +370,7 @@ def _attach(control, plan, rank, device, checkpoint):
             sequence_length=SEQLEN,
             tp_group=control.tp_group,
             executor_group=control.executor_group,
+            boundary_groups=control.boundary_groups,
             device=device,
         ),
         checkpoint_path=checkpoint,
@@ -405,10 +405,9 @@ def _run_recovery(rank, world_size, device, kind, backend, result_dir):
 
     failed: tuple[int, ...] = ()
     for event, victim in enumerate(VICTIMS[kind], start=1):
-        previous = plan
         plan, failed = control.safe_point(config, plan, failed, victim, next_step=event)
         assert plan.version == event
-        result["events"].append(_snapshot(control, plan, rank, previous))
+        result["events"].append(_snapshot(control, plan, rank))
         result["losses"].append(control.training_step())  # keep training after recovery
 
     result["cursor"] = None if control.training_run is None else control.training_run.cursor

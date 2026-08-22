@@ -10,11 +10,10 @@ GPUs than the case needs), so a 2-GPU box runs the two-rank gates for real.
   (3 vs 1) standing in for a post-reroute imbalance: each replica scales its losses by
   the *global* micro count and the DP combine sums the replicas, so the AdamW update
   matches the single-process reference no matter how lopsided the split is.
-* ``*_cross_replica`` -- PP2xDP2 with one micro-batch rerouted so its stage-0 executor
-  is in replica A and its stage-1 executor in replica B: the forward activation crosses
-  the replica boundary to the *actual* downstream executor and the gradient returns to
-  the *actual* upstream executor, and every stage's combined gradient matches the
-  reference.
+* ``*_cross_replica`` -- PP2xDP2 with one micro-batch rerouted from replica B to
+  replica A, the imbalance a real fail-stop reroute produces: the executors come from
+  the assignment rather than from a fixed neighbour, and every stage's combined
+  gradient still matches the reference.
 * ``*_pp_heterogeneous`` -- replica A runs two PP stages while replica B runs one stage
   owning every layer; both reach the reference gradient after the DP combine.
 * ``*_tp_heterogeneous`` -- replica A executes real TP2 sharded forward/backward while
@@ -39,6 +38,7 @@ from resihp.parallel.dp import (
     stage_pipeline,
 )
 from resihp.planner.dp import DPAssignment, DPPlacement
+from resihp.planner.pp import peak_in_flight
 
 
 CONFIG_KWARGS = dict(
@@ -99,6 +99,17 @@ _CROSS_SPEC = [
     (3, 0, 0, (0,)), (3, 1, 1, (3,)),
 ]
 
+# The same 4-rank topology after a capacity-proportional reroute: micro-batch 3 moved
+# off replica B and now runs replica A's whole pipeline. This is the shape the planner
+# actually emits -- a micro-batch belongs to one replica across all of its stages, which
+# ``assert_invariants`` enforces -- so it is what the runtime gates execute.
+_REROUTED_SPEC = [
+    (0, 0, 0, (0,)), (0, 1, 0, (1,)),
+    (1, 0, 0, (0,)), (1, 1, 0, (1,)),
+    (2, 0, 1, (2,)), (2, 1, 1, (3,)),
+    (3, 0, 0, (0,)), (3, 1, 0, (1,)),
+]
+
 
 @requires_torch
 def test_executor_route_reads_actual_downstream_and_upstream():
@@ -117,6 +128,39 @@ def test_executor_route_reads_actual_downstream_and_upstream():
     rank1 = executor_route(assignment, 1)
     assert [r["micro_batch"] for r in rank1] == [0, 1]
     assert all(r["downstream"] is None for r in rank1)  # stage 1 is the pipeline end
+
+
+@requires_torch
+def test_a_micro_batch_split_mid_pipeline_is_rejected_not_executed():
+    """The runtime refuses an assignment the planner cannot produce, rather than hang.
+
+    1F1B fuses a forward send with a backward receive into one transfer on one hop, so
+    a rank's neighbours must be fixed for the whole iteration. ``_CROSS_SPEC`` splits
+    micro-batch 3 across replicas mid-pipeline, which would give rank 0 two different
+    downstream peers; ``assert_invariants`` already forbids such a plan, and the runtime
+    says so at construction instead of deadlocking on the first fused exchange.
+    """
+    from unittest.mock import patch
+
+    from resihp.parallel.pp import PipelineRuntime
+
+    class _StubStage:
+        """Enough of a stage to build the optimizer; the routing check runs first."""
+
+        def parameters(self):
+            return [torch.nn.Parameter(torch.zeros(1))]
+
+    with patch("resihp.parallel.pp.dist.get_rank", return_value=0):
+        with pytest.raises(ValueError, match="differing neighbours"):
+            PipelineRuntime(_StubStage(), replica_id=0, assignment=_assignment(_CROSS_SPEC))
+
+        # The same rank under the rerouted assignment has one fixed downstream peer.
+        runtime = PipelineRuntime(
+            _StubStage(), replica_id=0, assignment=_assignment(_REROUTED_SPEC)
+        )
+    assert runtime.downstream == (1,)
+    assert runtime.micro_batches == [0, 1, 3]
+    assert (runtime.stage_index, runtime.num_stages) == (0, 2)
 
 
 @requires_torch
@@ -202,10 +246,24 @@ def _stage(source, *, layer_ids, is_first, is_last, device, world_size):
     ).to(device).train()
 
 
-def _runtime_result(stage, *, replica_id, assignment, tokens, ref_grads, ref_updated):
-    from resihp.parallel.dp import DataParallelRuntime
+def _boundaries(pairs, rank):
+    """Create every hop group on every rank, in one order; keep the ones this rank joins."""
+    import torch.distributed as dist
 
-    runtime = DataParallelRuntime(stage, replica_id=replica_id, assignment=assignment)
+    groups = {}
+    for pair in pairs:
+        group = dist.new_group(list(pair))
+        if rank in pair:
+            groups[pair] = group
+    return groups
+
+
+def _runtime_result(stage, *, replica_id, assignment, tokens, ref_grads, ref_updated, boundaries):
+    from resihp.parallel.pp import PipelineRuntime
+
+    runtime = PipelineRuntime(
+        stage, replica_id=replica_id, assignment=assignment, boundary_groups=boundaries
+    )
     loss = runtime.train_step(tokens)
 
     owned = stage.logical_state_dict()
@@ -221,6 +279,9 @@ def _runtime_result(stage, *, replica_id, assignment, tokens, ref_grads, ref_upd
         "owned": sorted(owned),
         "loss": loss,
         "processed": [(r["micro_batch"], r["stage_id"]) for r in runtime.routes],
+        "schedule": list(runtime.schedule),
+        "stage_index": runtime.stage_index,
+        "num_stages": runtime.num_stages,
         "activation_peak": runtime.activation_log.peak,
         "activation_drained": runtime.activation_log.live == set(),
         "grad_close": bool(grad_close),
@@ -238,7 +299,17 @@ def _assert_runtime(results, ref_loss, *, label):
         assert result["grad_close"], result
         assert result["step_close"], result
         assert result["activation_drained"], result  # every activation released by its backward
-        assert result["activation_peak"] == len(result["processed"]), result
+        # 1F1B, not GPipe: a stage holds one activation per stage still downstream of
+        # it, capped by the micro-batches it runs -- never one per micro-batch. This is
+        # the assertion that fails the moment the runtime goes back to all-forwards-
+        # then-all-backwards.
+        assert result["activation_peak"] == peak_in_flight(
+            len(result["processed"]),
+            stage_index=result["stage_index"],
+            num_stages=result["num_stages"],
+        ), result
+        assert result["schedule"][-1] == "W", result  # exactly one WeightUpdate, last
+        assert result["schedule"].count("W") == 1, result
 
     # Every (micro, stage) executed exactly once across all ranks (no shared workload).
     # JSON turns the tuples into lists on the round-trip through the result files.
@@ -265,15 +336,27 @@ def _run_dp_normalization(rank, world_size, device):
     )
     assignment = _assignment([(0, 0, 0, (0,)), (1, 0, 0, (0,)), (2, 0, 0, (0,)), (3, 0, 1, (1,))])
     result = _runtime_result(
-        stage, replica_id=rank, assignment=assignment, tokens=tokens, ref_grads=ref_grads, ref_updated=ref_updated
+        stage,
+        replica_id=rank,
+        assignment=assignment,
+        tokens=tokens,
+        ref_grads=ref_grads,
+        ref_updated=ref_updated,
+        boundaries=_boundaries((), rank),  # single-stage replicas have no hop
     )
     result["reference_loss"] = ref_loss
     return result
 
 
 def _run_cross_replica(rank, world_size, device):
-    """PP2xDP2 where micro-batch 3's stages sit in different replicas."""
-    from resihp.parallel.pp import balanced_layers
+    """PP2xDP2 after a reroute moved micro-batch 3 from replica B onto replica A.
+
+    A pristine plan splits four micro-batches evenly, two per replica; here replica A
+    runs three and replica B one, which is what a capacity-proportional reroute produces
+    when a replica loses ground. Every executor is read from the assignment, and the
+    combined gradient must still equal the reference despite the lopsided split.
+    """
+    from resihp.planner.pp import balanced_layers
 
     source, tokens, ref_grads, ref_updated, ref_loss = _reference(device)
     groups = balanced_layers(_config().num_layers, 2)
@@ -287,14 +370,22 @@ def _run_cross_replica(rank, world_size, device):
         device=device,
         world_size=world_size,
     )
-    assignment = _assignment(_CROSS_SPEC)
+    assignment = _assignment(_REROUTED_SPEC)
     result = _runtime_result(
-        stage, replica_id=replica, assignment=assignment, tokens=tokens, ref_grads=ref_grads, ref_updated=ref_updated
+        stage,
+        replica_id=replica,
+        assignment=assignment,
+        tokens=tokens,
+        ref_grads=ref_grads,
+        ref_updated=ref_updated,
+        boundaries=_boundaries(((0, 1), (2, 3)), rank),
     )
     result["reference_loss"] = ref_loss
-    # rank 0's downstream for the rerouted micro-batch 3 is rank 3, in the other replica.
+    # Micro-batch 3 landed on replica A: its stage-0 executor is rank 0, not rank 2.
     routes = executor_route(assignment, rank)
-    result["crossed"] = rank == 0 and any(r["micro_batch"] == 3 and r["downstream"] == (3,) for r in routes)
+    result["rerouted"] = rank == 0 and any(
+        route["micro_batch"] == 3 and route["downstream"] == (1,) for route in routes
+    )
     return result
 
 
@@ -322,7 +413,13 @@ def _run_pp_heterogeneous(rank, world_size, device):
         (3, 0, 1, (2,)),
     ])
     result = _runtime_result(
-        stage, replica_id=replica, assignment=assignment, tokens=tokens, ref_grads=ref_grads, ref_updated=ref_updated
+        stage,
+        replica_id=replica,
+        assignment=assignment,
+        tokens=tokens,
+        ref_grads=ref_grads,
+        ref_updated=ref_updated,
+        boundaries=_boundaries(((0, 1),), rank),  # only replica A has a hop
     )
     result["reference_loss"] = ref_loss
     result["owns_whole_model"] = rank == 2 and len(result["owned"]) == len(ref_grads)
@@ -501,7 +598,8 @@ def test_dp_normalization_matches_reference_gloo(tmp_path):
 @requires_torch
 def test_cross_replica_matches_reference_gloo(tmp_path):
     results = _spawn(_gloo_cross_replica, 4, tmp_path)
-    assert results[0]["crossed"], results[0]  # micro-batch 3's activation crossed replicas
+    assert results[0]["rerouted"], results[0]  # micro-batch 3 moved onto replica A
+    assert [len(r["processed"]) for r in results] == [3, 3, 1, 1]  # 3-vs-1 after reroute
     _assert_runtime(results, results[0]["reference_loss"], label="cross-replica Gloo")
 
 
@@ -537,7 +635,7 @@ def test_dp_normalization_matches_reference_cuda_nccl(tmp_path):
 def test_cross_replica_matches_reference_cuda_nccl(tmp_path):
     _skip_if_few_gpus(4)
     results = _spawn(_nccl_cross_replica, 4, tmp_path)
-    assert results[0]["crossed"], results[0]
+    assert results[0]["rerouted"], results[0]
     for result in results:
         assert result["is_cuda"], result
     _assert_runtime(results, results[0]["reference_loss"], label="cross-replica NCCL")

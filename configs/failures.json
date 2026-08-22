@@ -1,6 +1,24 @@
 {
   "events": [
-    {"after_iteration": 2, "failed_rank": 1},
-    {"after_iteration": 4, "failed_rank": 5}
+    {
+      "after_iteration": 2,
+      "failed_rank": 1
+    },
+    {
+      "after_iteration": 3,
+      "failed_rank": 4
+    },
+    {
+      "after_iteration": 4,
+      "failed_rank": 5
+    },
+    {
+      "after_iteration": 5,
+      "failed_rank": 6
+    },
+    {
+      "after_iteration": 6,
+      "failed_rank": 7
+    }
   ]
 }

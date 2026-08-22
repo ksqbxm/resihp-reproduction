@@ -19,12 +19,18 @@ from typing import Iterable
 
 from .config import TrainConfig
 from .planner.dp import DPPlacement, DPStage, DPTopology, InfeasibleDP, assign
-from .planner.pp import InfeasiblePP, repartition_pp
+from .planner.pp import InfeasiblePP, balanced_layers, peak_in_flight, repartition_pp
 from .planner.tp import InfeasibleTP, choose_tp
 
 
-#: Optimizer/parameter state that travels with a migrating logical layer.
-MIGRATED_STATES = ("param", "grad", "exp_avg", "exp_avg_sq", "step")
+#: The persistent training state a migrating logical tensor carries. ``grad`` is
+#: deliberately absent: a safe point is reached only after the current iteration's
+#: AdamW step has been applied, so the gradients then resident are spent values the
+#: next iteration recomputes from scratch. They are in no checkpoint and in no route.
+RECOVERED_STATES = ("param", "exp_avg", "exp_avg_sq", "step")
+#: State groups that belong to a replica's first / last executable stage rather than
+#: to any one layer (plan 3.4), and so are routed as units of their own.
+BOUNDARY_GROUPS = ("embedding", "head")
 _DONOR_KINDS = frozenset({"prev_owner", "peer_replica", "checkpoint"})
 _RESHARD_METHODS = frozenset({"peer_copy", "gather_reshard", "checkpoint_restore"})
 
@@ -46,15 +52,30 @@ class StagePlan:
 
 @dataclass(frozen=True)
 class StateRoute:
-    """How one replica's logical layer state reaches its new owner ranks."""
+    """How one group of a replica's logical state reaches its new owner ranks.
+
+    The plan's executable recovery instruction, not a description of one:
+    :func:`resihp.recovery.recover` reads these routes to decide what this rank must
+    fetch, under which source layout, into which target layout. It performs no routing
+    decision of its own.
+
+    A route covers one **state group** -- either a single global layer (``layer`` set,
+    ``boundary`` empty) or one of :data:`BOUNDARY_GROUPS` (``layer`` ``None``), which
+    follow the replica's first / last executable stage rather than any layer.
+    ``donor_degree`` / ``target_degree`` are the TP layouts the state is read under and
+    written into; ``donor_degree`` is 0 exactly for a checkpoint restore.
+    """
 
     replica_id: int
-    layer: int
+    layer: int | None
+    boundary: str  # "" for a layer route, else one of BOUNDARY_GROUPS
     target_ranks: tuple[int, ...]
+    target_degree: int
     donor_kind: str  # prev_owner | peer_replica | checkpoint
     donor_ranks: tuple[int, ...]  # empty only for a checkpoint restore
+    donor_degree: int
     reshard: str  # peer_copy | gather_reshard | checkpoint_restore
-    states: tuple[str, ...] = MIGRATED_STATES
+    states: tuple[str, ...] = RECOVERED_STATES
 
 
 @dataclass(frozen=True)
@@ -112,7 +133,18 @@ class ExecutionPlan:
                 for p in self.placements
             ],
             "state_routes": [
-                [r.replica_id, r.layer, list(r.target_ranks), r.donor_kind, list(r.donor_ranks), r.reshard, list(r.states)]
+                [
+                    r.replica_id,
+                    r.layer,
+                    r.boundary,
+                    list(r.target_ranks),
+                    r.target_degree,
+                    r.donor_kind,
+                    list(r.donor_ranks),
+                    r.donor_degree,
+                    r.reshard,
+                    list(r.states),
+                ]
                 for r in self.state_routes
             ],
         }
@@ -139,8 +171,8 @@ def _owner_ranges(stage_layers: tuple[int, ...]) -> tuple[tuple[int, int] | None
 
 
 def _initial_stage_layers(num_layers: int, pp: int) -> tuple[int, ...]:
-    base, extra = divmod(num_layers, pp)
-    return tuple(base + (1 if stage < extra else 0) for stage in range(pp))
+    """Layer counts of the pristine partition, from the planner's one definition."""
+    return tuple(len(stage) for stage in balanced_layers(num_layers, pp))
 
 
 def _stage_domains(config: TrainConfig) -> dict[int, dict[int, tuple[int, ...]]]:
@@ -190,6 +222,23 @@ def _owner_of(stage_layout: dict[int, tuple[tuple[int, ...], tuple[int, int]]], 
     raise AssertionError("layer is not owned by any stage in the layout")
 
 
+def _boundary_owner_of(
+    stage_layout: dict[int, tuple[tuple[int, ...], tuple[int, int]]], boundary: str
+) -> tuple[int, ...]:
+    """TP members of the stage owning ``boundary`` -- the first / last executable one."""
+    ordered = sorted(stage_layout)
+    return stage_layout[ordered[0 if boundary == "embedding" else -1]][0]
+
+
+def _group_owner(
+    stage_layout: dict[int, tuple[tuple[int, ...], tuple[int, int]]],
+    layer: int | None,
+    boundary: str,
+) -> tuple[int, ...]:
+    """TP members currently owning one state group, layer or boundary alike."""
+    return _owner_of(stage_layout, layer) if boundary == "" else _boundary_owner_of(stage_layout, boundary)
+
+
 def _repartition(old_layers, old_tp, new_tp):
     """``repartition_pp``, with its structured reason carried into the plan's own."""
     try:
@@ -203,21 +252,70 @@ def _repartition(old_layers, old_tp, new_tp):
 def _state_route(
     old_layout: dict[int, dict[int, tuple[tuple[int, ...], tuple[int, int]]]],
     replica: int,
-    layer: int,
+    layer: int | None,
+    boundary: str,
     old_members: tuple[int, ...],
     new_members: tuple[int, ...],
     failed_set: set[int],
 ) -> StateRoute:
+    """Pick the donor for one state group: own previous owner, healthy peer, checkpoint.
+
+    Plan 3.3/3.6 fix this order and admit no other: the state is collected from a
+    healthy replica whenever one still holds it, and the pre-failure checkpoint is
+    consulted only when it survives nowhere. Recovery executes the choice made here.
+    """
+
+    def route(kind: str, donors: tuple[int, ...], method: str) -> StateRoute:
+        return StateRoute(
+            replica_id=replica,
+            layer=layer,
+            boundary=boundary,
+            target_ranks=new_members,
+            target_degree=len(new_members),
+            donor_kind=kind,
+            donor_ranks=donors,
+            donor_degree=len(donors),
+            reshard=method,
+        )
+
     if all(rank not in failed_set for rank in old_members):
-        reshard = "peer_copy" if len(old_members) == len(new_members) else "gather_reshard"
-        return StateRoute(replica, layer, new_members, "prev_owner", old_members, reshard)
+        method = "peer_copy" if len(old_members) == len(new_members) else "gather_reshard"
+        return route("prev_owner", old_members, method)
     for peer in sorted(old_layout):
         if peer == replica:
             continue
-        peer_members = _owner_of(old_layout[peer], layer)
+        peer_members = _group_owner(old_layout[peer], layer, boundary)
         if all(rank not in failed_set for rank in peer_members):
-            return StateRoute(replica, layer, new_members, "peer_replica", peer_members, "gather_reshard")
-    return StateRoute(replica, layer, new_members, "checkpoint", (), "checkpoint_restore")
+            return route("peer_replica", peer_members, "gather_reshard")
+    return route("checkpoint", (), "checkpoint_restore")
+
+
+def _state_groups(num_layers: int) -> tuple[tuple[int | None, str], ...]:
+    """Every routable state group of one replica: each layer, then the two boundaries."""
+    return tuple((layer, "") for layer in range(num_layers)) + tuple(
+        (None, boundary) for boundary in BOUNDARY_GROUPS
+    )
+
+
+def boundary_pairs(plan: "ExecutionPlan") -> tuple[tuple[int, int], ...]:
+    """Sorted leader pairs of every pipeline hop this plan's assignment creates.
+
+    The pipeline boundaries are read from the assignment, so a hop exists exactly where
+    a micro-batch actually moves between two stages. Each pair gets its own two-rank
+    process group: the 1F1B steady state issues a fused ``batch_isend_irecv``, which
+    NCCL runs on the group's collective communicator, so the group must hold exactly
+    the two ranks taking part (see :mod:`resihp.parallel.pp`).
+    """
+    pipelines: dict[int, list[DPPlacement]] = {}
+    for placement in plan.placements:
+        pipelines.setdefault(placement.micro_batch, []).append(placement)
+    pairs = set()
+    for places in pipelines.values():
+        ordered = sorted(places, key=lambda placement: placement.stage_id)
+        for upstream, downstream in zip(ordered, ordered[1:]):
+            leaders = (upstream.executor_ranks[0], downstream.executor_ranks[0])
+            pairs.add((min(leaders), max(leaders)))
+    return tuple(sorted(pairs))
 
 
 def build_plan(
@@ -229,8 +327,7 @@ def build_plan(
     previous: "ExecutionPlan | None" = None,
     memory_budget: int | None = None,
     sequence_length: int = 1,
-    vocab_size: int = 1,
-    in_flight_micro_batches: int = 1,
+    vocab_size: int | None = None,
 ) -> ExecutionPlan:
     """Chain TP, PP, and DP planning into one immutable, verified plan.
 
@@ -241,6 +338,16 @@ def build_plan(
     layout -- a fully dead stage becomes zero layers and its layers move to the
     replica's survivors, so a single dead stage never discards a whole replica.
     ``assign`` finally distributes micro-batches across the surviving replicas.
+
+    ``vocab_size`` is a topology constraint, not only a memory input: the token
+    embedding and the LM head are sharded over vocabulary, so a degree that does not
+    divide it cannot be built. Pass it and no such degree is ever selected; leave it
+    out (as pure planning tests do) and only the dimension constraints apply. A
+    ``memory_budget`` requires it either way.
+
+    Peak activation memory is never guessed: each stage's in-flight micro-batch count
+    comes from :func:`resihp.planner.pp.peak_in_flight`, replayed from the very 1F1B
+    schedule :class:`resihp.parallel.pp.PipelineRuntime` executes.
     """
     if not isinstance(step, Integral) or isinstance(step, bool) or step < 0:
         raise ValueError("step must be a non-negative integer")
@@ -266,31 +373,40 @@ def build_plan(
             old_layers[stage] = layer_range[1] - layer_range[0]
             old_tp[stage] = len(members)
 
+        # The old pipeline is the only shape available when TP degrees are chosen --
+        # the repartition needs those degrees before it can produce the new one -- so a
+        # stage's 1F1B position is taken from it, and the in-flight count from the whole
+        # global micro-batch set, an upper bound on any replica's share. Both over-
+        # rather than under-state the peak, and the DP gate below re-checks every stage
+        # against the layout that is actually published.
+        old_active = [stage for stage in range(config.pp) if old_tp[stage] > 0]
+
         new_members: dict[int, tuple[int, ...]] = {}
         new_tp = [0] * config.pp
         for stage in range(config.pp):
             survivors = tuple(rank for rank in domains[replica][stage] if rank not in failed_set)
             if not survivors:
                 continue
-            if memory_budget is None:
-                choice = choose_tp(config, active_ranks=survivors, min_degree=1)
-            else:
-                try:
-                    choice = choose_tp(
-                        config,
-                        active_ranks=survivors,
-                        min_degree=1,
-                        stage_layers=max(1, old_layers[stage]),
-                        micro_batches=micro_batches,
-                        sequence_length=sequence_length,
-                        vocab_size=vocab_size,
-                        memory_budget=memory_budget,
-                        in_flight_micro_batches=in_flight_micro_batches,
-                    )
-                except InfeasibleTP as error:
-                    raise InfeasiblePlan(
-                        PlanInfeasibleReason(error.reason.code, error.reason.message)
-                    ) from error
+            try:
+                choice = choose_tp(
+                    config,
+                    active_ranks=survivors,
+                    min_degree=1,
+                    stage_layers=max(1, old_layers[stage]),
+                    micro_batches=micro_batches,
+                    sequence_length=sequence_length,
+                    vocab_size=vocab_size,
+                    memory_budget=memory_budget,
+                    in_flight_micro_batches=peak_in_flight(
+                        micro_batches,
+                        stage_index=old_active.index(stage),
+                        num_stages=len(old_active),
+                    ),
+                )
+            except InfeasibleTP as error:
+                raise InfeasiblePlan(
+                    PlanInfeasibleReason(error.reason.code, error.reason.message)
+                ) from error
             new_members[stage] = choice.members
             new_tp[stage] = choice.degree
 
@@ -318,12 +434,18 @@ def build_plan(
             for stage in range(config.pp)
             if pp_plan.layer_ranges[stage] is not None
         }
-        for layer in range(config.num_layers):
-            old_members = _owner_of(old_layout[replica], layer)
-            new_owner = _owner_of(new_stage_layout, layer)
+        # A state group needs a route exactly when the TP members owning it change:
+        # different stages hold disjoint rank domains, so that single test covers a
+        # layer moving stage, a stage changing degree, a rank changing seat within its
+        # stage, and a boundary tensor following a new first / last executable stage.
+        for layer, boundary in _state_groups(config.num_layers):
+            old_members = _group_owner(old_layout[replica], layer, boundary)
+            new_owner = _group_owner(new_stage_layout, layer, boundary)
             if old_members != new_owner:
                 state_routes.append(
-                    _state_route(old_layout, replica, layer, old_members, new_owner, failed_set)
+                    _state_route(
+                        old_layout, replica, layer, boundary, old_members, new_owner, failed_set
+                    )
                 )
 
     if not dp_stages:
@@ -345,9 +467,8 @@ def build_plan(
         stages=tuple(dp_stages),
         micro_batches=micro_batches,
         sequence_length=sequence_length,
-        vocab_size=vocab_size,
+        vocab_size=1 if vocab_size is None else vocab_size,
         memory_budget=memory_budget,
-        in_flight_micro_batches=in_flight_micro_batches,
     )
     try:
         assignment = assign(step, failed, topology)
@@ -432,13 +553,27 @@ def assert_invariants(plan: ExecutionPlan, previous: ExecutionPlan | None = None
         if set(ran) != active_stage_ids[replica]:
             raise PlanInvariantError(f"micro-batch {micro_batch} does not run its replica's stages exactly once")
 
+    routed = set()
     for route in plan.state_routes:
         if route.donor_kind not in _DONOR_KINDS or route.reshard not in _RESHARD_METHODS:
             raise PlanInvariantError("state route has an unknown donor kind or reshard method")
+        if (route.layer is None) == (route.boundary == ""):
+            raise PlanInvariantError("state route must name exactly one layer or boundary")
+        if route.boundary not in ("",) + BOUNDARY_GROUPS:
+            raise PlanInvariantError("state route names an unknown boundary group")
+        if (route.replica_id, route.layer, route.boundary) in routed:
+            raise PlanInvariantError("a state group is routed more than once")
+        routed.add((route.replica_id, route.layer, route.boundary))
         if not route.target_ranks or set(route.target_ranks) - active:
             raise PlanInvariantError("state route target ranks are empty or not active")
+        if route.target_degree != len(route.target_ranks):
+            raise PlanInvariantError("state route target degree does not match its target ranks")
+        if route.donor_degree != len(route.donor_ranks):
+            raise PlanInvariantError("state route donor degree does not match its donor ranks")
         if not route.states:
             raise PlanInvariantError("state route migrates no state")
+        if "grad" in route.states:
+            raise PlanInvariantError("gradients are not persistent state and are never routed")
         if route.donor_kind == "checkpoint":
             if route.donor_ranks or route.reshard != "checkpoint_restore":
                 raise PlanInvariantError("checkpoint route must have no donor ranks")

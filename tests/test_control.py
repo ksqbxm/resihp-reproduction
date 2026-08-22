@@ -76,7 +76,7 @@ def _worker(rank, world_size, result_dir, port):
     control = ControlPlane.initialize(
         training_backend="gloo", vocab_size=VOCAB, sequence_length=SEQLEN
     )
-    plan = build_initial_plan(CONFIG)
+    plan = build_initial_plan(CONFIG, vocab_size=VOCAB, sequence_length=SEQLEN)
     control.build_training_groups(plan)
     control.attach_run(
         initial_run(
@@ -86,6 +86,7 @@ def _worker(rank, world_size, result_dir, port):
             sequence_length=SEQLEN,
             tp_group=control.tp_group,
             executor_group=control.executor_group,
+            boundary_groups=control.boundary_groups,
         ),
         checkpoint_path=Path(result_dir, "ckpt.pt"),
     )

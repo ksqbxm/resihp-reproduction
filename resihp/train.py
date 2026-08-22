@@ -6,7 +6,12 @@ echo, so the CLI is inspectable without a distributed launcher.
 
 ``VOCAB_SIZE`` / ``SEQUENCE_LENGTH`` are run constants rather than config fields:
 the training schema (plan section 1) admits only the fields it lists, and these two
-fix the token stream and the embedding shapes for the whole run.
+fix the token stream and the embedding shapes for the whole run. Both reach the
+planner, because both are topology constraints: no TP degree that fails to divide the
+vocabulary can be built, and the sequence length sizes the activation budget.
+
+``memory_budget_bytes`` *is* a config field, and the only way to switch the analytical
+memory gate on for a launched run. Left ``null``, no artificial ceiling applies.
 """
 
 import argparse
@@ -64,8 +69,17 @@ def run_distributed(loaded):
     failures_by_iteration = {event.after_iteration: event.failed_rank for event in loaded.failures}
 
     device = _select_device()
-    control = ControlPlane.initialize(vocab_size=VOCAB_SIZE, sequence_length=SEQUENCE_LENGTH)
-    plan = build_initial_plan(config)
+    control = ControlPlane.initialize(
+        vocab_size=VOCAB_SIZE,
+        sequence_length=SEQUENCE_LENGTH,
+        memory_budget=config.memory_budget_bytes,
+    )
+    plan = build_initial_plan(
+        config,
+        vocab_size=VOCAB_SIZE,
+        sequence_length=SEQUENCE_LENGTH,
+        memory_budget=config.memory_budget_bytes,
+    )
     control.build_training_groups(plan)
     control.attach_run(
         initial_run(
@@ -75,6 +89,7 @@ def run_distributed(loaded):
             sequence_length=SEQUENCE_LENGTH,
             tp_group=control.tp_group,
             executor_group=control.executor_group,
+            boundary_groups=control.boundary_groups,
             device=device,
         ),
         checkpoint_path=CHECKPOINT_PATH,
@@ -126,10 +141,24 @@ def run_distributed(loaded):
     return plan
 
 
-def build_initial_plan(config):
+def build_initial_plan(config, *, vocab_size, sequence_length, memory_budget=None):
+    """The pristine plan a run starts from, gated by the inputs every replan uses.
+
+    Passing the run constants and the budget here rather than defaulting them is what
+    makes the launched run's first plan subject to the same feasibility rules as the
+    ones a fail-stop produces: one planner, one set of constraints, no privileged
+    starting topology.
+    """
     from .plan import build_plan
 
-    return build_plan(config, step=0, version=0)
+    return build_plan(
+        config,
+        step=0,
+        version=0,
+        memory_budget=memory_budget,
+        vocab_size=vocab_size,
+        sequence_length=sequence_length,
+    )
 
 
 def main(argv=None):

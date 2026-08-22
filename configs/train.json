@@ -1,6 +1,6 @@
 {
   "model_dim": 128,
-  "num_layers": 4,
+  "num_layers": 6,
   "num_heads": 8,
   "batch_size": 8,
   "micro_batch_size": 2,
@@ -8,5 +8,6 @@
   "tp": 2,
   "pp": 2,
   "dp": 2,
-  "iterations": 6
+  "iterations": 8,
+  "memory_budget_bytes": null
 }

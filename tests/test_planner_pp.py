@@ -1,8 +1,23 @@
-"""Tests for deterministic PP repartition planning."""
+"""Tests for deterministic PP repartition planning and the 1F1B schedule.
+
+The schedule gates here are the project's one definition of 1F1B: the runtime issues
+exactly :func:`pipeline_schedule`'s order (a torch-gated test in
+``test_parallel_pp.py`` compares them element for element) and the memory model sizes
+peak activations from :func:`peak_in_flight`. Locking the order here therefore locks
+both, and rules out the GPipe order -- all forwards, then all backwards -- which is
+what this project previously ran in production.
+"""
 
 import pytest
 
-from resihp.planner.pp import InfeasiblePP, repartition_pp
+from resihp.planner.pp import (
+    InfeasiblePP,
+    balanced_layers,
+    peak_in_flight,
+    pipeline_phases,
+    pipeline_schedule,
+    repartition_pp,
+)
 
 
 def owners(ranges):
@@ -124,3 +139,100 @@ def test_active_stage_count_cannot_exceed_model_layers():
         repartition_pp((1, 1, 0), (1, 1, 0), (2, 2, 2))
 
     assert error.value.reason.code == "no_executable_pp"
+
+
+# --- the base partition -----------------------------------------------------------
+
+
+def test_balanced_layers_covers_every_layer_once():
+    assert balanced_layers(4, 2) == ((0, 1), (2, 3))
+    assert balanced_layers(5, 2) == ((0, 1, 2), (3, 4))  # remainder to earlier stages
+    assert balanced_layers(3, 3) == ((0,), (1,), (2,))
+    flat = [gid for stage in balanced_layers(7, 3) for gid in stage]
+    assert flat == list(range(7))  # contiguous, unique, complete
+
+
+def test_balanced_layers_rejects_more_stages_than_layers():
+    with pytest.raises(ValueError):
+        balanced_layers(2, 3)
+
+
+def test_the_plan_derives_its_pristine_partition_from_balanced_layers():
+    """One definition of the initial split, so plan and planner cannot disagree."""
+    from resihp.plan import _initial_stage_layers
+
+    for num_layers, pp in ((4, 2), (6, 2), (7, 3), (6, 4)):
+        assert _initial_stage_layers(num_layers, pp) == tuple(
+            len(stage) for stage in balanced_layers(num_layers, pp)
+        )
+
+
+# --- the 1F1B schedule ------------------------------------------------------------
+
+
+def test_single_stage_alternates_forward_and_backward():
+    """With nothing downstream there is no warmup: every forward retires immediately."""
+    assert pipeline_phases(4, stage_index=0, num_stages=1) == (0, 4)
+    assert pipeline_schedule(4, stage_index=0, num_stages=1) == ("F", "B") * 4
+    assert peak_in_flight(4, stage_index=0, num_stages=1) == 1
+
+
+def test_two_stages_warm_up_steady_and_cool_down():
+    """The canonical 2-stage / 4-micro-batch schedule, stage by stage."""
+    assert pipeline_phases(4, stage_index=0, num_stages=2) == (1, 3)
+    assert pipeline_schedule(4, stage_index=0, num_stages=2) == (
+        "F", "F", "B", "F", "B", "F", "B", "B",
+    )
+    assert pipeline_phases(4, stage_index=1, num_stages=2) == (0, 4)
+    assert pipeline_schedule(4, stage_index=1, num_stages=2) == ("F", "B") * 4
+
+
+def test_schedule_is_not_gpipe():
+    """No stage runs every forward before its first backward once micro-batches exceed
+    the warmup -- that ordering is exactly what this project had to stop doing."""
+    for num_stages in (1, 2, 3, 4):
+        for stage_index in range(num_stages):
+            order = pipeline_schedule(8, stage_index=stage_index, num_stages=num_stages)
+            gpipe = ("F",) * 8 + ("B",) * 8
+            assert order != gpipe, (num_stages, stage_index)
+
+
+def test_every_micro_batch_is_forwarded_and_backwarded_exactly_once():
+    for num_stages in (1, 2, 3, 4):
+        for micro in (1, 2, 4, 8):
+            for stage_index in range(num_stages):
+                order = pipeline_schedule(micro, stage_index=stage_index, num_stages=num_stages)
+                assert order.count("F") == micro
+                assert order.count("B") == micro
+                # A backward can only retire something already forwarded.
+                live = 0
+                for operation in order:
+                    live += 1 if operation == "F" else -1
+                    assert live >= 0, (num_stages, stage_index, micro, order)
+                assert live == 0
+
+
+def test_peak_in_flight_is_replayed_from_the_schedule():
+    """Earlier stages hold more, and the micro-batch count caps every stage."""
+    assert [peak_in_flight(4, stage_index=i, num_stages=3) for i in range(3)] == [3, 2, 1]
+    # Two micro-batches cannot produce three in flight, however deep the pipeline is.
+    assert [peak_in_flight(2, stage_index=i, num_stages=4) for i in range(4)] == [2, 2, 2, 1]
+    for num_stages in (1, 2, 3, 4, 5):
+        for micro in (1, 2, 3, 8):
+            for stage_index in range(num_stages):
+                order = pipeline_schedule(micro, stage_index=stage_index, num_stages=num_stages)
+                live = peak = 0
+                for operation in order:
+                    live += 1 if operation == "F" else -1
+                    peak = max(peak, live)
+                assert peak == peak_in_flight(
+                    micro, stage_index=stage_index, num_stages=num_stages
+                )
+
+
+def test_schedule_rejects_a_stage_outside_its_pipeline():
+    for bad in ((4, 2, 2), (4, -1, 2), (4, 0, 0)):
+        with pytest.raises(ValueError):
+            pipeline_phases(bad[0], stage_index=bad[1], num_stages=bad[2])
+    with pytest.raises(ValueError):
+        pipeline_phases(-1, stage_index=0, num_stages=1)

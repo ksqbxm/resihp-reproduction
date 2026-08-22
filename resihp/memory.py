@@ -1,4 +1,11 @@
-"""Analytical memory budget used by all planning decisions."""
+"""Analytical memory budget used by all planning decisions.
+
+The single calculator: the TP ``k_min`` search (:mod:`resihp.planner.tp`) and the DP
+``MemoryFeasible`` gate (:mod:`resihp.planner.dp`) both call :func:`memory_feasible`,
+and there is no second formula anywhere. ``in_flight_micro_batches`` has no default on
+purpose -- a silent ``1`` would under-count the activation peak of every stage the 1F1B
+schedule warms up; callers derive it from :func:`resihp.planner.pp.peak_in_flight`.
+"""
 
 from dataclasses import dataclass
 
@@ -42,7 +49,7 @@ def estimate_memory(
     micro_batches: int,
     sequence_length: int,
     vocab_size: int,
-    in_flight_micro_batches: int = 1,
+    in_flight_micro_batches: int,
 ) -> MemoryBreakdown:
     """Return the resident FP32 bytes for one stage and TP rank.
 
@@ -108,7 +115,7 @@ def memory_feasible(
     sequence_length: int,
     vocab_size: int,
     memory_budget: int,
-    in_flight_micro_batches: int = 1,
+    in_flight_micro_batches: int,
 ) -> bool:
     _positive("memory_budget", memory_budget)
     return estimate_memory(

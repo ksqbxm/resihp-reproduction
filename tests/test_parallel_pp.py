@@ -1,22 +1,27 @@
-"""Pipeline-parallel 1F1B runtime and layer-state migration (T12).
+"""The single 1F1B pipeline runtime and layer-state migration (T12).
 
-Pure gates (single process) cover the base partition and the placement planner --
-including the case a migrations-only view misses: a layer that stays on its stage
-but must still reshard because the stage lost a TP rank.
+``PipelineRuntime`` is the runtime the control plane drives, so these gates exercise
+the production class directly -- there is no separate test-only scheduler to compare
+against. The pure schedule itself (warmup / steady / cooldown, in-flight peaks) is
+locked in ``test_planner_pp.py``; what is checked here is that the runtime issues
+*that* order and that the transfers it issues are correct.
 
 The distributed gates run identical logic on two backends, exactly like T10/T11:
-CPU/**Gloo** (always available where torch is installed) and GPU/**NCCL** (real
-device tensors and real point-to-point transfers, skipped when there are fewer GPUs
-than the case needs), so a 2-GPU box actually runs them.
+CPU/**Gloo** (always available where torch is installed) and GPU/**NCCL** (real device
+tensors and real point-to-point transfers, skipped when there are fewer GPUs than the
+case needs), so a 2-GPU box actually runs them.
 
 * ``*_matches_reference`` -- two stages, four micro-batches: each rank owns only its
   slice of the model, activations and gradients cross the stage boundary as real
   transfers, and every stage's gradients and post-AdamW weights match the
   single-process reference for the names it owns. The emitted primitive order is
-  asserted to be genuine 1F1B, not all-forwards-then-all-backwards.
-* ``*_layer_migration_is_lossless`` -- the layer that both moves stage and changes
-  TP degree carries ``param``/``grad``/``exp_avg``/``exp_avg_sq``/``step`` through a
-  real collective and lands tensor-for-tensor equal to the checkpoint anchor.
+  asserted equal to :func:`resihp.planner.pp.pipeline_schedule`, so it is genuine 1F1B
+  and not all-forwards-then-all-backwards.
+* ``*_layer_migration_is_lossless`` -- a stage that must reacquire two layers at once
+  (one arriving from another stage, one staying put but re-chunked because its stage
+  lost a TP rank) carries ``param``/``exp_avg``/``exp_avg_sq``/``step`` through a real
+  collective and lands tensor-for-tensor equal to the checkpoint anchor. There is no
+  ``grad``: gradients are not persistent state and never cross a safe point.
 """
 
 import importlib.util
@@ -29,12 +34,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from resihp.config import TrainConfig
-from resihp.parallel.pp import (
-    LayerPlacement,
-    balanced_layers,
-    plan_migration,
-    reshard_layout,
-)
+from resihp.planner.pp import balanced_layers, pipeline_schedule
 
 
 CONFIG = TrainConfig(
@@ -75,82 +75,44 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-# --- pure: base partition and placement planning ----------------------------------
-
-
 @requires_torch
-def test_balanced_layers_covers_every_layer_once():
-    assert balanced_layers(4, 2) == ((0, 1), (2, 3))
-    assert balanced_layers(5, 2) == ((0, 1, 2), (3, 4))  # remainder to earlier stages
-    assert balanced_layers(3, 3) == ((0,), (1,), (2,))
-    flat = [gid for stage in balanced_layers(7, 3) for gid in stage]
-    assert flat == list(range(7))  # contiguous, unique, complete
-
-
-@requires_torch
-def test_balanced_layers_rejects_more_stages_than_layers():
-    with pytest.raises(ValueError):
-        balanced_layers(2, 3)
-
-
-@requires_torch
-def test_placements_cover_every_layer_with_both_sides():
-    """Every global layer gets an old and a new (owner, degree) -- none omitted."""
-    plan, placements = plan_migration((2, 2, 2), (2, 2, 2), (2, 1, 1))
-    assert [place.layer for place in placements] == list(range(6))
-    assert plan.stage_layers == (3, 2, 1)
-    assert plan.embedding_owner == 0 and plan.lm_head_owner == 2
-
-    by_layer = {place.layer: place for place in placements}
-    assert by_layer[2] == LayerPlacement(2, old_owner=1, new_owner=0, old_degree=2, new_degree=2)
-    assert by_layer[2].moved and not by_layer[2].resharded
-    # Layer 4 both changes stage and changes degree: moved *and* resharded.
-    assert by_layer[4] == LayerPlacement(4, old_owner=2, new_owner=1, old_degree=2, new_degree=1)
-    assert by_layer[4].moved and by_layer[4].resharded
-    # Layer 5 stays on stage 2 but its degree dropped, so it still reshards.
-    assert not by_layer[5].moved and by_layer[5].resharded
-
-
-@requires_torch
-def test_stationary_layers_still_reshard_when_their_stage_loses_a_rank():
-    """No layer moves, yet stage 0's layers must be re-chunked from TP2 to TP1.
-
-    ``PPPlan.migrations`` is empty here, so a plan that only tracked moved layers
-    would silently leave stage 0's state in the old two-way layout.
-    """
-    plan, placements = plan_migration((2, 2), (2, 2), (1, 2))
-    assert plan.stage_layers == (2, 2)
-    assert plan.migrations == ()
-    assert not any(place.moved for place in placements)
-    assert [place.resharded for place in placements] == [True, True, False, False]
-
-
-@requires_torch
-def test_reshard_layout_covers_moved_and_stationary_resharded_layers():
-    _, placements = plan_migration((2, 2, 2), (2, 2, 2), (2, 1, 1))
-    layout = reshard_layout(placements, new_owner=1)
-
-    # Layer 4 arrives from stage 2; layer 3 stays on stage 1 but its degree dropped
-    # 2 -> 1, so it must be re-chunked too. Selecting only arriving layers would
-    # leave layer 3's state in the old two-way layout.
-    assert {name.split(".")[1] for name in layout} == {"3", "4"}
-    assert layout["layers.4.attn.q_proj.weight"] == 0  # column-parallel
-    assert layout["layers.4.attn.out_proj.weight"] == 1  # row-parallel
-    assert layout["layers.4.attn_norm.weight"] is None  # replicated
-    # Embedding / LM head belong to the first / last stage, never to a layer.
-    assert not any(name.startswith(("token_", "position_", "final_", "lm_head")) for name in layout)
-
-
-@requires_torch
-def test_reshard_layout_selects_stage_that_only_lost_a_rank():
-    """No layer moves anywhere, yet stage 0's retained layers must still be listed."""
-    _, placements = plan_migration((2, 2), (2, 2), (1, 2))
-    assert {name.split(".")[1] for name in reshard_layout(placements, new_owner=0)} == {"0", "1"}
-    # Stage 1 kept both its layers at the same degree, so it has no state work.
-    assert reshard_layout(placements, new_owner=1) == {}
+def test_expected_schedule_is_the_planner_definition():
+    """The literal above is only a readable spelling of the shared schedule function."""
+    for stage_index, expected in EXPECTED_SCHEDULE.items():
+        order = pipeline_schedule(MICRO, stage_index=stage_index, num_stages=2)
+        assert [step[0] for step in expected[:-1]] == list(order)
 
 
 # --- distributed: 1F1B execution against the reference ----------------------------
+
+
+def _pipeline(rank, num_stages):
+    """A one-rank-per-stage assignment plus the two-rank group of every hop.
+
+    Exactly the shape the plan produces for a single DP replica: every micro-batch runs
+    every stage, executed by that stage's own rank. ``new_group`` is collective over the
+    world, so every rank creates every hop group in the same order and keeps the ones it
+    joins.
+    """
+    import torch.distributed as dist
+
+    from resihp.planner.dp import DPAssignment, DPPlacement
+
+    assignment = DPAssignment(
+        step=0,
+        failure_signature=(),
+        placements=tuple(
+            DPPlacement(micro_batch=micro, stage_id=stage, replica_id=0, executor_ranks=(stage,))
+            for micro in range(MICRO)
+            for stage in range(num_stages)
+        ),
+    )
+    boundary = {}
+    for pair in zip(range(num_stages), range(1, num_stages)):
+        group = dist.new_group(list(pair))
+        if rank in pair:
+            boundary[pair] = group
+    return assignment, boundary
 
 
 def _compare_pp(rank, num_stages, device):
@@ -161,7 +123,7 @@ def _compare_pp(rank, num_stages, device):
     import torch.distributed as dist
 
     from resihp.model import ReferenceTransformer
-    from resihp.parallel.pp import PipelineRuntime, balanced_layers
+    from resihp.parallel.pp import PipelineRuntime
     from resihp.parallel.reshard import shard_dims, shard_logical_state
     from resihp.parallel.tp import TensorParallelStage
     from resihp.reference import ADAM_BETAS, ADAM_EPS, LEARNING_RATE, WEIGHT_DECAY
@@ -181,6 +143,7 @@ def _compare_pp(rank, num_stages, device):
     # One TP rank per stage: every rank builds every solo group, in the same order,
     # because ``new_group`` is collective over the world.
     solo = [dist.new_group([peer]) for peer in range(num_stages)][rank]
+    assignment, boundary = _pipeline(rank, num_stages)
     stage = TensorParallelStage(
         CONFIG,
         vocab_size=VOCAB,
@@ -209,7 +172,9 @@ def _compare_pp(rank, num_stages, device):
     ref_opt.step()
     ref_updated = {name: p.detach().clone() for name, p in reference.logical_state_dict().items()}
 
-    runtime = PipelineRuntime(stage, stage_ranks=range(num_stages), num_micro_batches=MICRO)
+    runtime = PipelineRuntime(
+        stage, replica_id=0, assignment=assignment, boundary_groups=boundary
+    )
     loss = runtime.train_step(tokens)
 
     owned = stage.logical_state_dict()
@@ -225,6 +190,13 @@ def _compare_pp(rank, num_stages, device):
         "owned": sorted(owned),
         "all_names": sorted(source),
         "schedule": runtime.schedule,
+        # Derived on the rank that ran it, so the comparison below is against the
+        # planner's definition and not against a literal that could drift from it.
+        "planned": list(
+            pipeline_schedule(MICRO, stage_index=runtime.stage_index, num_stages=num_stages)
+        ),
+        "activation_peak": runtime.activation_log.peak,
+        "activation_drained": runtime.activation_log.live == set(),
         "loss": loss,
         "reference_loss": float(ref_loss.detach()),
         "grad_close": bool(grad_close),
@@ -260,6 +232,16 @@ def _assert_matches_reference(results, num_stages, label):
         for right in owned[i + 1 :]:
             assert not (left & right), (left, right)
 
+    for rank, result in enumerate(results):
+        # The runtime issues exactly the shared schedule -- the tie that keeps the
+        # memory model's in-flight peaks describing the real thing.
+        assert [step[0] for step in result["schedule"][:-1]] == result["planned"], result
+        assert result["schedule"][-1] == "W", result  # one WeightUpdate, at the end
+        assert result["activation_drained"], result  # every activation released
+        # 1F1B, not GPipe: a stage holds at most one activation per stage below it,
+        # never one per micro-batch.
+        assert result["activation_peak"] == min(num_stages - rank, MICRO), result
+
     if num_stages > 1:
         for result in results:
             # Real pipelining: no stage holds the whole model.
@@ -268,12 +250,24 @@ def _assert_matches_reference(results, num_stages, label):
         assert any(n.startswith("lm_head") for n in results[-1]["owned"])
         for rank, result in enumerate(results):
             assert result["schedule"] == EXPECTED_SCHEDULE[rank], result["schedule"]
+        # The whole point: the first stage really does hold two activations at once,
+        # which a GPipe schedule would have made four.
+        assert results[0]["activation_peak"] == 2 < MICRO, results[0]
 
 
 # --- distributed: layer state migration -------------------------------------------
 
 _MIGRATION_DIM = 4
-_MIGRATION_FIELDS = ("param", "grad", "exp_avg", "exp_avg_sq")
+#: Persistent per-parameter state only. ``grad`` is absent by contract: a safe point is
+#: reached after the iteration's AdamW step, so the next iteration recomputes it.
+_MIGRATION_FIELDS = ("param", "exp_avg", "exp_avg_sq")
+#: Layers 3 and 4 of a six-layer model: layer 4 arrives from another stage while layer 3
+#: stays put, and both drop from TP2 to TP1 -- one reshard covers the pair. Which layers
+#: these are is the plan's decision (``ExecutionPlan.state_routes``); what is under test
+#: here is that moving them loses nothing.
+_MIGRATION_LAYERS = (3, 4)
+_MIGRATION_OLD_DEGREE = 2
+_MIGRATION_NEW_DEGREE = 1
 
 
 def _layer_shape(name, dim):
@@ -297,7 +291,6 @@ def _anchor_state(layout, seed):
         base = torch.rand(_layer_shape(name, _MIGRATION_DIM), generator=generator)
         anchor[name] = {
             "param": base,
-            "grad": base * 2.0,
             "exp_avg": base * 0.5,
             "exp_avg_sq": base.abs() + 1.0,
             "step": torch.tensor(5.0),
@@ -313,35 +306,39 @@ def _shard_of(full, dim, index, size):
     return torch.chunk(full, size, dim=dim)[index].contiguous().clone()
 
 
-def _run_migration(rank, device):
-    """Stage 1's whole state workload at TP2 -> TP1, over a real collective.
+def _migration_layout():
+    """Shard dims of the two layers the receiving stage must reacquire."""
+    from resihp.parallel.reshard import shard_dims
 
-    Under ``(2,2,2)/TP(2,2,2) -> TP(2,1,1)`` stage 1 must reacquire two layers at
-    once: layer 4 arrives from stage 2 *and* drops to degree 1, while layer 3 never
-    leaves stage 1 yet still has to be re-chunked because the stage lost a TP rank.
-    Both are handled by one reshard (they share the same 2 -> 1 degree pair). The two
-    ranks are the current TP2 shards; afterwards rank 0 must hold the full logical
-    tensors byte for byte equal to the checkpoint anchor, AdamW moments and step
+    prefixes = tuple(f"layers.{layer}." for layer in _MIGRATION_LAYERS)
+    return {
+        name: dim
+        for name, dim in shard_dims(_MIGRATION_LAYERS).items()
+        if name.startswith(prefixes)
+    }
+
+
+def _run_migration(rank, device):
+    """A stage's whole state workload at TP2 -> TP1, over a real collective.
+
+    The two ranks are the current TP2 shards; afterwards rank 0 must hold the full
+    logical tensors byte for byte equal to the checkpoint anchor, AdamW moments and step
     included, and the dropped rank must keep nothing.
     """
     import torch
 
-    from resihp.parallel.pp import plan_migration, reshard_layout
     from resihp.parallel.reshard import reshard_tp_state
 
-    _, placements = plan_migration((2, 2, 2), (2, 2, 2), (2, 1, 1))
-    arriving = next(place for place in placements if place.layer == 4)
-    staying = next(place for place in placements if place.layer == 3)
-    layout = reshard_layout(placements, new_owner=1)
-    # One reshard call handles one degree pair; these two layers share it.
-    assert (arriving.old_degree, arriving.new_degree) == (staying.old_degree, staying.new_degree)
+    layout = _migration_layout()
     anchor = _anchor_state(layout, seed=2024)
 
     local_state = {
         name: {
             "shard_index": rank,
             **{
-                field: _shard_of(anchor[name][field], layout[name], rank, arriving.old_degree).to(device)
+                field: _shard_of(
+                    anchor[name][field], layout[name], rank, _MIGRATION_OLD_DEGREE
+                ).to(device)
                 for field in _MIGRATION_FIELDS
             },
             "step": anchor[name]["step"].to(device),
@@ -353,8 +350,8 @@ def _run_migration(rank, device):
     new_local = reshard_tp_state(
         local_state,
         layout=layout,
-        old_size=arriving.old_degree,
-        new_size=arriving.new_degree,
+        old_size=_MIGRATION_OLD_DEGREE,
+        new_size=_MIGRATION_NEW_DEGREE,
         new_rank=0 if rank == 0 else None,
         checkpoint=anchor,
     )
@@ -371,19 +368,18 @@ def _run_migration(rank, device):
         "match": bool(matched),
         "layers": sorted({name.split(".")[1] for name in new_local}),
         "names": sorted(new_local),
-        "arriving_moved": arriving.moved and arriving.resharded,
-        "staying_resharded_only": not staying.moved and staying.resharded,
+        "fields": sorted(next(iter(new_local.values()))),
         "local_was_device": local_was_device,
     }
 
 
 def _assert_migration(results):
     receiver, donor = results
-    assert receiver["arriving_moved"], receiver  # layer 4 both moved and resharded
-    assert receiver["staying_resharded_only"], receiver  # layer 3 stayed but reshards
     assert receiver["match"], receiver  # every field equals the checkpoint anchor
     assert receiver["layers"] == ["3", "4"], receiver
     assert len(receiver["names"]) == 20, receiver  # both layers whole, 10 tensors each
+    # Nothing carries a gradient across the boundary -- it is not persistent state.
+    assert receiver["fields"] == ["exp_avg", "exp_avg_sq", "param", "step"], receiver
     assert donor["dropped"] and donor["empty"], donor
 
 

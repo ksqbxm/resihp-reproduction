@@ -275,6 +275,7 @@ def _commit_worker(rank, world_size, result_dir, port):
             sequence_length=SEQLEN,
             tp_group=control.tp_group,
             executor_group=control.executor_group,
+            boundary_groups=control.boundary_groups,
         ),
         checkpoint_path=path,
     )

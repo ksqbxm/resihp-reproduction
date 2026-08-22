@@ -50,7 +50,6 @@ checkpoint ones, where no arithmetic is involved.
 
 import faulthandler
 import json
-import math
 import os
 import socket
 import time
@@ -66,18 +65,18 @@ from torch.nn import functional as F
 from resihp.checkpoint import load_anchor
 from resihp.config import TrainConfig
 from resihp.control import ControlPlane
-from resihp.model import ReferenceTransformer
-from resihp.parallel.reshard import local_slice
 from resihp.plan import build_plan
-from resihp.recovery import initial_run, stage_layout, stage_of
-from resihp.reference import ADAM_BETAS, ADAM_EPS, LEARNING_RATE, WEIGHT_DECAY, _token_stream
+from resihp.planner.pp import peak_in_flight
+from resihp.recovery import initial_run, stage_of
+from resihp import verify
 
 
 VOCAB = 32
 SEQLEN = 8
 #: Reassociation band: real TP all-reduce plus micro-batch splitting (T10/T12/T13).
-RTOL = 1e-4
-ATOL = 1e-5
+#: Taken from ``resihp.verify``, the one place the numerical contract is defined.
+RTOL = verify.RTOL
+ATOL = verify.ATOL
 
 #: Six layers so one event both halves a degree and moves a layer across a boundary.
 CONFIG = TrainConfig(
@@ -145,51 +144,17 @@ def _free_port() -> int:
 
 def _batch(index, device):
     """Iteration ``index``'s fixed token batch -- the same stream the run consumes."""
-    stream = _token_stream(VOCAB, SEQLEN, CONFIG.batch_size, CONFIG.iterations, CONFIG.seed)
-    return stream[index].to(device)
-
-
-def _adamw(params):
-    return torch.optim.AdamW(
-        params, lr=LEARNING_RATE, betas=ADAM_BETAS, eps=ADAM_EPS, weight_decay=WEIGHT_DECAY
-    )
+    return verify.batch(CONFIG, index, vocab_size=VOCAB, sequence_length=SEQLEN, device=device)
 
 
 # --- reference anchors ------------------------------------------------------------
 
 
-def _denominator(state):
-    """AdamW's own ``sqrt(v / bias_correction2) + eps`` for the step it just took."""
-    bias_correction2 = 1 - ADAM_BETAS[1] ** float(state["step"])
-    return state["exp_avg_sq"].sqrt() / math.sqrt(bias_correction2) + ADAM_EPS
-
-
-def _step_record(model, optimizer, tokens):
-    """One full-batch reference iteration: its gradients, new weights, new moments."""
-    logits = model(tokens)
-    loss = F.cross_entropy(logits[:, :-1].reshape(-1, VOCAB), tokens[:, 1:].reshape(-1))
-    optimizer.zero_grad()
-    loss.backward()
-    named = model.logical_state_dict()
-    grads = {name: param.grad.detach().clone() for name, param in named.items()}
-    optimizer.step()
-    return {
-        "loss": float(loss.detach()),
-        "grads": grads,
-        "params": {name: param.detach().clone() for name, param in named.items()},
-        # Read back from the optimizer that just used it: this is the divisor that
-        # turns a gradient difference into a parameter difference (``_compare_shards``).
-        "denoms": {name: _denominator(optimizer.state[param]) for name, param in named.items()},
-    }
-
-
 def _reference_steps(device, count):
     """The no-failure reference: ``count`` iterations from the fixed initialization."""
-    torch.manual_seed(CONFIG.seed)
-    model = ReferenceTransformer(CONFIG, vocab_size=VOCAB, sequence_length=SEQLEN).to(device)
-    model.train()
-    optimizer = _adamw(model.parameters())
-    return [_step_record(model, optimizer, _batch(index, device)) for index in range(count)]
+    return verify.reference_steps(
+        CONFIG, vocab_size=VOCAB, sequence_length=SEQLEN, count=count, device=device
+    )
 
 
 def _steps_from_anchor(anchor, device, *, start, count):
@@ -197,135 +162,30 @@ def _steps_from_anchor(anchor, device, *, start, count):
 
     The baseline is *not* an uninterrupted run from iteration 0 but "the same
     checkpoint + the new topology + the new configuration's actual batch + the same
-    seed" -- the checkpoint's full logical parameters and AdamW moments, stepped on
-    the batches the resumed run consumes from cursor ``start``.
+    seed" -- which is what :func:`resihp.verify.steps_from_anchor` builds.
     """
-    model = ReferenceTransformer(CONFIG, vocab_size=VOCAB, sequence_length=SEQLEN).to(device)
-    model.train()
-    named = model.logical_state_dict()
-    with torch.no_grad():
-        for name, param in named.items():
-            param.copy_(anchor[name]["param"].to(device))
-    optimizer = _adamw(model.parameters())
-    optimizer.state.clear()
-    for name, fields in anchor.items():
-        if "exp_avg" not in fields:
-            continue
-        optimizer.state[named[name]] = {
-            "exp_avg": fields["exp_avg"].to(device).clone(),
-            "exp_avg_sq": fields["exp_avg_sq"].to(device).clone(),
-            "step": fields["step"].clone(),  # AdamW keeps its step count on the CPU
-        }
-    return [
-        _step_record(model, optimizer, _batch(start + offset, device)) for offset in range(count)
-    ]
+    return verify.steps_from_anchor(
+        CONFIG,
+        anchor,
+        vocab_size=VOCAB,
+        sequence_length=SEQLEN,
+        start=start,
+        count=count,
+        device=device,
+    )
 
 
 # --- comparisons ------------------------------------------------------------------
 
-
-def _compare_shards(stage, record):
-    """Compare this rank's shards to the reference, sliced by its own TP layout.
-
-    Gradients are compared in the reassociation band directly -- they are what the
-    distributed algorithm is responsible for producing. Parameters cannot be, because
-    AdamW's update is ``lr * m_hat / (sqrt(v_hat) + eps)``: a gradient difference ``d``
-    reaches the parameter scaled by at most ``lr / denom``, which is ~1e-10 where the
-    gradient is healthy and rises to ``lr`` itself where ``sqrt(v_hat)`` has fallen to
-    ``eps`` and the update degenerates into ``lr * sign(g)``. A fixed band on the
-    post-step parameter asserts that AdamW is well conditioned, not that the run is
-    correct, so the allowance carries that factor per element instead.
-
-    It stays tight exactly where the check earns its keep: a moment that did not
-    survive a recovery, a wrong step count, or a parameter the optimizer never touched
-    each move the parameter by order ``lr`` while leaving the gradient -- and therefore
-    the allowance -- where it was.
-    """
-    grad_close = step_close = True
-    max_grad_diff = max_param_diff = 0.0
-    worst_grad = worst_param = None
-    for name, (param, dim) in stage.local_shards().items():
-        if param.grad is None:
-            grad_close = False  # every owned parameter must have taken a gradient
-            continue
-        sliced = (dim, stage.tp_rank, stage.tp_size)
-        want_param = local_slice(record["params"][name], *sliced)
-        want_grad = local_slice(record["grads"][name], *sliced)
-        denom = local_slice(record["denoms"][name], *sliced)
-        grad_diff = (param.grad - want_grad).abs()
-        param_diff = (param.detach() - want_param).abs()
-        # The factor 2 is what makes this an upper bound rather than a first-order
-        # estimate: at ``g ~ 0`` the update is ``lr * sign(g)``, so two runs can differ
-        # by the whole ``2 * lr`` while the linear term alone would allow only ``lr``.
-        allowed = ATOL + RTOL * want_param.abs() + 2 * LEARNING_RATE * grad_diff / denom
-
-        grad_close &= torch.allclose(param.grad, want_grad, rtol=RTOL, atol=ATOL)
-        step_close &= bool((param_diff <= allowed).all())
-        max_grad_diff = max(max_grad_diff, grad_diff.max().item())
-        max_param_diff = max(max_param_diff, param_diff.max().item())
-        element = (name, stage, grad_diff, param_diff, want_grad, denom)
-        if worst_grad is None or grad_diff.max().item() > worst_grad["abs"]:
-            worst_grad = _worst(*element, int(grad_diff.argmax()))
-        excess = (param_diff - allowed).max().item()
-        if worst_param is None or excess > worst_param["excess"]:
-            index = int((param_diff - allowed).argmax())
-            worst_param = dict(_worst(*element, index), excess=excess)
-    return {
-        "grad_close": bool(grad_close),
-        "step_close": bool(step_close),
-        "max_grad_diff": max_grad_diff,
-        "max_param_diff": max_param_diff,
-        "worst_grad": worst_grad,
-        "worst_param": worst_param,
-        "owned": sorted(stage.logical_state_dict()),
-        "tp_size": stage.tp_size,
-        "reference_loss": record["loss"],
-    }
-
-
-def _worst(name, stage, grad_diff, param_diff, want_grad, denom, index):
-    """One element's full numeric story, for a failure message that explains itself."""
-    return {
-        "name": name,
-        "abs": grad_diff.max().item(),
-        "grad_diff_here": grad_diff.flatten()[index].item(),
-        "param_diff_here": param_diff.flatten()[index].item(),
-        "reference_grad_here": want_grad.flatten()[index].abs().item(),
-        "reference_grad_max": want_grad.abs().max().item(),
-        # How far the gradient is off relative to the tensor's own scale, and AdamW's
-        # divisor at this element -- ``eps``-sized means the update is ``lr * sign(g)``.
-        "rel": grad_diff.max().item() / max(want_grad.abs().max().item(), ATOL),
-        "denom_here": denom.flatten()[index].item(),
-        "tp_size": stage.tp_size,
-    }
+#: Principle A lives in one place for the whole project (``resihp.verify``); these are
+#: only local spellings of it, so this gate and the combination / fault-sequence gates
+#: cannot drift into three slightly different contracts.
+_compare_shards = verify.compare_shards
 
 
 def _matches_anchor(run, plan, rank, checkpoint):
     """Principle A's before-resume half: exactly the checkpoint, re-sharded by the plan."""
-    stage = stage_of(plan, rank)
-    if stage is None:
-        return run is None  # a dropped rank must hold no state at all
-    layout = stage_layout(plan, stage)
-    shards = run.stage.local_shards()
-    if set(shards) != set(layout):
-        return False  # the stage holds its plan's names, no more and no fewer
-    anchor, _completed = load_anchor(checkpoint)
-    moments = run.runtime.optimizer.state
-    index = stage.tp_members.index(rank)
-    ok = True
-    for name, dim in layout.items():
-        param = shards[name][0]
-        ok &= torch.equal(
-            param.detach().cpu(), local_slice(anchor[name]["param"], dim, index, stage.tp_degree)
-        )
-        held = moments[param]
-        for field in ("exp_avg", "exp_avg_sq"):
-            ok &= torch.equal(
-                held[field].detach().cpu(),
-                local_slice(anchor[name][field], dim, index, stage.tp_degree),
-            )
-        ok &= torch.equal(held["step"].detach().cpu(), anchor[name]["step"])
-    return bool(ok)
+    return verify.matches_checkpoint(run, plan, rank, checkpoint)
 
 
 # --- the scenario -----------------------------------------------------------------
@@ -375,6 +235,7 @@ def _run_end_to_end(rank, world_size, device, backend, result_dir):
             sequence_length=SEQLEN,
             tp_group=control.tp_group,
             executor_group=control.executor_group,
+            boundary_groups=control.boundary_groups,
             device=device,
         ),
         checkpoint_path=checkpoint,
@@ -407,6 +268,9 @@ def _run_end_to_end(rank, world_size, device, backend, result_dir):
             ]
             record["activation_peak"] = runtime.activation_log.peak
             record["activation_drained"] = runtime.activation_log.live == set()
+            record["stage_index"] = runtime.stage_index
+            record["num_stages"] = runtime.num_stages
+            record["schedule"] = list(runtime.schedule)
             wanted = reference[iteration - base]
             record.update(_compare_shards(control.training_run.stage, wanted))
         iterations.append(record)
@@ -544,7 +408,13 @@ def _assert_micro_batch_stage_executed_once(results, label):
             if not record["trained"]:
                 continue
             assert record["activation_drained"], (label, result["rank"], record["iteration"])
-            assert record["activation_peak"] == len(record["processed"]), (label, record)
+            # 1F1B, not GPipe: the peak is one activation per stage still downstream,
+            # capped by the micro-batches this rank runs -- never one per micro-batch.
+            assert record["activation_peak"] == peak_in_flight(
+                len(record["processed"]),
+                stage_index=record["stage_index"],
+                num_stages=record["num_stages"],
+            ), (label, record)
 
 
 def _assert_failed_ranks_stop_training(results, label):

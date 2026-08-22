@@ -6,7 +6,7 @@
 
 - 每条结论都标出**证据在哪、由谁产生**。凡本机（Windows，**无 torch**，计划硬性禁止安装/升级 torch）
   跑不了的，一律写「待 8 卡目标机执行」，不以「实现看起来对」代替执行结果。
-- 本机可执行部分：`python -m pytest -q` → **82 passed, 12 skipped**。12 项 skip 全部是分布式 / GPU
+- 本机可执行部分：`python -m pytest -q` → **117 passed, 12 skipped**。12 项 skip 全部是分布式 / GPU
   模块在收集阶段整模块 skip（`torch` 不可导入），不是被跳过的断言。
 - 本报告不复述各任务的实现细节，那些在 `docs/PROGRESS.md`；这里只回答「完成标准成立没有、凭什么」。
 
@@ -18,16 +18,31 @@
 torchrun --standalone --nproc_per_node=8 -m resihp.train --config configs/train.json --failures configs/failures.json
 ```
 
-`configs/failures.json` 排的就是两次连续 fail-stop：第 2 轮后 rank 1、第 4 轮后 rank 5，共 6 轮，
-所以最后一次故障之后仍有 2 轮训练。纯 planner 对这套配置给出的计划序列（本机实跑 `build_plan` 核对过）：
+默认配置是 `TP2 × PP2 × DP2 / 6 层 / 8 轮`，故障表排了**五次连续 fail-stop**（每次单 rank，
+`after_iteration` 严格递增、rank 不重复），最后一次之后仍有 2 轮训练。层数取 6 而不是 4 是有原因的：
+4 层时 `repartition_pp` 恰好把原来的层数还给每个 stage，验收就只能看到 TP degree 变化；6 层才让
+**同一个事件既降 TP degree 又把一层搬过 stage 边界**。故障序列也不再是两次就收手——只有把整个
+replica 1 打空，micro-batch 归属才会真的换 replica，这才是**真实 DP reroute**。
 
-| 版本 | 生效轮次 | 失效 rank | active ranks | stages `(replica, stage, degree, members, layers)` |
-|---|---|---|---|---|
-| v0 | 1–2 | — | 0–7 | (0,0,2,(0,1),[0,2)) (0,1,2,(2,3),[2,4)) (1,0,2,(4,5),[0,2)) (1,1,2,(6,7),[2,4)) |
-| v1 | 3–4 | 1 | 0,2,3,4,5,6,7 | (0,0,**1**,(0,),[0,2)) 其余不动 |
-| v2 | 5–6 | 1,5 | 0,2,3,4,6,7 | (1,0,**1**,(4,),[0,2)) 其余不动 |
+纯 planner 对这套配置给出的计划序列（本机实跑 `build_plan` 核对过；`resihp/train.py` 里
+`build_initial_plan` 用同一套入参，所以 digest 逐版相同）：
 
-每个 rank 实际应执行的轮次：rank 1 = `[1,2]`，rank 5 = `[1,2,3,4]`，其余六个 rank = `[1..6]`。
+| 版本 | 生效轮次 | 失效 rank | active ranks | replica 0 stages | replica 1 stages | micro-batch 归属 |
+|---|---|---|---|---|---|---|
+| v0 | 1–2 | — | 0–7 | s0 TP2 (0,1) L[0,1,2] / s1 TP2 (2,3) L[3,4,5] | s0 TP2 (4,5) L[0,1,2] / s1 TP2 (6,7) L[3,4,5] | r0=[0,1] r1=[2,3] |
+| v1 | 3 | 1 | 0,2,3,4,5,6,7 | s0 **TP1** (0,) **L[0,1]** / s1 TP2 (2,3) **L[2,3,4,5]** | 不动 | r0=[0,1] r1=[2,3] |
+| v2 | 4 | 1,4 | 0,2,3,5,6,7 | 不动 | s0 **TP1** (5,) **L[0,1]** / s1 TP2 (6,7) **L[2,3,4,5]** | r0=[0,1] r1=[2,3] |
+| v3 | 5 | 1,4,5 | 0,2,3,6,7 | 不动 | **s0 清空**；s1 TP2 (6,7) **L[0..5]** | r0=[0,1] r1=[2,3] |
+| v4 | 6 | 1,4,5,6 | 0,2,3,7 | 不动 | s1 **TP1** (7,) L[0..5] | r0=[0,1] r1=[2,3] |
+| v5 | 7–8 | 1,4,5,6,7 | 0,2,3 | 不动 | **整个 replica 消失** | **r0=[0,1,2,3]** |
+
+三个维度都真的动了：**TP** 在 v1/v2/v4 各降一次 degree；**PP** 在 v1/v2 搬层、在 v3 清空一个 stage
+并把全部 6 层交给幸存 stage；**DP** 在 v5 把 micro-batch 2、3 重路由到 replica 0。
+`tests/test_acceptance.py::test_the_shipped_schedule_exercises_tp_pp_and_dp` 把这三条写成门禁，
+且不需要 GPU——计划序列是两个配置文件的纯函数。
+
+每个 rank 实际应执行的轮次：rank 1 = `[1,2]`，rank 4 = `[1,2,3]`，rank 5 = `[1,2,3,4]`，
+rank 6 = `[1..5]`，rank 7 = `[1..6]`，rank 0/2/3 = `[1..8]`。
 
 **自动门禁**：`tests/test_acceptance.py::test_torchrun_nccl_acceptance`（需 8 张 GPU，不足即 skip）。
 它用 `sys.executable -m torch.distributed.run`（`torchrun` 控制台脚本就是它的薄包装）在仓库根目录发起
@@ -37,9 +52,9 @@ torchrun --standalone --nproc_per_node=8 -m resihp.train --config configs/train.
 |---|---|
 | 跑完而不是中途一致停止 | 启动器退出码 0；stdout 里没有 `{"stopped": ...}` 行 |
 | 真的在 GPU / NCCL 上 | 每个 rank 报告 `device == "cuda"` 且 `training_backend == "nccl"` |
-| 每次故障恰好一个新计划、各 rank 一致 | 各 rank 的 `plan_versions == [0,1,2]`，且 `plan_digests` 八个 rank 逐版相等，**并等于纯 planner 对同一配置算出的 digest** |
-| 两次 fail-stop 都真的生效 | 各 rank 报告的 `failed_ranks == [1,5]` |
-| 失效 rank 永久退出、幸存者继续训练 | 各 rank **实际执行**的轮次列表逐 rank 等于上表的 active 集合——rank 1 停在第 2 轮、rank 5 停在第 4 轮、其余跑满 6 轮 |
+| 每次故障恰好一个新计划、各 rank 一致 | 各 rank 的 `plan_versions == [0..5]`，且 `plan_digests` 八个 rank 逐版相等，**并等于纯 planner 对同一配置算出的 digest** |
+| 五次 fail-stop 都真的生效 | 各 rank 报告的 `failed_ranks == [1,4,5,6,7]` |
+| 失效 rank 永久退出、幸存者继续训练 | 各 rank **实际执行**的轮次列表逐 rank 等于上表的 active 集合——每个失效 rank 停在自己那次事件，rank 0/2/3 跑满 8 轮 |
 | 安全点原子提交了 checkpoint | 运行前先清掉 `checkpoint.pt`，跑完后它存在、且没有 `checkpoint.pt.tmp` 残留 |
 
 为让这条命令**从外部可验证**，`resihp/train.py` 在跑完时每个 rank 打印一行
@@ -103,10 +118,10 @@ checkpoint、残留 `.tmp`、以及配置层面的「最后一次故障落在最
 
 | 完成标准（计划六） | 结论 | 依据 |
 |---|---|---|
-| A–F 全部测试通过 | **部分待执行**：无 torch 的 A/F 与 B 的纯函数部分本机全绿；分布式与 GPU 门禁见第 3 节状态列 | `python -m pytest -q` = 82 passed / 12 skipped |
+| A–F 全部测试通过 | **部分待执行**：无 torch 的 A/F 与 B 的纯函数部分本机全绿；分布式与 GPU 门禁见第 3 节状态列 | `python -m pytest -q` = 117 passed / 12 skipped |
 | GPU/NCCL 下 ≥2 次连续 fail-stop 并继续 | **待目标机执行** | 第 1 节：命令、期望计划序列、门禁与 18 项变异核对均已就位 |
 | TP/PP/DP 均真实执行（非仅元数据） | 成立（凭已确认的目标机结果） | T16 两项在目标机全过：真实 TP all-reduce 分片前反向、1F1B 层迁移、跨 replica activation/gradient；T15 的七项组合明确要求「执行真实前反向」 |
-| 参数 / 梯度 / AdamW / 迭代号 / 数据游标无丢失 | 成立（同上） | 恢复后各分片与 anchor 逐张量 `torch.equal`（含 `exp_avg`/`exp_avg_sq`/`step`）；cursor 逐轮等于 `iteration-1`，恢复后等于 checkpoint 的 `completed_steps` |
+| 参数 / AdamW / 迭代号 / 数据游标无丢失 | 成立（同上） | 恢复后各分片与 anchor 逐张量 `torch.equal`（含 `exp_avg`/`exp_avg_sq`/`step`）；cursor 逐轮等于 `iteration-1`，恢复后等于 checkpoint 的 `completed_steps`。**`grad` 不在其中**：安全点只出现在 AdamW step 之后、无跨安全点梯度累积，下一轮 `zero_grad` 后重算（计划文档「二·补」） |
 | 恢复前精确等于 checkpoint、恢复后与新配置参考一致 | 成立（同上，NCCL 侧 T17 待复跑） | 原则 A 双口径：前半段 `torch.equal`，后半段对「同起点 + 新拓扑 + 新 batch + 同种子」参考 `allclose`（NCCL 上梯度差已降到 ~1e-08–3e-08） |
 | 资源不足时全体一致退出、最后 checkpoint 完整 | 成立（Gloo 已确认，NCCL 待复跑） | 六条停止条件各一项门禁；随机序列一路注入到资源耗尽后以 `no_executable_pp` 全体一致退出，故障前 checkpoint 仍可重载 |
 | 代码中不存在 Detector / pᵢ / 速度分支 / standby / Algorithm 1 / 旧入口 / 前向兼容 | **成立，本机已执行** | 第 2 节，7 类禁用项命中数全为 0，且匹配式的检出力经变异核对 |
@@ -127,9 +142,10 @@ torchrun --standalone --nproc_per_node=8 -m resihp.train --config configs/train.
 python -m pytest -q
 ```
 
-第二条是人工验收：屏幕上应出现 8 行 `{"acceptance": ...}`，其中 `rank 1` 的 `trained_iterations` 为
-`[1, 2]`、`rank 5` 为 `[1, 2, 3, 4]`、其余为 `[1, 2, 3, 4, 5, 6]`，八行的 `plan_digests` 完全相同，
-且不出现 `{"stopped": ...}`。第一条门禁检查的就是这些，人工跑一遍是为了留下可读的验收记录。
+第二条是人工验收：屏幕上应出现 8 行 `{"acceptance": ...}`，其中 `trained_iterations` 为
+rank 1 `[1,2]`、rank 4 `[1,2,3]`、rank 5 `[1,2,3,4]`、rank 6 `[1..5]`、rank 7 `[1..6]`、
+rank 0/2/3 `[1..8]`，八行的 `plan_digests` 完全相同（各 6 项），且不出现 `{"stopped": ...}`。
+第一条门禁检查的就是这些，人工跑一遍是为了留下可读的验收记录。
 
 全部通过后，把本报告第 1 节与第 4 节的「待目标机执行」改为「已验证」，并在 `docs/PROGRESS.md` 记录结果。
 

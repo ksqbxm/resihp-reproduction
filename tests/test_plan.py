@@ -11,6 +11,7 @@ from resihp.plan import (
     InfeasiblePlan,
     PlanInvariantError,
     assert_invariants,
+    boundary_pairs,
     build_plan,
 )
 
@@ -217,14 +218,35 @@ def test_tp_memory_infeasibility_is_reported_at_the_tp_stage():
 
 
 def test_tp_change_emits_a_donor_target_reshard_state_route():
+    """A route carries both layouts, so recovery can execute it without re-deriving one."""
     plan = build_plan(CONFIG, step=2, version=2, failed_ranks=(1,))
 
     route = next(r for r in plan.state_routes if r.replica_id == 0 and r.layer == 0)
-    assert route.target_ranks == (0,)
+    assert route.boundary == ""
+    assert route.target_ranks == (0,) and route.target_degree == 1
     assert route.donor_kind == "peer_replica"
-    assert route.donor_ranks == (4, 5)
+    assert route.donor_ranks == (4, 5) and route.donor_degree == 2
     assert route.reshard == "gather_reshard"
-    assert set(route.states) == {"param", "grad", "exp_avg", "exp_avg_sq", "step"}
+    # Gradients are not persistent state: they are recomputed by the next iteration.
+    assert set(route.states) == {"param", "exp_avg", "exp_avg_sq", "step"}
+    assert "grad" not in route.states
+
+
+def test_boundary_tensors_are_routed_when_their_owning_stage_changes():
+    """The embedding and LM head follow the first / last executable stage (plan 3.4).
+
+    They belong to no layer, so a per-layer route table cannot express them -- and a
+    recovery that never fetched them would leave a resharded boundary stage holding the
+    old layout.
+    """
+    plan = build_plan(CONFIG, step=2, version=2, failed_ranks=(1,))
+
+    boundaries = {r.boundary: r for r in plan.state_routes if r.replica_id == 0 and r.layer is None}
+    # Replica 0's stage 0 halved to TP1, so its embedding shard must be rebuilt.
+    assert boundaries["embedding"].target_ranks == (0,)
+    assert boundaries["embedding"].donor_kind == "peer_replica"
+    # Its last stage was untouched, so the head does not move at all.
+    assert "head" not in boundaries
 
 
 def test_consecutive_failures_route_from_the_previous_plan_not_the_initial_config():
@@ -233,13 +255,17 @@ def test_consecutive_failures_route_from_the_previous_plan_not_the_initial_confi
     third = build_plan(CONFIG, step=4, version=3, failed_ranks=(1, 3), previous=second)
 
     # Layers 0-1 have stayed on rank 0 since the second plan, so nothing routes
-    # them; only the freshly degraded stage (layers 2-3) migrates.
-    assert {r.layer for r in third.state_routes if r.replica_id == 0} == {2, 3}
+    # them; only the freshly degraded stage (layers 2-3, and the LM head it owns)
+    # migrates.
+    groups = {(r.layer, r.boundary) for r in third.state_routes if r.replica_id == 0}
+    assert groups == {(2, ""), (3, ""), (None, "head")}
 
     # Rebuilding the same failure from the initial config would wrongly claim the
-    # already-settled layers 0-1 migrate again.
+    # already-settled layers 0-1 -- and the embedding with them -- migrate again.
     from_initial = build_plan(CONFIG, step=4, version=3, failed_ranks=(1, 3))
-    assert {r.layer for r in from_initial.state_routes if r.replica_id == 0} == {0, 1, 2, 3}
+    assert {(r.layer, r.boundary) for r in from_initial.state_routes if r.replica_id == 0} == {
+        (0, ""), (1, ""), (2, ""), (3, ""), (None, "embedding"), (None, "head"),
+    }
 
 
 def test_cross_replica_heterogeneous_stages_pass_the_invariants():
@@ -320,3 +346,50 @@ def test_out_of_range_and_duplicate_failures_are_rejected():
 
     with pytest.raises(ValueError, match="duplicate"):
         build_plan(CONFIG, step=0, version=1, failed_ranks=(1, 1))
+
+
+def test_an_indivisible_vocabulary_stops_the_plan_instead_of_crashing_the_runtime():
+    """Every static constraint that would make the layout unbuildable is a plan reason.
+
+    ``TensorParallelStage`` refuses a TP degree that does not divide the vocabulary, so
+    a planner blind to it would publish a plan the runtime cannot construct. With
+    ``vocab_size`` passed -- as the launched entrypoint always does -- no such degree is
+    ever selected, and when none survives the plan is infeasible with a root cause.
+    """
+    # 6 is divisible by 2 but not by 4: TP2 is buildable, TP4 is not.
+    config = replace(CONFIG, tp=4, pp=1, dp=1)
+    plan = build_plan(config, step=0, version=0, vocab_size=6, sequence_length=SEQLEN)
+    assert [s.tp_degree for s in plan.stages] == [2]
+
+    # Without the vocabulary the planner would have taken the largest degree the
+    # dimensions allow -- 4 -- which ``TensorParallelStage`` then refuses to build.
+    # That difference is the whole point of the gate.
+    blind = build_plan(config, step=0, version=0, sequence_length=SEQLEN)
+    assert [s.tp_degree for s in blind.stages] == [4]
+
+    # Degree 1 divides every vocabulary, so a plan is never infeasible on vocabulary
+    # alone; the structured ``no_feasible_tp`` reason belongs to a stage whose ``k_min``
+    # rules degree 1 out as well, which ``test_planner_tp.py`` covers directly.
+    odd = build_plan(config, step=0, version=0, vocab_size=7, sequence_length=SEQLEN)
+    assert [s.tp_degree for s in odd.stages] == [1]
+
+
+def test_boundary_pairs_name_every_pipeline_hop_the_assignment_creates():
+    """The two-rank groups the 1F1B boundary transfers ride on, read from the plan."""
+    plan = build_plan(CONFIG, step=0, version=0)
+    # TP2 x PP2 x DP2: one hop per replica, between the two stages' leaders.
+    assert boundary_pairs(plan) == ((0, 2), (4, 6))
+
+    # Rank 1 dies: replica 0's stage 0 keeps leader 0, so its hop is unchanged.
+    degraded = build_plan(CONFIG, step=1, version=1, failed_ranks=(1,), previous=plan)
+    assert boundary_pairs(degraded) == ((0, 2), (4, 6))
+
+    # Rank 4 dies too: replica 1's stage 0 leader becomes rank 5, and the hop follows.
+    moved = build_plan(CONFIG, step=2, version=2, failed_ranks=(1, 4), previous=degraded)
+    assert boundary_pairs(moved) == ((0, 2), (5, 6))
+
+
+def test_a_single_stage_replica_has_no_pipeline_hop():
+    """Nothing to transfer when a replica runs one stage, so no boundary group exists."""
+    config = replace(CONFIG, pp=1, dp=2, tp=2)
+    assert boundary_pairs(build_plan(config, step=0, version=0)) == ()

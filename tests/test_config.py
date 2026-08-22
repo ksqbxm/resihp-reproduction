@@ -89,3 +89,48 @@ def test_forbidden_failure_field_is_rejected_by_name(tmp_path, extra_field):
 
     with pytest.raises(ConfigError, match=extra_field):
         load_config(config_path, failures_path)
+
+
+# --- the optional analytical memory budget ----------------------------------------
+
+
+def test_memory_budget_defaults_to_no_artificial_limit(tmp_path):
+    """Absent means "no ceiling", which is what the shipped default config says."""
+    loaded = load_config(*write_inputs(tmp_path))
+
+    assert loaded.train.memory_budget_bytes is None
+
+
+def test_explicit_null_memory_budget_means_no_limit(tmp_path):
+    config = dict(VALID_CONFIG, memory_budget_bytes=None)
+    loaded = load_config(*write_inputs(tmp_path, config=config))
+
+    assert loaded.train.memory_budget_bytes is None
+
+
+def test_positive_memory_budget_turns_the_feasibility_gate_on(tmp_path):
+    config = dict(VALID_CONFIG, memory_budget_bytes=64 * 1024 * 1024)
+    loaded = load_config(*write_inputs(tmp_path, config=config))
+
+    assert loaded.train.memory_budget_bytes == 64 * 1024 * 1024
+
+
+@pytest.mark.parametrize("value", [0, -1, "8GB", 1.5, True])
+def test_a_malformed_memory_budget_is_rejected_rather_than_read_as_unlimited(tmp_path, value):
+    """A typo must not silently disable the gate it was meant to switch on."""
+    config = dict(VALID_CONFIG, memory_budget_bytes=value)
+    with pytest.raises(ConfigError, match="memory_budget_bytes"):
+        load_config(*write_inputs(tmp_path, config=config))
+
+
+def test_the_shipped_default_config_loads_and_leaves_the_budget_unset():
+    """The acceptance command's own inputs, parsed by the same validator."""
+    loaded = load_config(Path("configs/train.json"), Path("configs/failures.json"))
+
+    assert loaded.train.memory_budget_bytes is None
+    assert loaded.train.num_layers == 6  # enough layers for a repartition to move one
+    events = [(event.after_iteration, event.failed_rank) for event in loaded.failures]
+    assert events == [(2, 1), (3, 4), (4, 5), (5, 6), (6, 7)]
+    assert [event[0] for event in events] == sorted({event[0] for event in events})
+    assert len({event[1] for event in events}) == len(events)  # never the same rank twice
+    assert max(event[0] for event in events) < loaded.train.iterations  # training continues after

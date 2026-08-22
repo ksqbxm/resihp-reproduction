@@ -9,8 +9,15 @@ T10 TP gates: CPU/**Gloo** (always available where torch is installed) and
 GPU/**NCCL** (real device shards and collectives, skipped when there are fewer GPUs
 than the case needs). They cover the real ``all_gather_object`` reshard for a
 ``TP2->TP1`` degree drop and a ``{0,1}->{0,2}`` member swap with no shard lost, and
-the heterogeneous boundary whose backward gradient must equal the single-process
-reference element for element (no double counting, nothing dropped).
+the heterogeneous TP boundary -- a TP1 stage feeding a TP2 stage -- executed by the
+production runtime, whose backward gradient must match the single-process reference
+(no double counting, nothing dropped).
+
+There is exactly one heterogeneous-boundary implementation in the project, the
+leader-to-leader hop plus TP broadcast inside
+:class:`resihp.parallel.pp.PipelineRuntime`, and this gate drives that one. Nothing
+here reshards a ``grad``: gradients are not persistent state, so they are in no
+checkpoint and no transfer (plan principle A).
 """
 
 import importlib.util
@@ -134,11 +141,12 @@ def _layout_worker(rank, port):
 # --- distributed reshard: logic shared by Gloo and NCCL ---------------------------
 
 _LAYOUT = shard_dims([0, 1])
-_FIELDS = ("param", "grad", "exp_avg", "exp_avg_sq")
+#: Persistent per-parameter state only -- see the module docstring on ``grad``.
+_FIELDS = ("param", "exp_avg", "exp_avg_sq")
 
 
 def _full_state(seed):
-    """A deterministic full logical state: every tensor with all four fields + step."""
+    """A deterministic full logical state: every tensor with its moments and step."""
     import torch
 
     generator = torch.Generator().manual_seed(seed)
@@ -156,7 +164,6 @@ def _full_state(seed):
         base = rand(*shapes[name])
         full[name] = {
             "param": base,
-            "grad": base * 2.0,
             "exp_avg": base * 0.5,
             "exp_avg_sq": base.abs() + 1.0,
             "step": torch.tensor(3.0),
@@ -221,46 +228,137 @@ def _run_reshard(rank, world_size, kind, device):
     return {"dropped": False, "match": bool(ok), "max_diff": max_diff, "local_was_device": local_was_device}
 
 
-def _run_boundary(rank, device):
-    """Upstream TP1 (rank 0) -> downstream TP2 (ranks 0,1): bridge one activation.
+BOUNDARY_CONFIG_KWARGS = dict(
+    model_dim=16,
+    num_layers=4,
+    num_heads=4,
+    batch_size=8,
+    micro_batch_size=2,
+    seed=1234,
+    tp=2,
+    pp=2,
+    dp=1,
+    iterations=1,
+)
+BOUNDARY_VOCAB = 32
+BOUNDARY_SEQLEN = 8
+BOUNDARY_MICRO = 4
+#: Reassociation band: real TP all-reduce plus micro-batch splitting (T10/T12).
+RTOL = 1e-4
+ATOL = 1e-5
 
-    Downstream degree (2) exceeds upstream (1), so the downstream grad is replicated
-    on both ranks; the bridge must return a *single* copy to the upstream rank, not
-    the sum -- rank 0's activation gradient must equal the single-process reference (a
-    naive all-reduce would double it). rank 1 is downstream-only and must receive the
-    real activation on the forward, so its loss equals the reference. Two ranks, so it
-    runs on a 2-GPU box.
+
+def _run_boundary(rank, device):
+    """Upstream TP1 (rank 0) -> downstream TP2 (ranks 1, 2), through the real runtime.
+
+    The two stages run at *different* TP degrees, which is the case plan 3.3 singles
+    out. The activation is replicated inside each stage's TP group, so the boundary
+    must move exactly one authoritative copy between the two stage leaders and let the
+    receiving group broadcast it: a per-rank sum would double the gradient the upstream
+    stage sees (by the downstream degree), and a single receiving rank would starve its
+    peer. Both failures show up as a gradient that no longer matches the single-process
+    reference, which is what this asserts.
+
+    This drives :class:`resihp.parallel.pp.PipelineRuntime` -- the project's only
+    heterogeneous-boundary implementation and the one the control plane runs. Three
+    ranks, so it runs on a 3-GPU box.
     """
     import torch
+    import torch.distributed as dist
+    from torch.nn import functional as F
 
-    from resihp.parallel.reshard import cross_tp_boundary
+    from resihp.config import TrainConfig
+    from resihp.model import ReferenceTransformer
+    from resihp.parallel.pp import PipelineRuntime
+    from resihp.parallel.reshard import shard_logical_state
+    from resihp.parallel.tp import TensorParallelStage
+    from resihp.planner.dp import DPAssignment, DPPlacement
+    from resihp.planner.pp import balanced_layers
+    from resihp.reference import ADAM_BETAS, ADAM_EPS, LEARNING_RATE, WEIGHT_DECAY
 
-    torch.manual_seed(0)
-    inp = torch.rand(2, 4, device=device)
-    w1 = torch.rand(4, 4, device=device)
-    w2 = torch.rand(4, 4, device=device)
+    config = TrainConfig(**BOUNDARY_CONFIG_KWARGS)
+    torch.manual_seed(config.seed)
+    reference = ReferenceTransformer(
+        config, vocab_size=BOUNDARY_VOCAB, sequence_length=BOUNDARY_SEQLEN
+    )
+    source = {name: p.detach().clone() for name, p in reference.logical_state_dict().items()}
 
-    # Reference (identical on every rank): full pipeline, single copy of the grad.
-    x_ref = (inp @ w1).requires_grad_(True)
-    (x_ref @ w2).sum().backward()
-    grad_ref = x_ref.grad.detach().clone()
-    reference_loss = float(((inp @ w1) @ w2).sum())
+    # Stage 0 is TP1 on rank 0; stage 1 is TP2 on ranks 1 and 2 -- a heterogeneous
+    # boundary. Every rank creates every group in the same order.
+    tp_groups = [dist.new_group([0]), dist.new_group([1, 2])]
+    stage_id = 0 if rank == 0 else 1
+    tp_group = tp_groups[stage_id]
+    executors = ((0,), (1, 2))
+    hop = dist.new_group([0, 1])  # the two stage leaders
 
-    if rank == 0:  # upstream: authoritative real activation for the forward
-        x = (inp @ w1).detach().clone().requires_grad_(True)
-    else:  # downstream only: placeholder, receives the real activation via the bridge
-        x = torch.zeros(2, 4, device=device, requires_grad=True)
-    x.retain_grad()
+    layers = balanced_layers(config.num_layers, 2)[stage_id]
+    stage = TensorParallelStage(
+        config,
+        vocab_size=BOUNDARY_VOCAB,
+        sequence_length=BOUNDARY_SEQLEN,
+        layer_ids=layers,
+        is_first=stage_id == 0,
+        is_last=stage_id == 1,
+        local_state=shard_logical_state(
+            source,
+            layout=shard_dims(layers),
+            tp_rank=dist.get_rank(tp_group),
+            tp_size=dist.get_world_size(tp_group),
+        ),
+        group=tp_group,
+    ).to(device)
+    stage.train()
 
-    bridged = cross_tp_boundary(x, upstream_leader=0, downstream_leader=0)
-    loss = (bridged @ w2).sum()  # both ranks are downstream
-    loss.backward()
+    generator = torch.Generator().manual_seed(7)
+    tokens = torch.randint(
+        0, BOUNDARY_VOCAB, (config.batch_size, BOUNDARY_SEQLEN), generator=generator
+    ).to(device)
 
+    reference = reference.to(device).train()
+    ref_opt = torch.optim.AdamW(
+        reference.parameters(),
+        lr=LEARNING_RATE,
+        betas=ADAM_BETAS,
+        eps=ADAM_EPS,
+        weight_decay=WEIGHT_DECAY,
+    )
+    logits = reference(tokens)
+    ref_loss = F.cross_entropy(
+        logits[:, :-1].reshape(-1, BOUNDARY_VOCAB), tokens[:, 1:].reshape(-1)
+    )
+    ref_opt.zero_grad()
+    ref_loss.backward()
+    ref_grads = {n: p.grad.detach().clone() for n, p in reference.logical_state_dict().items()}
+
+    assignment = DPAssignment(
+        step=0,
+        failure_signature=(),
+        placements=tuple(
+            DPPlacement(micro_batch=micro, stage_id=sid, replica_id=0, executor_ranks=executors[sid])
+            for micro in range(BOUNDARY_MICRO)
+            for sid in (0, 1)
+        ),
+    )
+    runtime = PipelineRuntime(
+        stage, replica_id=0, assignment=assignment, boundary_groups={(0, 1): hop}
+    )
+    loss = runtime.train_step(tokens)
+
+    close = True
+    max_grad_diff = 0.0
+    for name, (param, dim) in stage.local_shards().items():
+        want = local_slice(ref_grads[name], dim, stage.tp_rank, stage.tp_size)
+        close &= torch.allclose(param.grad, want, rtol=RTOL, atol=ATOL)
+        max_grad_diff = max(max_grad_diff, (param.grad - want).abs().max().item())
     return {
-        "grad_matches_reference": bool(torch.equal(x.grad, grad_ref)) if rank == 0 else None,
-        "loss": float(loss.detach()),
-        "reference_loss": reference_loss,
-        "is_cuda": bool(x.is_cuda),
+        "stage_id": stage_id,
+        "degree": stage.tp_size,
+        "grad_matches_reference": bool(close),
+        "max_grad_diff": max_grad_diff,
+        "loss": loss,
+        "reference_loss": float(ref_loss.detach()),
+        "schedule": list(runtime.schedule),
+        "is_cuda": bool(next(stage.parameters()).is_cuda),
     }
 
 
@@ -349,10 +447,15 @@ def _assert_replace(results):
 
 
 def _assert_boundary(results):
-    r0, r1 = results
-    assert r0["grad_matches_reference"], r0  # one grad copy returned, not doubled
-    assert abs(r0["loss"] - r0["reference_loss"]) < 1e-6, r0
-    assert abs(r1["loss"] - r1["reference_loss"]) < 1e-6, r1  # got real activation forward
+    upstream, *downstream = results
+    assert [r["degree"] for r in results] == [1, 2, 2], results  # genuinely heterogeneous
+    for result in results:
+        # A doubled boundary gradient (the naive all-reduce) is ~2x off, far outside
+        # the reassociation band; a dropped one leaves the upstream stage at zero.
+        assert result["grad_matches_reference"], result
+    assert upstream["loss"] is None, upstream  # only the last stage produces the loss
+    for result in downstream:
+        assert abs(result["loss"] - result["reference_loss"]) < 1e-4, result
 
 
 # --- Gloo gates (always run where torch is installed) -----------------------------
@@ -378,8 +481,8 @@ def test_reshard_member_replacement_gloo(tmp_path):
 def test_heterogeneous_boundary_gloo(tmp_path):
     import torch.multiprocessing as mp
 
-    mp.spawn(_gloo_boundary_worker, args=(2, str(tmp_path), _free_port()), nprocs=2, join=True)
-    _assert_boundary(_results(tmp_path, 2))
+    mp.spawn(_gloo_boundary_worker, args=(3, str(tmp_path), _free_port()), nprocs=3, join=True)
+    _assert_boundary(_results(tmp_path, 3))
 
 
 # --- NCCL gates (real GPU device shards + collectives; skip without enough GPUs) --
@@ -411,9 +514,9 @@ def test_reshard_member_replacement_cuda_nccl(tmp_path):
 def test_heterogeneous_boundary_cuda_nccl(tmp_path):
     import torch.multiprocessing as mp
 
-    _skip_if_few_gpus(2)
-    mp.spawn(_nccl_boundary_worker, args=(2, str(tmp_path), _free_port()), nprocs=2, join=True)
-    results = _results(tmp_path, 2)
+    _skip_if_few_gpus(3)
+    mp.spawn(_nccl_boundary_worker, args=(3, str(tmp_path), _free_port()), nprocs=3, join=True)
+    results = _results(tmp_path, 3)
     for result in results:
         assert result["is_cuda"], result
     _assert_boundary(results)
