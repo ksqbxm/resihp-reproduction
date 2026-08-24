@@ -11,7 +11,7 @@ from resihp.plan import (
     InfeasiblePlan,
     PlanInvariantError,
     assert_invariants,
-    boundary_pairs,
+    boundary_hops,
     build_plan,
 )
 
@@ -465,22 +465,22 @@ def test_an_indivisible_vocabulary_stops_the_plan_instead_of_crashing_the_runtim
     assert [s.tp_degree for s in odd.stages] == [1]
 
 
-def test_boundary_pairs_name_every_pipeline_hop_the_assignment_creates():
-    """The two-rank groups the 1F1B boundary transfers ride on, read from the plan."""
+def test_boundary_hops_name_every_pipeline_hop_the_assignment_creates():
+    """The union groups the scatter/gather boundary transfers ride on, read from plan."""
     plan = build_plan(CONFIG, step=0, version=0)
-    # TP2 x PP2 x DP2: one hop per replica, between the two stages' leaders.
-    assert boundary_pairs(plan) == ((0, 2), (4, 6))
+    # TP2 x PP2 x DP2: one hop per replica, the union of both stages' full TP members.
+    assert boundary_hops(plan) == ((0, 1, 2, 3), (4, 5, 6, 7))
 
-    # Rank 1 dies: replica 0's stage 0 keeps leader 0, so its hop is unchanged.
+    # Rank 1 dies: replica 0's stage 0 drops to TP1 on rank 0, so its union shrinks.
     degraded = build_plan(CONFIG, step=1, version=1, failed_ranks=(1,), previous=plan)
-    assert boundary_pairs(degraded) == ((0, 2), (4, 6))
+    assert boundary_hops(degraded) == ((0, 2, 3), (4, 5, 6, 7))
 
-    # Rank 4 dies too: replica 1's stage 0 leader becomes rank 5, and the hop follows.
+    # Rank 4 dies too: replica 1's stage 0 drops to TP1 on rank 5, union follows.
     moved = build_plan(CONFIG, step=2, version=2, failed_ranks=(1, 4), previous=degraded)
-    assert boundary_pairs(moved) == ((0, 2), (5, 6))
+    assert boundary_hops(moved) == ((0, 2, 3), (5, 6, 7))
 
 
 def test_a_single_stage_replica_has_no_pipeline_hop():
     """Nothing to transfer when a replica runs one stage, so no boundary group exists."""
     config = replace(CONFIG, pp=1, dp=2, tp=2)
-    assert boundary_pairs(build_plan(config, step=0, version=0)) == ()
+    assert boundary_hops(build_plan(config, step=0, version=0)) == ()

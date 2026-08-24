@@ -8,8 +8,9 @@ Two process groups exist at all times:
   the recovery gather -- never deadlock.
 * the **training groups** -- built from the current
   :class:`~resihp.plan.ExecutionPlan` (NCCL on GPU, Gloo on CPU): one TP subgroup per
-  active stage, which a stage's sharded execution rides on; one two-rank subgroup per
-  pipeline hop the assignment creates, which the 1F1B boundary transfers ride on; and
+  active stage, which a stage's sharded execution rides on; one union subgroup per
+  pipeline hop the assignment creates, which the scatter/gather boundary transfers ride
+  on; and
   one group over every rank the plan places, which the DP gradient combine rides on.
   All are torn down and rebuilt, in unison across every process, on each fail-stop.
 
@@ -33,7 +34,7 @@ caller can exit normally with the root cause in hand.
 from dataclasses import dataclass
 
 from .config import TrainConfig
-from .plan import ExecutionPlan, InfeasiblePlan, boundary_pairs, build_plan
+from .plan import ExecutionPlan, InfeasiblePlan, boundary_hops, build_plan
 
 
 #: The six consistent-stop conditions of plan section 3.6. The first three are the
@@ -119,7 +120,7 @@ class ControlPlane:
         self.training_backend = training_backend
         self.tp_group = None
         self.executor_group = None
-        self.boundary_groups: dict[tuple[int, int], object] = {}
+        self.boundary_groups: dict[tuple[int, ...], object] = {}
         # Run-wide planning inputs: identical on every rank, so every rank replans
         # to the same plan. Per-rank state is attached separately by ``attach_run``.
         self.vocab_size = vocab_size
@@ -183,10 +184,10 @@ class ControlPlane:
         so only the groups this rank actually belongs to are kept: it neither runs
         training collectives elsewhere nor destroys a group it never joined.
 
-        The per-hop groups hold exactly two ranks -- the two stage leaders a boundary
-        connects -- because the 1F1B steady state issues a fused ``batch_isend_irecv``
-        and NCCL runs batched P2P on the group's collective communicator, which every
-        member would then have to issue in the same order.
+        The per-hop groups hold the sorted union of the two adjacent stages' ranks --
+        because the scatter/gather boundary transfer P2P-sends its chunks between ranks
+        of both stages and NCCL runs coalesced P2P on the group's collective
+        communicator, which every member would then have to issue in the same order.
         """
         import torch.distributed as dist
 
@@ -195,11 +196,11 @@ class ControlPlane:
             group = dist.new_group(ranks=list(stage.tp_members), backend=self.training_backend)
             if self.rank in stage.tp_members:
                 tp_group = group
-        boundaries: dict[tuple[int, int], object] = {}
-        for pair in boundary_pairs(plan):
-            group = dist.new_group(ranks=list(pair), backend=self.training_backend)
-            if self.rank in pair:
-                boundaries[pair] = group
+        boundaries: dict[tuple[int, ...], object] = {}
+        for hop in boundary_hops(plan):
+            group = dist.new_group(ranks=list(hop), backend=self.training_backend)
+            if self.rank in hop:
+                boundaries[hop] = group
         executors = dist.new_group(ranks=list(plan.active_ranks), backend=self.training_backend)
         self.tp_group = tp_group
         self.boundary_groups = boundaries
@@ -208,7 +209,7 @@ class ControlPlane:
     def destroy_training_groups(self) -> None:
         """Release the current training groups in unison (safe-point step 6a).
 
-        ``boundary_groups`` is built in sorted-pair order, so its two members release it
+        ``boundary_groups`` is built in sorted-hop order, so every member releases it
         at the same point in the sequence.
         """
         import torch.distributed as dist

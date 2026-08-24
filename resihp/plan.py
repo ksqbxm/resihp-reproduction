@@ -297,25 +297,29 @@ def _state_groups(num_layers: int) -> tuple[tuple[int | None, str], ...]:
     )
 
 
-def boundary_pairs(plan: "ExecutionPlan") -> tuple[tuple[int, int], ...]:
-    """Sorted leader pairs of every pipeline hop this plan's assignment creates.
+def boundary_hops(plan: "ExecutionPlan") -> tuple[tuple[int, ...], ...]:
+    """Sorted union groups of every pipeline hop this plan's assignment creates.
 
     The pipeline boundaries are read from the assignment, so a hop exists exactly where
-    a micro-batch actually moves between two stages. Each pair gets its own two-rank
-    process group: the 1F1B steady state issues a fused ``batch_isend_irecv``, which
-    NCCL runs on the group's collective communicator, so the group must hold exactly
-    the two ranks taking part (see :mod:`resihp.parallel.pp`).
+    a micro-batch actually moves between two stages. Each hop gets its own process group
+    whose ranks are the sorted union of both adjacent stages' full ``executor_ranks``
+    (de-duplicated). The scatter/gather boundary transfer scatters the activation into
+    ``N = max(TP_send, TP_recv)`` chunks, P2P-sends each chunk between its own
+    (sender, receiver) rank pair, and the receiver reconstructs by intra-node
+    all-gather; every chunk op for a hop rides this one union group so NCCL's coalesced
+    P2P uses a single communicator (see :mod:`resihp.parallel.pp`). Two TP1 stages give
+    a two-rank union, identical to the old leader pair, so TP1 hops are unchanged.
     """
     pipelines: dict[int, list[DPPlacement]] = {}
     for placement in plan.placements:
         pipelines.setdefault(placement.micro_batch, []).append(placement)
-    pairs = set()
+    hops = set()
     for places in pipelines.values():
         ordered = sorted(places, key=lambda placement: placement.stage_id)
         for upstream, downstream in zip(ordered, ordered[1:]):
-            leaders = (upstream.executor_ranks[0], downstream.executor_ranks[0])
-            pairs.add((min(leaders), max(leaders)))
-    return tuple(sorted(pairs))
+            union = set(upstream.executor_ranks) | set(downstream.executor_ranks)
+            hops.add(tuple(sorted(union)))
+    return tuple(sorted(hops))
 
 
 def build_plan(

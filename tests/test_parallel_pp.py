@@ -22,6 +22,10 @@ case needs), so a 2-GPU box actually runs them.
   lost a TP rank) carries ``param``/``exp_avg``/``exp_avg_sq``/``step`` through a real
   collective and lands tensor-for-tensor equal to the checkpoint anchor. There is no
   ``grad``: gradients are not persistent state and never cross a safe point.
+* ``*_heterogeneous_boundary_matches_reference`` -- TP2 -> TP1 and TP1 -> TP2 pipelines
+  (world 3), where the scatter/gather boundary is the only thing that can make the two
+  differently sharded stages agree. The chunk routing itself is proved separately and
+  purely by ``test_scatter_routing_*``.
 """
 
 import importlib.util
@@ -34,6 +38,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from resihp.config import TrainConfig
+from resihp.parallel.pp import scatter_routing
 from resihp.planner.pp import balanced_layers, pipeline_schedule
 
 
@@ -83,16 +88,71 @@ def test_expected_schedule_is_the_planner_definition():
         assert [step[0] for step in expected[:-1]] == list(order)
 
 
+# --- pure: the chunk routing (no process group, no tensor, no device) --------------
+
+#: ``(up members, down members)``: equal degrees, both directions of a halving boundary,
+#: and a 4 -> 2 hop where several senders feed one receiver.
+_ROUTING_CASES = [
+    ((0,), (1,)),
+    ((0, 1), (2, 3)),
+    ((0, 1), (2,)),
+    ((0,), (1, 2)),
+    ((0, 1, 2, 3), (4, 5)),
+]
+
+
+@requires_torch
+@pytest.mark.parametrize("up,down", _ROUTING_CASES)
+def test_scatter_routing_spreads_one_copy_over_n_links(up, down):
+    """The traffic-reduction proof: N distinct pairs, each carrying 1/N of the tensor.
+
+    A hop moves ``N = max(U, D)`` chunks. If every chunk sits on a pair of its own and no
+    pair repeats, the whole tensor crosses the link exactly once -- the same volume the
+    old leader-to-leader hop moved -- but over ``N`` links in parallel instead of one.
+    """
+    routing = scatter_routing(up, down)
+    chunks = max(len(up), len(down))
+    assert len(routing) == chunks  # exactly N chunks
+    assert len(set(routing)) == chunks  # each pair distinct, so each is used once
+    # One copy in total, not one per receiver: the chunks partition the tensor rather
+    # than duplicating it, so N chunks of ``numel // N`` add back up to exactly ``numel``.
+    numel = 256
+    assert len(routing) * (numel // chunks) == numel
+
+
+@requires_torch
+@pytest.mark.parametrize("up,down", _ROUTING_CASES)
+def test_scatter_routing_gives_every_rank_a_contiguous_share(up, down):
+    """Every member takes part, and its chunks are the contiguous share it gathers.
+
+    The receiver rebuilds the tensor with a plain all-gather over its TP group, which is
+    only correct if each member's chunks are its own contiguous ``1/degree`` slice, in
+    ascending member order. Same on the way back for the senders and the gradient.
+    """
+    routing = scatter_routing(up, down)
+    chunks = max(len(up), len(down))
+    for members, end in ((up, 0), (down, 1)):
+        runs = [[k for k, pair in enumerate(routing) if pair[end] == member] for member in members]
+        assert all(runs), (members, runs)  # no member is left idle
+        for run in runs:
+            assert run == list(range(run[0], run[0] + len(run)))  # contiguous
+            assert len(run) == chunks // len(members)  # equal shares
+        # Ascending member order is ascending chunk order, so ``cat`` in TP-rank order
+        # restores the flat tensor.
+        assert [k for run in runs for k in run] == list(range(chunks))
+
+
 # --- distributed: 1F1B execution against the reference ----------------------------
 
 
 def _pipeline(rank, num_stages):
-    """A one-rank-per-stage assignment plus the two-rank group of every hop.
+    """A one-rank-per-stage assignment plus the union group of every hop.
 
     Exactly the shape the plan produces for a single DP replica: every micro-batch runs
-    every stage, executed by that stage's own rank. ``new_group`` is collective over the
-    world, so every rank creates every hop group in the same order and keeps the ones it
-    joins.
+    every stage, executed by that stage's own rank. At degree 1 the union of two adjacent
+    stages *is* the two-rank pair, and the routing has a single chunk on it, so this
+    keeps working unchanged. ``new_group`` is collective over the world, so every rank
+    creates every hop group in the same order and keeps the ones it joins.
     """
     import torch.distributed as dist
 
@@ -253,6 +313,147 @@ def _assert_matches_reference(results, num_stages, label):
         # The whole point: the first stage really does hold two activations at once,
         # which a GPipe schedule would have made four.
         assert results[0]["activation_peak"] == 2 < MICRO, results[0]
+
+
+# --- distributed: the heterogeneous scatter/gather boundary ------------------------
+
+#: ``case -> (stage 0 members, stage 1 members)`` over a world of 3. Both directions of
+#: an unequal boundary, which is the case only scatter/gather handles: the sending and
+#: receiving TP groups have different sizes, so N = max(U, D) chunks are routed onto
+#: N distinct rank pairs and the receiver reassembles by all-gather.
+_HETERO = {"tp2_tp1": ((0, 1), (2,)), "tp1_tp2": ((0,), (1, 2))}
+
+
+def _source(config):
+    """The fixed initial full logical state -- the init the reference starts from."""
+    import torch
+
+    from resihp.model import ReferenceTransformer
+
+    torch.manual_seed(config.seed)
+    model = ReferenceTransformer(config, vocab_size=VOCAB, sequence_length=SEQLEN)
+    return {name: param.detach().clone() for name, param in model.logical_state_dict().items()}
+
+
+def _compare_hetero(rank, case, device):
+    """Run one side of an unequal-degree boundary and measure it against the reference."""
+    import torch.distributed as dist
+
+    from resihp import verify
+    from resihp.parallel.pp import PipelineRuntime
+    from resihp.parallel.reshard import shard_dims, shard_logical_state
+    from resihp.parallel.tp import TensorParallelStage
+    from resihp.planner.dp import DPAssignment, DPPlacement
+
+    members = _HETERO[case]
+    union = tuple(sorted(set(members[0]) | set(members[1])))
+    # ``new_group`` is collective over the world, so every rank makes every call in the
+    # same order and keeps only the handles it joined.
+    tp_groups = [dist.new_group(list(stage_members)) for stage_members in members]
+    hop = dist.new_group(list(union))
+    executors = dist.new_group(list(union))
+
+    stage_id = 0 if rank in members[0] else 1
+    # The TP group is built from the stage's executors, so a rank's index in the members
+    # tuple *is* its TP rank -- the correspondence the gather reassembly relies on.
+    tp_index, tp_size = members[stage_id].index(rank), len(members[stage_id])
+
+    reference = verify.reference_steps(
+        CONFIG, vocab_size=VOCAB, sequence_length=SEQLEN, count=1, device=device
+    )[0]
+    layer_ids = balanced_layers(CONFIG.num_layers, len(members))[stage_id]
+    stage = (
+        TensorParallelStage(
+            CONFIG,
+            vocab_size=VOCAB,
+            sequence_length=SEQLEN,
+            layer_ids=layer_ids,
+            is_first=stage_id == 0,
+            is_last=stage_id == len(members) - 1,
+            local_state=shard_logical_state(
+                _source(CONFIG), layout=shard_dims(layer_ids), tp_rank=tp_index, tp_size=tp_size
+            ),
+            group=tp_groups[stage_id],
+        )
+        .to(device)
+        .train()
+    )
+
+    # Every micro-batch runs both stages; each stage's executors are its whole TP group.
+    assignment = DPAssignment(
+        step=0,
+        failure_signature=(),
+        placements=tuple(
+            DPPlacement(
+                micro_batch=micro, stage_id=sid, replica_id=0, executor_ranks=members[sid]
+            )
+            for micro in range(MICRO)
+            for sid in (0, 1)
+        ),
+    )
+    runtime = PipelineRuntime(
+        stage,
+        replica_id=0,
+        assignment=assignment,
+        # One union group for the whole hop -- every rank of both stages joins it,
+        # because every one of them carries a chunk.
+        boundary_groups={union: hop},
+        group=executors,
+    )
+    loss = runtime.train_step(
+        verify.batch(CONFIG, 0, vocab_size=VOCAB, sequence_length=SEQLEN, device=device)
+    )
+
+    result = verify.compare_shards(stage, reference)
+    result.update(
+        loss=loss,
+        stage_id=stage_id,
+        tp_index=tp_index,
+        schedule=list(runtime.schedule),
+        all_names=sorted(reference["params"]),
+        routing=[list(pair) for pair in scatter_routing(*members)],
+        is_cuda=bool(next(stage.parameters()).is_cuda),
+    )
+    return result
+
+
+def _assert_hetero(results, case, label):
+    from resihp import verify
+
+    members = _HETERO[case]
+    for rank, result in enumerate(results):
+        print(f"{label} rank {rank}: {_diffs(result)}")  # magnitude, for a failure
+    for rank, result in enumerate(results):
+        # Sliced by this rank's own TP layout, so a TP2 shard is held to its half of the
+        # reference and a TP1 stage to the whole of it.
+        verify.assert_matches_reference(result, label=f"{label} rank {rank}")
+
+    last = [result for result in results if result["stage_id"] == 1]
+    for result in last:
+        assert abs(result["loss"] - result["reference_loss"]) < 1e-4, result
+    for result in results:
+        if result["stage_id"] == 0:
+            assert result["loss"] is None, result  # only the last stage produces the loss
+
+    # Real pipelining across an unequal boundary: the two stages own disjoint names and
+    # together own the whole model, whatever their degrees are.
+    by_stage = [
+        set().union(*[set(r["owned"]) for r in results if r["stage_id"] == sid]) for sid in (0, 1)
+    ]
+    assert not (by_stage[0] & by_stage[1]), by_stage
+    assert by_stage[0] | by_stage[1] == set(results[0]["all_names"])
+
+    # The boundary really was scattered: N = max(U, D) distinct pairs, spanning ranks of
+    # both stages -- not one leader link.
+    chunks = max(len(members[0]), len(members[1]))
+    routing = [tuple(pair) for pair in results[0]["routing"]]
+    assert len(routing) == len(set(routing)) == chunks, routing
+    assert {pair[0] for pair in routing} == set(members[0]), routing
+    assert {pair[1] for pair in routing} == set(members[1]), routing
+
+    for result in results:
+        assert result["schedule"] == EXPECTED_SCHEDULE[result["stage_id"]], result
+        assert result["tp_size"] == len(members[result["stage_id"]]), result
 
 
 # --- distributed: layer state migration -------------------------------------------
@@ -420,6 +621,31 @@ def _nccl_pp_worker(rank, world_size, result_dir, port):
     dist.destroy_process_group()
 
 
+def _gloo_hetero_worker(rank, world_size, result_dir, port, case):
+    _init_env(rank, world_size, port)
+    import torch
+    import torch.distributed as dist
+
+    dist.init_process_group(backend="gloo")
+    result = _compare_hetero(rank, case, torch.device("cpu"))
+    Path(result_dir, f"result_{rank}.json").write_text(json.dumps(result))
+    dist.destroy_process_group()
+
+
+def _nccl_hetero_worker(rank, world_size, result_dir, port, case):
+    _init_env(rank, world_size, port)
+    import torch
+    import torch.distributed as dist
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl")
+    assert dist.get_backend() == "nccl"
+    result = _compare_hetero(rank, case, torch.device(f"cuda:{rank}"))
+    assert result["is_cuda"]
+    Path(result_dir, f"result_{rank}.json").write_text(json.dumps(result))
+    dist.destroy_process_group()
+
+
 def _gloo_migration_worker(rank, world_size, result_dir, port):
     _init_env(rank, world_size, port)
     import torch
@@ -468,6 +694,18 @@ def test_pp_matches_reference_gloo(tmp_path, num_stages):
 
 
 @requires_torch
+@pytest.mark.parametrize("case", sorted(_HETERO))
+def test_pp_heterogeneous_boundary_matches_reference_gloo(tmp_path, case):
+    """TP2 -> TP1 and TP1 -> TP2 through the real runtime, over a world of 3."""
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _gloo_hetero_worker, args=(3, str(tmp_path), _free_port(), case), nprocs=3, join=True
+    )
+    _assert_hetero(_results(tmp_path, 3), case, f"{case} Gloo")
+
+
+@requires_torch
 def test_pp_layer_migration_is_lossless_gloo(tmp_path):
     import torch.multiprocessing as mp
 
@@ -489,6 +727,22 @@ def test_pp_cuda_nccl_matches_reference(tmp_path, num_stages):
     for result in results:
         assert result["is_cuda"], result
     _assert_matches_reference(results, num_stages, f"PP{num_stages} NCCL")
+
+
+@requires_torch
+@pytest.mark.parametrize("case", sorted(_HETERO))
+def test_pp_heterogeneous_boundary_cuda_nccl(tmp_path, case):
+    """The same unequal boundary on real devices: NCCL coalesced P2P over the union group."""
+    import torch.multiprocessing as mp
+
+    _skip_if_few_gpus(3)
+    mp.spawn(
+        _nccl_hetero_worker, args=(3, str(tmp_path), _free_port(), case), nprocs=3, join=True
+    )
+    results = _results(tmp_path, 3)
+    for result in results:
+        assert result["is_cuda"], result
+    _assert_hetero(results, case, f"{case} NCCL")
 
 
 @requires_torch

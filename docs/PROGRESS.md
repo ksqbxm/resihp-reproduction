@@ -1186,3 +1186,78 @@ python -m pytest -q  ->  125 passed, 12 skipped
 12 项 skip 是 10 个 torch 门禁模块整模块 skip + 2 项 GPU/torch 条件 skip。分布式与数值门禁
 **必须在 8 卡目标机复跑**，命令见 `docs/ACCEPTANCE.md` 第 5 节。本轮改动触及真实通信结构
 （每跳两 rank 组、leader→leader + TP broadcast、1F1B 接入生产），这些**尚未在本机执行过**。
+
+## P11 P2P scatter/gather 边界优化（ResiHP §"P2P Communication Optimization"，Fig 7）
+
+**根因**：当前 [resihp/parallel/pp.py](../resihp/parallel/pp.py) 的 stage 边界只把一份激活
+**leader→leader** 经一个两-rank 跳组搬过 InfiniBand，再在接收侧 TP 组内 **broadcast**（`_replicate`）。
+异构 TP degree 下功能正确，但不等价于论文性能：只走一条 leader 链、用 broadcast 而非 all-gather，
+未把跨节点流量摊到 N 条并行链路上。
+
+**修法**：全量替换、**不留前向兼容**，删除 leader-pair / `_replicate` 逻辑，scatter/gather 作为
+唯一边界路径。论文规则：把边界激活切成 `N = max(TP_send, TP_recv)` 等长连续块，chunk `k` 的
+sender = `up_members[k*U//N]`、receiver = `down_members[k*D//N]`，每个 `(sender,receiver)` 对恰搬
+一块（1/N），接收侧用节点内 all-gather 快速重构。净跨节点流量一份、摊到 N 条链路。分 3 个可独立
+验收的 commit：
+
+- **Commit 1（控制面，运行时不动）**：`plan.boundary_pairs` → `boundary_hops(plan)`，每个不同跳返回
+  两相邻 stage 全部 `executor_ranks` 的**排序并集元组**（去重）；`control.build_training_groups` 每个并集
+  建一个 `new_group`、以并集元组为 key。TP1↔TP1 并集 == 旧两-rank 对，故 TP1 跳不受影响。
+  验收 `pytest tests/test_plan.py tests/test_control.py -v`。**本机（无 torch）已跑：test_plan 35 passed；
+  test_control 1 passed / 1 skipped（8 进程 Gloo 门禁 skip）。**
+- **Commit 2（运行时）**：pp.py 新增纯函数 `scatter_routing`（torch-free，返回 N 个不重复
+  (sender,receiver) 对，即流量减少证明），重写 Send/Recv 为 `_scatter_send_ops` / `_gather_recv` /
+  `_reconstruct`（节点内 all-gather，TP1 退化 no-op），每跳一次 `batch_isend_irecv`；新增 TP2↔TP1
+  异构 CPU/Gloo 门禁。验收 `pytest tests/test_parallel_pp.py -v`。
+- **Commit 3（集成 + NCCL + 清理）**：更新 `test_combinations._run_tp_pp` 为并集组，回归
+  end_to_end / fault_sequences / recovery，目标机跑 GPU/NCCL 门禁，确保 `boundary_pairs` / `_replicate`
+  彻底删除（`grep -rn "boundary_pairs\|_replicate" resihp/` 为空）。
+
+分布式 + NCCL 门禁必须在 8 卡目标机复跑（本机无 torch）。
+
+### Commit 2 执行记录（运行时 scatter/gather，已完成）
+
+**改动**：`resihp/parallel/pp.py` + `tests/test_parallel_pp.py`。旧的 leader→leader 逻辑
+（`_hop` / `_replicate` / `_is_leader` / `_send_op` / `_recv_op`）**整体删除，不留兼容分支**；
+scatter/gather 是边界的唯一路径。
+
+- 新增模块级纯函数 `scatter_routing(up_members, down_members)`：返回 `N = max(U,D)` 个
+  `(sender, receiver)` 对，`chunk k` 由 `up[k*U//N] → down[k*D//N]` 承载。无 tensor / 无 device /
+  无进程组。
+- 运行时新方法：`_hop_group(up, down)`（并集元组查表）、`_my_chunks`（本 rank 承担的
+  `(chunk 序号, 对端 rank)`；相邻 stage rank 集合不相交，故本 rank 非发即收）、`_scatter_send_ops`、
+  `_gather_recv`（slab + irecv P2POp）、`_reconstruct`（`stage.group` 上 all-gather 后按 TP rank 序
+  cat 再 reshape；`tp_size==1` 时不发任何集合调用）。六个 Send/Recv 方法全部改写，每跳仍只一次
+  `batch_isend_irecv`，返回值与 `requires_grad_` 语义不变。
+- 关键不变量：因 degree 是 2 的幂，`N` 同时是 `U`、`D` 的倍数，故**每个 rank 的 chunk 序号是连续段**，
+  恰是它自己的 `1/degree` 连续份额——这正是接收侧能用**普通 all-gather**（而非 broadcast）重构的前提。
+  TP 组由 stage 的 `executor_ranks` 建立，所以「members 升序 == TP rank 序 == chunk 升序」；
+  `__init__` 新增 `len(executors) == stage.tp_size` 校验，因为不一致只会重构出错张量或在 gather 处挂死。
+- 前反向共用同一张路由表（角色互换），故 1F1B 稳态的融合 `batch_isend_irecv` 仍逐 chunk 配对。
+
+**新增测试**：
+- 纯函数门禁 `test_scatter_routing_spreads_one_copy_over_n_links` /
+  `..._gives_every_rank_a_contiguous_share`，覆盖 `(1,1),(2,2),(2,1),(1,2),(4,2)`：恰 N 个 chunk、
+  N 个**互不相同**的 rank 对（=流量减少证明：总量仍是一份，摊到 N 条链路）、每个成员都不空转、
+  每个成员的 chunk 连续且份额相等、升序拼接恰好覆盖 `0..N-1`。
+- 异构分布式门禁 `test_pp_heterogeneous_boundary_matches_reference_gloo` 与
+  `..._cuda_nccl`（world=3）：`TP2→TP1`（stage0=(0,1), stage1=(2,)）与 `TP1→TP2`
+  （stage0=(0,), stage1=(1,2)），走真实 `PipelineRuntime`，并集跳组 `(0,1,2)`；用
+  `resihp.verify.compare_shards` / `assert_matches_reference`（项目唯一的 Principle A 数值契约，
+  按各 rank 自身 TP 布局切片）断言梯度与一步 AdamW 后参数对齐单进程参考，另断言两 stage 名字不相交
+  且并集为全模型、1F1B 顺序不变、路由确实是 N 个跨两 stage 的不同对。
+- TP1↔TP1 并集 == 旧两-rank 对，`_pipeline` 辅助函数与既有 PP1/PP2 门禁**无需改动**（仅更新注释措辞）。
+
+**本机（无 torch）已做的验证**：
+- `python -m pytest -q`：125 passed, 12 skipped——与改动前基线一致，无回归。
+- `py_compile resihp/parallel/pp.py tests/test_parallel_pp.py`：通过。
+- `grep -rn "boundary_pairs\|_replicate" resihp/`：**空**（旧逻辑已彻底清除；`tests/test_combinations.py`
+  的引用属 Commit 3）。
+- **离线仿真**（scratchpad 假 torch/`torch.distributed`，`object.__new__` 造裸 runtime 后调用**生产方法本身**
+  `_scatter_send_ops`/`_gather_recv`/`_reconstruct`）：`U×D ∈ {1×1, 2×2, 2×1, 1×2, 4×2, 2×4}` 的前向与
+  反向共 12 组，全部满足「每个 rank 对恰一个 chunk、发收一一配对无残留、接收侧重构结果与源张量逐元素相等」。
+  同一 stub 下直接执行上面两个纯函数门禁的函数体，全部通过。
+
+**待目标机执行的门禁**：`python3 -m pytest -q tests/test_parallel_pp.py`（Gloo 必跑；NCCL 需 ≥3 卡，
+异构用例 world=3）。
+
