@@ -1261,3 +1261,44 @@ scatter/gather 是边界的唯一路径。
 **待目标机执行的门禁**：`python3 -m pytest -q tests/test_parallel_pp.py`（Gloo 必跑；NCCL 需 ≥3 卡，
 异构用例 world=3）。
 
+
+### Commit 3 执行记录（全栈接入 + 清理，已完成）
+
+**改动**：只动测试与文档措辞，运行时与控制面不再变更（Commit 1/2 已定型）。
+
+- `tests/test_combinations.py`：删除已失效的 `from resihp.plan import boundary_pairs`（该函数在
+  Commit 1 已改名，这一行是整个仓库最后一处引用；因模块级 `importorskip("torch")` 先行 skip，
+  本机跑不出 ImportError，属实打实的坏引用）。`_run_tp_pp` 的跳组由两-leader
+  `{(0,2): group over (0,2)}` 改为**并集组** `{(0,1,2,3): group over (0,1,2,3)}`，四个 rank 全部加入，
+  因为每个 rank 都承担一个 chunk；随之删掉 `if "hop" in mine else {}` 的非成员分支。
+  `tp_dp`（无跳）与 `pp_dp`（TP1 跳，并集 == 旧两-rank 对）按设计无需改动。
+- `tests/test_parallel_reshard.py`：异构边界门禁 `_run_boundary`（stage0=TP1 rank0，
+  stage1=TP2 ranks1,2）的跳组 `(0,1)`（旧「两个 stage leader」）改为并集 `(0,1,2)`。
+  这一处是 Commit 2 遗留的坏引用——旧 key 会在 `_hop_group` 直接 KeyError，本机因无 torch 未暴露。
+- 文档措辞对齐（旧 leader→broadcast 说法已不成立）：`resihp/parallel/reshard.py` 模块 docstring、
+  `tests/test_parallel_reshard.py` 模块 docstring、`tests/test_combinations.py` 模块 docstring 与
+  `_run_tp_pp` docstring、`tests/test_fault_sequences.py` 的组泄漏说明（「每跳两-rank 组、该 rank 是
+  leader 的跳」→「每跳一个并集组、该 rank 参与的跳」）。
+- `tests/test_fault_sequences.py:310` 的 `len(control.boundary_groups)` 断言无需改动：期望值本就从控制面
+  实时读出（`baseline + training_group_count`），并集化只改 key 与成员、不改跳的数量。
+  `test_end_to_end` / `test_recovery` / `test_control` / `test_parallel_tp` 均只透传
+  `control.boundary_groups`，`recovery.py` / `train.py` 同理，全部无需改动。
+
+**本机（无 torch）已做的验证**：
+- `python -m pytest -q`：125 passed, 12 skipped——与 Commit 2 后基线一致，无回归。
+- `python -m pytest -q tests/test_plan.py tests/test_control.py`：36 passed, 1 skipped。
+- `python -m compileall resihp/ tests/`：通过。
+- `grep -rn "boundary_pairs\|_replicate" resihp/`：**空**；`grep -rn "boundary_pairs" tests/`：**空**。
+  旧逻辑与最后的引用全部清除，scatter/gather 是边界的唯一路径。
+- **离线索引仿真**：按生产代码的 `scatter_routing` + slab/all-gather 下标算法在纯 Python 上跑
+  `(0,1)→(2,3)`、`(0,)→(1,2)`、`(0,1)→(2,)`、`(0,)→(1,)`、`(0,1,2,3)→(4,5)`，逐例断言
+  ①N 个 rank 对互不相同 ②上线总量恰为一份拷贝 ③每个接收 rank 的 chunk 连续 ④按 TP rank 序拼接后
+  与源张量逐元素相等；并据此确认本次写入的并集 key 与 `_hop_group` 的 `sorted(set(up)|set(down))`
+  完全一致：tp_pp = `(0,1,2,3)`、reshard 异构 = `(0,1,2)`、TP1 跳 = `(0,1)`（未变）。
+
+**待目标机执行的门禁**（本机无 torch，分布式/数值/NCCL 全部 skip）：
+```bash
+python3 -m pytest -q tests/test_combinations.py tests/test_end_to_end.py tests/test_fault_sequences.py tests/test_recovery.py
+python3 -m pytest -q tests/test_parallel_pp.py tests/test_parallel_reshard.py tests/test_parallel_dp.py tests/test_parallel_tp.py
+python3 -m pytest -q          # 全量，含 8 卡 NCCL 门禁
+```

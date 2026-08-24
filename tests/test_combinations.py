@@ -13,8 +13,9 @@ elsewhere:
   the project's one runtime: the control plane drives this same class.
   T10 runs TP with a single stage and T12 runs the pipeline at TP degree 1; nothing
   ran real TP all-reduces *inside* a 1F1B schedule. The boundary activation is
-  replicated within a TP group, so the pipeline hop is per TP index: two columns,
-  ``(0,2)`` and ``(1,3)``, which is how TP and PP compose.
+  replicated within a TP group, so scatter/gather cuts the one crossing copy per TP
+  index -- chunks routed ``0 -> 2`` and ``1 -> 3`` -- and both ride the single union
+  hop group ``(0,1,2,3)``, which is how TP and PP compose.
 * ``tp_dp`` -- TP2 x DP2 through the same :class:`~resihp.parallel.pp.PipelineRuntime`,
   here as single-stage replicas: the DP dimension enters as which micro-batches a rank
   runs and as the cross-replica gradient combine.
@@ -75,7 +76,6 @@ from resihp.parallel.reshard import shard_dims, shard_logical_state
 from resihp.parallel.tp import TensorParallelStage
 from resihp.plan import build_plan
 from resihp.planner.dp import DPAssignment, DPPlacement
-from resihp.plan import boundary_pairs
 from resihp.planner.pp import balanced_layers, peak_in_flight
 from resihp.recovery import dp_assignment, initial_run, stage_of
 from resihp import verify
@@ -279,16 +279,22 @@ def _micro_batch_map(plan):
 def _run_tp_pp(rank, world_size, device, backend, result_dir):
     """TP2 inside PP2: a heterogeneous-capable boundary between two TP2 stages.
 
-    The activation is replicated inside each stage's TP group, so the boundary moves one
-    authoritative copy between the two stage leaders (ranks 0 and 2) and each receiving
-    group broadcasts it -- the same single implementation a TP1 -> TP2 boundary uses.
+    The activation is replicated inside each stage's TP group, so exactly one copy
+    crosses the boundary: scatter/gather cuts it into two chunks carried by the distinct
+    pairs ``0 -> 2`` and ``1 -> 3``, and the receiving stage all-gathers them back into
+    the whole tensor -- the same single implementation a TP1 -> TP2 boundary uses.
     """
     from resihp.parallel.pp import PipelineRuntime
 
     config = _config("tp_pp")
     stage_id, tp_index = rank // config.tp, rank % config.tp
     mine = _groups(
-        [("tp0", (0, 1)), ("tp1", (2, 3)), ("hop", (0, 2)), ("exec", tuple(range(world_size)))],
+        [
+            ("tp0", (0, 1)),
+            ("tp1", (2, 3)),
+            ("hop", tuple(range(world_size))),
+            ("exec", tuple(range(world_size))),
+        ],
         backend,
         rank,
     )
@@ -314,9 +320,9 @@ def _run_tp_pp(rank, world_size, device, backend, result_dir):
         stage,
         replica_id=0,
         assignment=assignment,
-        # Only the two leaders join the hop group; the others reach the activation
-        # through their stage's TP broadcast and hold no hop of their own.
-        boundary_groups={(0, 2): mine["hop"]} if "hop" in mine else {},
+        # One union group for the whole hop -- every rank of both stages joins it,
+        # because every one of them carries a chunk.
+        boundary_groups={tuple(range(world_size)): mine["hop"]},
         group=executors,
     )
     loss = runtime.train_step(_batch(config, 0, device))

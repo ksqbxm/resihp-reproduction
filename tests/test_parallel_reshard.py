@@ -14,10 +14,9 @@ production runtime, whose backward gradient must match the single-process refere
 (no double counting, nothing dropped).
 
 There is exactly one heterogeneous-boundary implementation in the project, the
-leader-to-leader hop plus TP broadcast inside
-:class:`resihp.parallel.pp.PipelineRuntime`, and this gate drives that one. Nothing
-here reshards a ``grad``: gradients are not persistent state, so they are in no
-checkpoint and no transfer (plan principle A).
+scatter/gather hop inside :class:`resihp.parallel.pp.PipelineRuntime`, and this gate
+drives that one. Nothing here reshards a ``grad``: gradients are not persistent state,
+so they are in no checkpoint and no transfer (plan principle A).
 """
 
 import importlib.util
@@ -253,11 +252,12 @@ def _run_boundary(rank, device):
 
     The two stages run at *different* TP degrees, which is the case plan 3.3 singles
     out. The activation is replicated inside each stage's TP group, so the boundary
-    must move exactly one authoritative copy between the two stage leaders and let the
-    receiving group broadcast it: a per-rank sum would double the gradient the upstream
-    stage sees (by the downstream degree), and a single receiving rank would starve its
-    peer. Both failures show up as a gradient that no longer matches the single-process
-    reference, which is what this asserts.
+    must move exactly one authoritative copy: scatter/gather cuts it into
+    ``N = max(1, 2) = 2`` chunks on the distinct pairs ``0 -> 1`` and ``0 -> 2``, and
+    the downstream group all-gathers them back. A per-rank sum would double the gradient
+    the upstream stage sees (by the downstream degree), and a single receiving rank
+    would starve its peer. Both failures show up as a gradient that no longer matches
+    the single-process reference, which is what this asserts.
 
     This drives :class:`resihp.parallel.pp.PipelineRuntime` -- the project's only
     heterogeneous-boundary implementation and the one the control plane runs. Three
@@ -289,7 +289,7 @@ def _run_boundary(rank, device):
     stage_id = 0 if rank == 0 else 1
     tp_group = tp_groups[stage_id]
     executors = ((0,), (1, 2))
-    hop = dist.new_group([0, 1])  # the two stage leaders
+    hop = dist.new_group([0, 1, 2])  # the union of both stages: every rank carries a chunk
 
     layers = balanced_layers(config.num_layers, 2)[stage_id]
     stage = TensorParallelStage(
@@ -340,7 +340,7 @@ def _run_boundary(rank, device):
         ),
     )
     runtime = PipelineRuntime(
-        stage, replica_id=0, assignment=assignment, boundary_groups={(0, 1): hop}
+        stage, replica_id=0, assignment=assignment, boundary_groups={(0, 1, 2): hop}
     )
     loss = runtime.train_step(tokens)
 

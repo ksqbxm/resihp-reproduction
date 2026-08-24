@@ -24,8 +24,9 @@ distributed driver (:func:`reshard_tp_state`) is a thin ``all_gather_object`` on
 
 The heterogeneous TP boundary itself lives in :class:`resihp.parallel.pp.PipelineRuntime`
 and nowhere else: an activation is replicated within each stage's TP group, so the
-boundary moves one authoritative copy between the two stages' leaders and the receiving
-group broadcasts it -- never a per-rank sum, which would double-count.
+boundary moves one authoritative copy -- scattered into ``N = max(TP_send, TP_recv)``
+chunks over ``N`` distinct rank pairs and all-gathered by the receiving group -- never a
+per-rank sum, which would double-count.
 """
 
 import torch
