@@ -5,9 +5,15 @@ Plan sections 四.C (multi failure-point coverage and sequence regressions), 四
 leaks) and 四.E (the one resource case the T14 stop gates structurally cannot reach).
 
 Every case is one uninterrupted job driven through the real safe point -- every
-failure below is a real ``SIGKILL``, and a killed rank writes no result at all -- over
-the same runtime T16 uses; the cases differ only in *when* each failure lands and
-*which* rank it takes, which is exactly the axis 四.C asks to cover:
+failure below is a real ``SIGKILL`` -- over the same runtime T16 uses; the cases differ
+only in *when* each failure lands and *which* rank it takes, which is exactly the axis
+四.C asks to cover:
+
+A rank rewrites its result file after every iteration, so the job leaves two kinds of
+account behind: a **survivor's**, complete down to the fields written on the way out,
+and a **victim's**, which stops at the iteration it died in and carries none of them.
+The two are told apart by the case's own schedule and by the operating system's exit
+codes (:func:`harness.assert_killed`), never by which fields a file happens to hold.
 
 * ``random_a`` / ``random_b`` -- fixed-seed random safe points and random victims, one
   rank per event, injected until only one rank is left running: every event is a real
@@ -577,7 +583,7 @@ def _assert_plan_stream(results, case, label):
         # A rank that was killed stops mid-stream, and everything it did record has to
         # be exactly the survivors' prefix -- same versions, same digests, same events.
         acted = len(result["plans"])
-        assert acted == published or result["rank"] in set(_killed(case)), (
+        assert acted == published or result["rank"] in _deaths(case), (
             label,
             result["rank"],
             acted,
@@ -817,7 +823,47 @@ def _assert_donor_stream(results, case, label):
         assert alive == 1, (label, alive, plans[-1])
 
 
+#: The fields a rank writes only on its way out of :func:`_run_sequence` -- after its
+#: last iteration, when it shuts the control plane down and reloads the checkpoint. A
+#: killed process never reaches that code.
+_CLOSING_FIELDS = (
+    "backend",
+    "is_cuda",
+    "checkpoint",
+    "initialized",
+    "released_final",
+    "final_held_by",
+    "resources",
+)
+
+
+def _assert_account_kinds(results, case, label):
+    """A victim left a partial account and a survivor a complete one.
+
+    :func:`harness.assert_killed` has already matched the schedule against the exit
+    codes, so a victim is known to have died on ``SIGKILL`` rather than exited. This is
+    the converse, asserted on what it wrote: its file stops at exactly the iteration it
+    died in -- it flushed after that iteration and never again -- and carries not one
+    field that is only written after the last one. A survivor's carries all of them, so
+    a run that quietly stopped short of shutdown cannot pass either.
+    """
+    deaths = _deaths(case)
+    for result in results:
+        rank = result["rank"]
+        closing = tuple(field for field in _CLOSING_FIELDS if field in result)
+        if rank in deaths:
+            assert closing == (), (label, rank, closing)
+            assert len(result["iterations"]) == deaths[rank], (
+                label,
+                rank,
+                len(result["iterations"]),
+            )
+        else:
+            assert closing == _CLOSING_FIELDS, (label, rank, closing)
+
+
 def _assert_sequence(results, case, label):
+    _assert_account_kinds(results, case, label)
     _assert_plan_stream(results, case, label)
     _assert_layers_and_placements(results, case, label)
     _assert_failed_ranks_and_data(results, case, label)
@@ -866,14 +912,23 @@ def _spawn(backend, case_name, tmp_path):
     return [accounts[rank] for rank in sorted(accounts)]
 
 
+def _deaths(case):
+    """``rank -> the iteration after which the schedule kills it``, in kill order.
+
+    The one authority on which ranks die: it is the case's own event list, so nothing
+    has to infer a death from a missing field or a short file.
+    """
+    return {victim: after for after, victim in case.events}
+
+
 def _killed(case):
     """The ranks this case really kills, in the order it kills them."""
-    return [victim for _after, victim in case.events]
+    return list(_deaths(case))
 
 
 def _survivors(results, case):
     """The ranks still running at the end -- the only ones with a full account."""
-    return [result for result in results if result["rank"] not in set(_killed(case))]
+    return [result for result in results if result["rank"] not in _deaths(case)]
 
 
 def _complete(results, case):
@@ -900,13 +955,24 @@ def test_fault_sequence_gloo(tmp_path, case_name):
 
 @pytest.mark.parametrize("case_name", sorted(CASES))
 def test_fault_sequence_cuda_nccl(tmp_path, case_name):
-    """The same sequences on real GPU tensors and real NCCL training groups."""
+    """The same sequences on real GPU tensors and real NCCL training groups.
+
+    Only the survivors report a device and a backend: both are written on the way out
+    of :func:`_run_sequence`, and a killed process has no way out. What holds a victim
+    to the same standard is not a field it never wrote but what it had to do while it
+    was alive: :func:`_entry` binds it to its own GPU before anything runs, its TP and
+    pipeline collectives ride the NCCL training groups -- which reject a CPU tensor
+    outright, so a victim running on the wrong device would end the job rather than be
+    reaped with ``-9`` -- and ``_assert_sequence`` holds the iterations it did complete
+    to exactly the numerical contract a survivor's are held to.
+    """
     case = CASES[case_name]
     _skip_if_few_gpus(case.config.world_size)
     results = _spawn("nccl", case_name, tmp_path)
-    for result in results:
+    survivors = _survivors(results, case)
+    for result in survivors:
         assert result["is_cuda"], result["rank"]
     # An idle rank holds no training group; every rank that holds one is on NCCL.
-    backends = {result["backend"] for result in results} - {None}
-    assert backends == {"nccl"}, [result["backend"] for result in results]
+    backends = {result["backend"] for result in survivors} - {None}
+    assert backends == {"nccl"}, [result["backend"] for result in survivors]
     _assert_sequence(results, case, f"{case_name} NCCL")

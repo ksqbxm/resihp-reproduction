@@ -1493,3 +1493,60 @@ python3 -m resihp.launch --config configs/train.json --failures configs/failures
 ```bash
 python3 -m pytest -q
 ```
+
+## P14 八卡实机：`test_fault_sequence_cuda_nccl` 5 条全挂 —— 门禁没适配 partial account
+
+**现象**：`assert result["is_cuda"]` 抛 `KeyError: 'is_cuda'`（`tests/test_fault_sequences.py:908`），
+五个 case 全中。Gloo 侧同样的 `_assert_sequence` 全绿。
+
+**根因**：这个文件的被杀 rank **会**留下 partial account——`_run_sequence` 每轮 `flush()` 一次，
+所以它的文件停在它死的那一轮；而 `is_cuda` / `backend` / `checkpoint` / `initialized` /
+`released_final` / `final_held_by` / `resources` 是**收尾字段**，只在最后一轮之后、
+`control.shutdown()` 那一段写出，死掉的进程根本走不到。NCCL 门禁却对 `results` 全量断言
+`is_cuda`，把「所有 rank 都正常跑到结尾」这个 true fail-stop 之前的假设留在了那里。
+`test_end_to_end.py` 的 NCCL 门禁早就改成只问 `_survivors(...)`，这里漏了。
+**生产代码没有 bug，结果契约本身是自洽的**：两类账本的区别是设计，不是缺陷。
+
+模块 docstring 里那句「a killed rank writes no result at all」也是错的（与 `_spawn` 自己的
+docstring 打架），正是它把门禁引到了错误的假设上，一并改掉。
+
+### 改动（只动测试）
+
+- **一处死亡表**：新增 `_deaths(case)` → `{rank: 被杀的那一轮}`，按击杀顺序。
+  `_killed(case)` 变成 `list(_deaths(case))`，`_survivors` / `_assert_plan_stream` 都查它。
+  「谁会死、什么时候死」只由 case 自己的事件表决定，不靠「某字段在不在」去猜。
+- **NCCL 门禁按幸存者断言**：`is_cuda` 与 `backend == nccl` 只问 `_survivors(results, case)`，
+  强度不变——幸存者仍然必须 `is_cuda == True`、必须持 NCCL 训练组。
+  被杀 rank 的设备不是没人管：`_entry` 在任何东西跑起来之前就把它绑到自己的 GPU 上，
+  它活着时的 TP / pipeline collective 走 NCCL 组（CPU 张量会被直接拒绝，那样它就不是
+  以 `-9` 被收尸而是把整个作业搞崩），而且 `_assert_principle_a` 对它跑完的那几轮
+  用的是和幸存者**一模一样**的数值契约。
+- **补上反向断言** `_assert_account_kinds`（进 `_assert_sequence`，Gloo/NCCL 都过）：
+  被杀 rank 的账本**一个收尾字段都不能有**，且 `len(iterations)` 必须**正好等于**它死的那一轮；
+  幸存者的账本必须七个收尾字段齐全。
+  SIGKILL 本身的判定仍然只有 `harness.assert_killed` 一处（OS 退出码必须是 `-9`），没有第二套。
+
+### 本机（无 torch）已做的验证
+
+把 `_deaths` / `_killed` / `_survivors` / `_assert_account_kinds` 从模块里切片出来单独 exec，
+用合成账本逐条打靶——一次正确的运行通过，六类回归全部被抓住：
+
+| 注入的回归 | 结果 |
+|---|---|
+| 被杀 rank 在 SIGKILL 之后继续写迭代 | 抓住（迭代数 ≠ 死亡轮次） |
+| 被杀 rank 写出完整的最终账本 | 抓住（收尾字段不为空） |
+| 被杀 rank 只伪造 `is_cuda` | 抓住 |
+| 幸存者缺 `is_cuda` | 抓住 |
+| 幸存者缺 `resources` 快照 | 抓住 |
+| 被杀 rank 的账本比它实际活的还短 | 抓住 |
+
+另外核对了五个 case 的死亡表：victim 互不重复、都落在运行区间内、每个 case 至少留一个幸存者
+（`random_a` / `random_b` 各只剩 rank 5，`donor_exhaustion` 只剩 rank 0）。
+`python -m pytest -q`：125 passed, 12 skipped；`compileall` 通过。
+
+### 待目标机执行的门禁
+
+```bash
+python3 -m pytest -q tests/test_fault_sequences.py
+python3 -m pytest -q
+```
