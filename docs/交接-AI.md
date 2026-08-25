@@ -35,7 +35,7 @@ resihp/
 ├── memory.py      解析显存模型（全项目唯一计算器，125 行）
 ├── model.py       decoder-only Transformer；稳定全局 layer id 与逻辑参数名
 ├── reference.py   单进程确定性参考训练 + adamw / next_token_loss（数值锚点）
-├── checkpoint.py  原子 checkpoint：tmp 写 → 完整读回校验 → os.replace
+├── checkpoint.py  原子 checkpoint：tmp 写 → 完整读回校验 → os.replace；install_anchor
 ├── plan.py        ExecutionPlan / StagePlan / StateRoute / build_plan / assert_invariants
 │                  / boundary_hops（583 行，全项目真值来源）
 ├── planner/
@@ -84,6 +84,13 @@ resihp/
    `memory.py` 是唯一显存公式；`recovery.recover` 是唯一恢复链路；`verify.py` 是唯一验收契约；
    `parallel/tp.TensorParallelStage` 是唯一 stage 类（TP1 就是它在单 rank 组上）；
    边界实现只有 `PipelineRuntime` 里那一套 scatter/gather。**不要新增第二套。**
+   同一条纪律往下还管着这几个小的（都是收敛过一轮的，别再分叉）：`plan.build_plan` 是**唯一**
+   建计划入口（没有 `reconfigure` / `build_initial_plan` 包装层，控制面与 entrypoint 直接调它）；
+   `planner/tp.choose_tp` 是唯一 TP 选择入口；`planner/pp.owner_ranges` 是唯一「层数 → 归属区间」；
+   `reference.adamw` / `reference.next_token_loss` 是唯一优化器配置与唯一损失；
+   `checkpoint.install_anchor` 是唯一「anchor 装进 model+optimizer」；
+   `validate.py` 是唯一整数/rank 序列校验器（`config.py` 与 `checkpoint.py` 各自那条抛的是
+   `ConfigError` / `CheckpointError`，属于各自模块的对外契约，**有意**不并进来）。
 6. `memory.py` 的 `in_flight_micro_batches` **没有默认值**——默认 1 会静默低估 warmup 阶段的激活峰值，
    调用方必须显式从 `planner.pp.peak_in_flight` 取。`peak_in_flight` 是**回放 1F1B 调度 +1/−1** 得出的，
    不是闭式常量：调度改了，显存预算自动跟着改。
@@ -363,13 +370,56 @@ rank 7 = `[1..6]`、rank 0/2/3 = `[1..8]`。
 
 ---
 
-## 10. 当前状态与交接注意
+## 10. 测试门禁的结构（改测试前必读）
 
+真 `SIGKILL` 让门禁的**结果数据**分成两类，这一条最近连着咬了两次，写在这里免得第三次。
+
+多进程门禁都跑在 `tests/harness.py` 上：`run_ranks`（Supervisor 起进程、收退出码）、
+`read_results`（按 rank 读结果文件）、`assert_killed`（**全项目唯一**的 SIGKILL 判定——
+被杀的 rank 退出码必须**正好是 `-9`**，其余必须是 0）。要判断「某 rank 是不是真被杀了」，
+只准调它，不要另写一套。
+
+**两类结果账本**：
+
+| 门禁 | 被杀 rank 留下什么 | `_spawn` 返回 |
+|---|---|---|
+| `test_combinations.py` / `test_recovery.py` | **什么都没有**（结果只在最后写一次） | 只有幸存者，`{rank: result}` |
+| `test_end_to_end.py` / `test_fault_sequences.py` | **partial account**：每轮 `flush()` 一次，文件停在它死的那一轮 | 全部 rank，按 rank 排序的 list |
+
+partial account 里**没有收尾字段**——`is_cuda` / `backend` / `checkpoint` / `initialized` /
+`released_final` / `final_held_by` / `resources` 都是最后一轮之后、`control.shutdown()` 那一段才写的，
+死进程走不到那里。于是：
+
+- 任何碰收尾字段的断言**必须**先过 `_survivors(...)`；碰「哪一轮发生了什么」的断言用全量 results，
+  但**必须**带 `len(result["iterations"]) >= iteration` 判断（`test_end_to_end._iteration` /
+  `test_fault_sequences` 各家的循环已经是这个形状）。
+- **禁止**用 `result.get("is_cuda", True)` 这类默认值把缺字段糊过去——那等于把「幸存者也缺字段」
+  这条回归一起放掉了。
+- 「谁死了」只从**用例自己的故障表**推（`_deaths(case)` / `KILLED` / `VICTIMS[kind]`），
+  **不要**靠「某字段在不在」去猜。
+- 反向也要锁住：`test_fault_sequences._assert_account_kinds` 断言 victim 的账本一个收尾字段都没有、
+  且迭代数**正好等于**它死的那一轮，幸存者的账本七个收尾字段齐全。少了这条，
+  「被杀 rank 其实只是正常退出」「被杀 rank 死后还在写」都能蒙混过去。
+
+NCCL 门禁的强度不因此打折：幸存者仍然必须 `is_cuda == True` 且训练组 backend 是 `nccl`；
+被杀 rank 的设备由别的东西管住——`_entry` 在任何东西跑起来之前就把它绑到自己的 GPU，
+它活着时的 TP / pipeline collective 走 NCCL 组（CPU 张量会被直接拒收，那它就不是以 `-9` 被收尸
+而是把作业搞崩），且它跑完的那几轮受**同一套**数值契约检验。
+
+---
+
+## 11. 当前状态与交接注意
+
+- **8 卡目标机（2026-08-26）：`python3 -m pytest -q` → 249 passed, 0 skipped，全绿。**
+  这是当前代码的有效确认——包含全部 37 条 NCCL 门禁（真 GPU 张量 + 真 NCCL 训练组 + 真 `SIGKILL`），
+  以及最近一轮改动的通信结构（每跳并集组、边界 scatter/gather、1F1B 接入生产、
+  recovery 改为执行 `state_routes`）与去重收敛（唯一入口，见不变量 5）。
 - 开发机（Windows，无 torch）：`python -m pytest -q` → **125 passed, 12 skipped**；12 项 skip 全是
   分布式/GPU 模块在收集阶段整模块跳过（`torch` 不可导入），不是被跳过的断言。
-- 8 卡目标机：最近一轮全量审阅改动了真实通信结构（**每跳并集组、边界 scatter/gather、1F1B 接入生产、
-  recovery 改为执行 `state_routes`**），**分布式与数值门禁需要在目标机复跑一遍**。
-  旧的目标机确认是针对已经不存在的代码取得的，**不能沿用**。
+- **skip 数就是环境的体温计**：37 条门禁按需要的卡数分档（1/2/3/4/8 卡）。8 卡可见 → 0 skipped；
+  4 卡 → 6；2 卡 → 24；1 卡 → 34；**37 就是一块卡都没看见**（CPU-only torch，或容器没做设备透传）。
+  看见非 0 的 skip 先查 `python3 -c "import torch; print(torch.version.cuda, torch.cuda.device_count())"`，
+  或 `pytest -q -rs` 直接读跳过理由，不要以为是门禁本身有问题。
 - 分支 `fix/dp-replica-level-rerouting`。逐条自检见 [ACCEPTANCE.md](ACCEPTANCE.md)，
   每轮修改的根因见 [PROGRESS.md](PROGRESS.md)（进度只记在这一个文件，不在根目录另建进度文档）。
 - 本项目不宣称证明所有硬件绝对无误；结论建立在确定性数值对照、状态不变量、故障原子性与多进程端到端之上。

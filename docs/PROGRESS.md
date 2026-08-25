@@ -1550,3 +1550,27 @@ docstring 打架），正是它把门禁引到了错误的假设上，一并改�
 python3 -m pytest -q tests/test_fault_sequences.py
 python3 -m pytest -q
 ```
+
+## P15 八卡目标机全量绿灯（2026-08-26）
+
+`python3 -m pytest -q` → **249 passed, 0 skipped**。0 skipped 意味着 37 条 NCCL 门禁**全部真的跑了**
+（它们唯一的跳过条件是卡不够），所以这一次覆盖到了真 GPU 张量、真 NCCL 训练组、真 `SIGKILL`
+下的重配与恢复，是当前代码的**有效确认**。
+
+这轮之前的三次失败各自的根因与修法见 P13（真 kill / scatter-gather 那轮遗留的四条门禁）、
+P14（`test_fault_sequence_cuda_nccl` 没适配 partial account）。中间还有一次 37 skipped 的跑法，
+原因是那个环境里 `torch.cuda.is_available()` 为假，不是门禁问题——skip 数与可见卡数的对应关系
+（8→0，4→6，2→24，1→34，0→37）已经写进两份交接文档，避免下次再误读。
+
+### 交接文档同步
+
+- `docs/交接-人类.md` / `docs/交接-AI.md` 的「当前状态」改为这次的绿灯结果，并写清 skip 数
+  是环境体温计而不是门禁故障。
+- `docs/交接-AI.md` 新增 **§10 测试门禁的结构（改测试前必读）**：真 `SIGKILL` 把门禁结果分成
+  「幸存者完整账本」与「被杀 rank 的 partial account」两类，哪些门禁属于哪一类，收尾字段有哪七个，
+  碰它们的断言必须先过 `_survivors(...)`，SIGKILL 判定只准用 `harness.assert_killed`，
+  以及禁止用 `.get(field, default)` 糊缺字段。P13/P14 两次都栽在这一条上，写进文档止血。
+- `docs/交接-AI.md` 不变量 5「唯一性纪律」补齐 P12 收敛出来的那批唯一入口：
+  `build_plan` / `choose_tp` / `owner_ranges` / `reference.adamw` / `reference.next_token_loss` /
+  `checkpoint.install_anchor` / `validate.py`，并写明 `config.py`、`checkpoint.py` 里那两条
+  整数校验是**有意**不并的（异常类型属于各自模块的对外契约）。
