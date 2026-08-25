@@ -26,6 +26,30 @@ ADAM_EPS = 1e-8
 _OPTIM_STATES = ("exp_avg", "exp_avg_sq", "step")
 
 
+def adamw(params):
+    """The project's one optimizer configuration.
+
+    Every optimizer in the project is built here -- the single-process reference, the
+    distributed runtime, and the A2 reference alike -- so a run and the reference it is
+    compared against cannot drift apart in hyperparameters.
+    """
+    return torch.optim.AdamW(
+        params, lr=LEARNING_RATE, betas=ADAM_BETAS, eps=ADAM_EPS, weight_decay=WEIGHT_DECAY
+    )
+
+
+def next_token_loss(logits, tokens, vocab_size):
+    """The project's one loss: mean next-token cross-entropy over the whole batch.
+
+    ``logits`` and ``tokens`` must already be on the same device. The pipeline runtime
+    divides the result by the global micro-batch count at its call site; nothing else
+    scales it.
+    """
+    return F.cross_entropy(
+        logits[:, :-1].reshape(-1, vocab_size), tokens[:, 1:].reshape(-1)
+    )
+
+
 @dataclass(frozen=True)
 class StepRecord:
     """One iteration's fixed inputs and post-update summaries."""
@@ -100,13 +124,7 @@ class ReferenceRun:
         self.sequence_length = sequence_length
         self.model = ReferenceTransformer(config, vocab_size=vocab_size, sequence_length=sequence_length)
         self.model.train()
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=LEARNING_RATE,
-            betas=ADAM_BETAS,
-            eps=ADAM_EPS,
-            weight_decay=WEIGHT_DECAY,
-        )
+        self.optimizer = adamw(self.model.parameters())
         self.batches = _token_stream(
             vocab_size, sequence_length, config.batch_size, config.iterations, config.seed
         )
@@ -117,10 +135,7 @@ class ReferenceRun:
         """Run one iteration on the next fixed batch and record the result."""
         tokens = self.batches[self.cursor]
         logits = self.model(tokens)
-        loss = F.cross_entropy(
-            logits[:, :-1].reshape(-1, self.vocab_size),
-            tokens[:, 1:].reshape(-1),
-        )
+        loss = next_token_loss(logits, tokens, self.vocab_size)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()

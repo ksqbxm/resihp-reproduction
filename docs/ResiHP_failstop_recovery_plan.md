@@ -11,7 +11,7 @@
 **范围约束（硬性）：**
 
 - 只实现纠错恢复，**不实现** Detector、心跳、硬件测速、fail-slow、时间预测、性能优化。
-- 只处理 **fail-stop**；失效 rank 永久“逻辑下线”（仍参与控制面同步，不再参加训练通信与计算）。
+- 只处理 **fail-stop**；失效 rank 的**进程被真正杀死**（`SIGKILL`），不做任何清理、不再参与任何通信，其显存与通信域随进程一起消失。存活 rank 必须自己发现它没了、销毁含死进程的通信域、在幸存者上重建，再恢复它持有的状态。
 - 所有存活设备均视为健康，故障速度概念不存在，**pᵢ 恒等于 1，不作为任何输入**。
 - 不使用 Megatron；不安装/升级/卸载/修改 Torch、CUDA、NCCL。
 - 默认拓扑 `TP=2, PP=2, DP=2`，8 进程；GPU 用 NCCL，CPU 测试用 Gloo，**共用同一 Scheduler、状态格式与执行路径，仅切后端**。
@@ -21,9 +21,14 @@
 **唯一入口（删除 `hello_dist.py`，不保留旧入口/兼容层/双路径）：**
 
 ```bash
-torchrun --standalone --nproc_per_node=8 -m resihp.train \
-  --config configs/train.json --failures configs/failures.json
+python3 -m resihp.launch --config configs/train.json --failures configs/failures.json
 ```
+
+> 入口不是 `torchrun`：elastic agent 在任一 worker 被信号杀死时会连带杀掉/重启其余 worker，
+> 而 ResiHP 的恢复是**幸存者原地重配**而不是整个作业重启，两者不可兼得。`resihp.launch`
+> 只做三件事：托管全run 唯一的 `TCPStore`（放在 launcher 而不是 rank 0，故任何 rank 的死亡
+> 都带不走 rendezvous）、按 world size 起 worker 进程、以及在某个子进程死掉时**不动其余进程**。
+> 它同时是全run 唯一判断"谁还活着"的地方，依据只有操作系统报告的子进程退出状态。
 
 **故障文件（只含 fail-stop，按迭代严格递增，rank 合法不重复；出现速度/降级/检测字段直接拒绝）：**
 
@@ -96,14 +101,19 @@ RNG
 
 - 唯一不可变、带版本号 `ExecutionPlan`（**先记录最小必要集，跑通再加**），含：活跃/失效 ranks；每个逻辑 DP replica、PP stage 的 TP 成员；每 stage 连续 layer 范围；每个 micro-batch·stage 的执行 rank；参数/优化器状态的 donor、目标与重分片方式；计划版本与规范化摘要；不可行时的结构化原因。
 - **通信 rank / TP shard / PP owner 只由当前 ExecutionPlan 决定，禁止从旧布局隐式推导。**
-- 所有进程持有一个**始终存活的 Gloo 控制组**；训练组按当前计划建（GPU=NCCL / CPU=Gloo）。
+- 每个 epoch 有一个 **Gloo world 组**（当前存活成员），控制类集合通信（停止协商、checkpoint 收集、
+  恢复收集）跑在它上面；训练组按当前计划建（GPU=NCCL / CPU=Gloo）。真 kill 之后含死进程的 world 组
+  永久不可用（`new_group` 是它上面的集合操作），所以每次 fail-stop 必须**整体销毁并在幸存者上重建**。
+- **plan rank 与 torch rank 分离**：plan rank 是进程启动时的固定身份，planner / checkpoint /
+  `ExecutionPlan` 只讲这一种；torch rank 是它在当前成员表里的下标，每次重建都变。翻译只发生在
+  `ControlPlane` 一处。
 - **每次故障安全点严格顺序执行**（单 rank）：
   1. 完成并提交当前迭代。
-  2. 原子保存最近完成迭代 checkpoint。
-  3. 广播 fail-stop 事件。
+  2. 原子保存最近完成迭代 checkpoint。**每个迭代都做**：死进程事后无法贡献任何分片，唯一还能持有它分片的 checkpoint 就是它活着时写下的那个。
+  3. 在安全点边界与 supervisor 会合，读回本轮成员表——fail-stop 事件是**被发现的**，不是被广播的（本该广播它的那个 rank 已经不存在了）。
   4. 标记该 rank 永久失效。
   5. TP→PP→DP 重规划。
-  6. 所有进程按统一顺序释放旧训练组、建新组。
+  6. 所有进程按统一顺序释放旧训练组与旧 world 组，在幸存者上重建 world 组，再建新训练组。
   7. 恢复/迁移/重切参数与 AdamW。
   8. 校验计划摘要与完整逻辑状态摘要一致。
   9. 从下一迭代继续。
@@ -154,6 +164,9 @@ RNG
   - checkpoint 缺失/损坏/摘要不匹配；
   - 各 rank 计划不一致；
   - 状态重切后完整逻辑张量不一致。
+- 其中「无可执行 PP 分区」当且仅当**所有 replica 全灭**，真 kill 下这意味着一个进程都不剩：
+  没有 rank 能观察它、协商它、正常退出。该条件因此不再是「rank 观察到的停止」，而是作业结束本身，
+  验收改为「最后一次完成迭代的 checkpoint 完整可重载」。planner 侧的这条不可行原因仍被纯函数测试锁定。
 - **测试**：临时文件不完整不替换；各停止条件全部进程一致退出、无半完成组/计划、最后 checkpoint 可重载、报错只指根因不用冗余兜底掩盖。
 
 ---
@@ -204,7 +217,7 @@ TP 候选空；PP 无法覆盖全层；DP 目标显存全不足；健康 donor �
 3. 接入确定性 reroute 与新 batch 计算 + B 组不变量测试。
 4. TP 真实重切（3.3，含异构边界反向）→ PP 迁移（3.4）→ DP 重路由（3.5），逐个锁定。
 5. 原子重配与一致停止（3.6）；扩展到随机序列与反复注入。
-6. 形成单一运行脚本与测试门禁：`python3 -m pytest -q` 全绿方可进下一阶段；`torchrun --standalone --nproc_per_node=8 -m resihp.train ...` 做 GPU/NCCL 验收（≥连续两次 fail-stop 并继续）。
+6. 形成单一运行脚本与测试门禁：`python3 -m pytest -q` 全绿方可进下一阶段；`python3 -m resihp.launch --config ... --failures ...` 做 GPU/NCCL 验收（≥连续两次**真 kill** 的 fail-stop 并继续，被杀 rank 退出码为 -9）。
 
 ---
 

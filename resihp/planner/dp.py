@@ -1,11 +1,11 @@
 """Deterministic data-parallel micro-batch rerouting."""
 
 from dataclasses import dataclass
-from numbers import Integral
 from typing import Iterable
 
 from ..config import TrainConfig
 from ..memory import memory_feasible
+from ..validate import non_negative_int, positive_int, unique_ranks
 from .pp import peak_in_flight
 
 
@@ -80,49 +80,29 @@ class InfeasibleDP(ValueError):
         self.reason = reason
 
 
-def _integer(name: str, value: object, *, positive: bool = False) -> int:
-    if not isinstance(value, Integral) or isinstance(value, bool):
-        raise ValueError(f"{name} must be an integer")
-    value = int(value)
-    if (value <= 0) if positive else (value < 0):
-        qualifier = "positive " if positive else "non-negative "
-        raise ValueError(f"{name} must be a {qualifier}integer")
-    return value
-
-
-def _normalize_failure_signature(failure_signature: Iterable[int]) -> tuple[int, ...]:
-    ranks = tuple(_integer("failure_signature", rank) for rank in failure_signature)
-    if len(set(ranks)) != len(ranks):
-        raise ValueError("failure_signature must not contain duplicate ranks")
-    return tuple(sorted(ranks))
-
-
 def _validate_topology(topology: DPTopology) -> None:
     if not isinstance(topology, DPTopology):
         raise TypeError("active_topology must be a DPTopology")
-    _integer("micro_batches", topology.micro_batches, positive=True)
-    _integer("sequence_length", topology.sequence_length, positive=True)
-    _integer("vocab_size", topology.vocab_size, positive=True)
+    positive_int("micro_batches", topology.micro_batches)
+    positive_int("sequence_length", topology.sequence_length)
+    positive_int("vocab_size", topology.vocab_size)
     if topology.memory_budget is not None:
-        _integer("memory_budget", topology.memory_budget, positive=True)
+        positive_int("memory_budget", topology.memory_budget)
     if not topology.stages:
         raise ValueError("active_topology must contain at least one stage")
     seen: set[tuple[int, int]] = set()
     for stage in topology.stages:
-        _integer("replica_id", stage.replica_id)
-        _integer("stage_id", stage.stage_id)
-        _integer("stage_layers", stage.stage_layers, positive=True)
-        _integer("tp_degree", stage.tp_degree, positive=True)
-        ranks = tuple(_integer("stage ranks", rank) for rank in stage.ranks)
-        if len(ranks) != stage.tp_degree:
+        non_negative_int("replica_id", stage.replica_id)
+        non_negative_int("stage_id", stage.stage_id)
+        positive_int("stage_layers", stage.stage_layers)
+        positive_int("tp_degree", stage.tp_degree)
+        if len(unique_ranks("stage ranks", stage.ranks)) != stage.tp_degree:
             raise ValueError("stage ranks length must equal tp_degree")
-        if len(set(ranks)) != len(ranks):
-            raise ValueError("stage ranks must not contain duplicates")
         if (stage.replica_id, stage.stage_id) in seen:
             raise ValueError("active_topology contains duplicate replica/stage")
         seen.add((stage.replica_id, stage.stage_id))
         if stage.capacity is not None:
-            _integer("capacity", stage.capacity, positive=True)
+            positive_int("capacity", stage.capacity)
 
 
 def _stage_capacity(topology: DPTopology, stage: DPStage, *, index: int, num_stages: int) -> int:
@@ -183,9 +163,9 @@ def assign(
     consistent along the whole pipeline. No runtime timing or progress information
     participates in the result.
     """
-    step = _integer("step", step)
+    step = non_negative_int("step", step)
     _validate_topology(active_topology)
-    failures = _normalize_failure_signature(failure_signature)
+    failures = unique_ranks("failure_signature", failure_signature)
     failed = set(failures)
 
     replicas: dict[int, dict[int, DPStage]] = {}

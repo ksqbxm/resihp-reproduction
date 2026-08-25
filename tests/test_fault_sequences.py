@@ -4,15 +4,23 @@ Plan sections 四.C (multi failure-point coverage and sequence regressions), 四
 (a fixed-seed random sequence injected to exhaustion, and repeated injection without
 leaks) and 四.E (the one resource case the T14 stop gates structurally cannot reach).
 
-Every case is one uninterrupted job driven through the real nine-step safe point over
-the same runtime T16 uses; the cases differ only in *when* each failure lands and
-*which* rank it takes, which is exactly the axis 四.C asks to cover:
+Every case is one uninterrupted job driven through the real safe point -- every
+failure below is a real ``SIGKILL`` -- over the same runtime T16 uses; the cases differ
+only in *when* each failure lands and *which* rank it takes, which is exactly the axis
+四.C asks to cover:
+
+A rank rewrites its result file after every iteration, so the job leaves two kinds of
+account behind: a **survivor's**, complete down to the fields written on the way out,
+and a **victim's**, which stops at the iteration it died in and carries none of them.
+The two are told apart by the case's own schedule and by the operating system's exit
+codes (:func:`harness.assert_killed`), never by which fields a file happens to hold.
 
 * ``random_a`` / ``random_b`` -- fixed-seed random safe points and random victims, one
-  rank per event, injected until nothing can run: the eighth event leaves no rank at
-  all and every process stops on the agreed ``no_executable_pp``. Two independent
-  sequences over one topology are 四.C's "多次序列回归"; between them the replicas
-  lose their first stage, their last stage, and finally all but one rank.
+  rank per event, injected until only one rank is left running: every event is a real
+  ``SIGKILL``, and the survivor still has to end up holding the whole model and
+  training on. Two independent sequences over one topology are 四.C's "多次序列回归";
+  between them the replicas lose their first stage, their last stage, and finally all
+  but one rank.
 * ``interval_n`` -- one rank every ``N = 2`` iterations, four events (四.D's repeated
   injection). Victims ``1, 5, 0, 4`` empty *stage 0* of both replicas in turn, so the
   surviving stage absorbs every layer and the embedding changes owner twice.
@@ -20,8 +28,8 @@ the same runtime T16 uses; the cases differ only in *when* each failure lands an
   on the *last* stage, so it is the LM-head end that is resharded and a layer moves
   toward the embedding end rather than away from it.
 * ``donor_exhaustion`` -- 四.E's "健康 donor 全失但 checkpoint 可用", the only listed
-  scenario T14 does not gate. Its other six are the six consistent-stop conditions,
-  each already driven through a real ``safe_point`` in ``tests/test_recovery.py``;
+  scenario T14 does not gate. Its other six are the consistent-stop conditions, each
+  already driven through a real ``safe_point`` in ``tests/test_recovery.py``;
   this one is not a stop but a *successful* recovery, and it needs a replica to be
   wiped out entirely before the last surviving replica loses a rank. ``TP2 x PP1 x
   DP2`` losing ranks 2, 3 and then 1: at event 1 the shard comes from the peer
@@ -44,13 +52,14 @@ than for one event):
 * the data cursor advances once per iteration, with no replay and no skip.
 
 **Leaks** (四.D): after every event a rank holds exactly the training groups the
-current plan gives it -- its TP group, its executor group, and one two-rank group per
-pipeline hop it is a leader of -- on top of the baseline measured before any training
+current plan gives it -- its TP group, its executor group, and one union group per
+pipeline hop it takes part in -- on top of the baseline measured before any training
 group was built, and a dropped rank holds nothing beyond that baseline, so a rebuild
 neither accumulates groups nor leaves half a set. The expected count is read from the
 control plane itself rather than written down, because it varies with the topology: a
-PP1 replica has no hop at all, a PP2 stage leader has one, and a middle stage of a
-deeper pipeline has two; the checkpoint directory holds exactly one
+PP1 replica has no hop at all, a rank on an end stage of a PP2 pipeline has one, and a
+rank on a middle stage of a deeper pipeline has two; the checkpoint directory holds
+exactly one
 file and never a leftover
 ``.tmp``; and no process group survives shutdown. That a reconfiguration *replaces*
 a generation rather than accumulating one is asserted on the generation itself -- the
@@ -61,8 +70,8 @@ state this model holds, and its run-to-run spread is the size of a whole generat
 so it cannot resolve what a weakref answers exactly (see ``_resources``).
 
 The gates run on CPU/**Gloo** and on GPU/**NCCL** with real device tensors and real
-NCCL training groups; the world group stays Gloo on both, as the control plane's
-always-alive group (plan 3.2). The NCCL gate needs one GPU per rank -- eight for the
+NCCL training groups; the world group stays Gloo on both, and is re-formed over the
+survivors at every fail-stop. The NCCL gate needs one GPU per rank -- eight for the
 three-dimensional cases, four for ``donor_exhaustion`` -- and skips with fewer.
 
 Tolerance is T10's reassociation band for anything arithmetic; the ``torch.equal``
@@ -73,8 +82,6 @@ import faulthandler
 import gc
 import json
 import os
-import socket
-import time
 import types
 import weakref
 from dataclasses import dataclass
@@ -87,9 +94,11 @@ torch = pytest.importorskip("torch")
 import torch.distributed as dist
 from torch.nn import functional as F
 
+from harness import assert_killed, read_results, run_ranks
 from resihp.checkpoint import load_anchor, load_checkpoint
 from resihp.config import TrainConfig
-from resihp.control import STOP_CODES, ConsistentStop, ControlPlane
+from resihp.control import ConsistentStop, ControlPlane
+from resihp.train import fail_stop
 from resihp.plan import InfeasiblePlan, build_plan
 from resihp.planner.pp import peak_in_flight
 from resihp.recovery import initial_run, stage_of
@@ -133,8 +142,6 @@ DONOR = TrainConfig(
     iterations=5,
 )
 
-#: A rank stuck in a collective would hang the suite forever; fail the gate instead.
-JOIN_TIMEOUT = 600.0
 #: A blocked rank is invisible from outside, so each dumps its own stack after this long.
 STACK_DUMP_AFTER = 120.0
 
@@ -147,6 +154,11 @@ def _random_events(seed, world_size, iterations):
     generator is a plain LCG instead of :mod:`random` on purpose: the point of a
     fixed seed is that this exact sequence replays anywhere, and ``random.choice``'s
     internals are not part of the language's compatibility guarantee.
+
+    The last rank is never taken. Killing it would leave no process to observe
+    anything, so the sequence would end with nothing to assert; exhaustion all the way
+    to an empty job is its own gate
+    (``tests/test_recovery.py::test_losing_every_rank_ends_the_job``).
     """
     state = seed
 
@@ -156,7 +168,7 @@ def _random_events(seed, world_size, iterations):
         return (state >> 33) % bound
 
     events, at, live = [], 0, list(range(world_size))
-    while live:
+    while len(live) > 1:
         at += 1 + draw(2)
         if at >= iterations:
             break
@@ -177,9 +189,9 @@ class _Case:
 
 
 CASES = {
-    # Injected until resources are exhausted: the eighth event takes the last rank.
-    "random_a": _Case(THREE_D, _random_events(42, THREE_D.world_size, 10), "no_executable_pp"),
-    "random_b": _Case(THREE_D, _random_events(112, THREE_D.world_size, 10), "no_executable_pp"),
+    # Injected until only one rank is left: every victim is a killed process.
+    "random_a": _Case(THREE_D, _random_events(42, THREE_D.world_size, 10), None),
+    "random_b": _Case(THREE_D, _random_events(112, THREE_D.world_size, 10), None),
     # Every N = 2 iterations, emptying stage 0 of each replica in turn.
     "interval_n": _Case(THREE_D, ((2, 1), (4, 5), (6, 0), (8, 4)), None),
     # Every 2N = 4 iterations, on the last stage instead of the first.
@@ -193,12 +205,6 @@ CASES = {
         donors=((), ("peer_replica",), (), ("checkpoint",)),
     ),
 }
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _segment_end(case, iteration) -> int:
@@ -301,7 +307,7 @@ def _resources(label, control, result_dir, device) -> dict:
     from torch.distributed.distributed_c10d import _world
 
     # What the current plan entitles this rank to hold, counted from the control plane
-    # rather than assumed: TP group + executor group + one per pipeline hop it leads.
+    # rather than assumed: TP group + executor group + one per pipeline hop it joins.
     # Reading it live is also what makes the snapshot right at a *stopped* plan, where
     # the groups still held are the previous plan's.
     training_group_count = (
@@ -389,19 +395,20 @@ def _sentinel(run):
     return None if run is None else weakref.ref(next(run.stage.parameters()))
 
 
-def _run_sequence(rank, world_size, device, backend, case_name, result_dir):
-    """One rank's whole run: train, then take every safe point the case schedules."""
+def _run_sequence(rank, device, backend, case_name, result_dir):
+    """One rank's whole run: train, and take every safe point a real kill opens."""
     case = CASES[case_name]
     config = case.config
     schedule = dict(case.events)
     checkpoint = result_dir / "ckpt.pt"
 
-    control = ControlPlane(
-        rank, world_size, dist.group.WORLD, backend, vocab_size=VOCAB, sequence_length=SEQLEN
+    control = ControlPlane.initialize(
+        training_backend=backend, vocab_size=VOCAB, sequence_length=SEQLEN
     )
-    # Taken before any training group exists: the always-alive control group on its
-    # own is the baseline every later group count is measured against, so the leak
-    # check does not have to assume how torch counts the default group.
+    # Taken before any training group exists: the world group on its own is the
+    # baseline every later group count is measured against, so the leak check does not
+    # have to assume how torch counts the default group. A fail-stop re-forms that
+    # group, so the baseline is also what proves the *old* world was released.
     resources = [_resources("init", control, result_dir, device)]
     plan = build_plan(config, step=0, version=0)
     control.build_training_groups(plan)
@@ -430,17 +437,39 @@ def _run_sequence(rank, world_size, device, backend, case_name, result_dir):
     resources.append(_resources("start", control, result_dir, device))
     iterations, events, stop = [], [], None
     failed: tuple[int, ...] = ()
+    # Written after every iteration rather than once at the end: a rank about to be
+    # killed gets no chance to report afterwards, and its account of the iterations it
+    # *did* run is what lets the "(micro-batch, stage) executed exactly once" invariant
+    # still be checked over the iterations it took part in.
+    result = {
+        "rank": rank,
+        "plans": plans,
+        "events": events,
+        "iterations": iterations,
+        "stop": stop,
+    }
+    partial = Path(result_dir, f"result_{rank}.json")
 
+    def flush():
+        result["stop"] = stop
+        partial.write_text(json.dumps(result))
+
+    flush()
     for step in range(config.iterations):
         iteration = step + 1
         iterations.append(_iteration(control, plan, rank, iteration, reference[iteration - base]))
+        flush()
 
-        victim = schedule.get(iteration)
-        if victim is None:
-            continue
+        # Step 2 runs every iteration, while everyone the schedule is about to kill is
+        # still alive; step 3 is the boundary, where the survivors find out who is not.
+        control.commit_checkpoint(plan)
+        fail_stop(schedule, rank, iteration)  # a scheduled rank's process ends here
         replaced = _sentinel(control.training_run)
+        lost = control.observe()
+        if not lost:
+            continue
         try:
-            plan, failed = control.safe_point(config, plan, failed, victim, next_step=iteration)
+            plan, failed = control.safe_point(config, plan, failed, lost, next_step=iteration)
         except ConsistentStop as stopped:
             stop = {"code": stopped.reason.code, "message": stopped.reason.message}
             resources.append(_resources("stop", control, result_dir, device))
@@ -451,7 +480,7 @@ def _run_sequence(rank, world_size, device, backend, case_name, result_dir):
         events.append(
             {
                 "iteration": iteration,
-                "victim": victim,
+                "victim": lost[0],
                 "failed": list(failed),
                 "completed": completed,
                 "matches_checkpoint": _matches_anchor(control.training_run, plan, rank, checkpoint),
@@ -464,6 +493,7 @@ def _run_sequence(rank, world_size, device, backend, case_name, result_dir):
             }
         )
         resources.append(_resources(f"event{iteration}", control, result_dir, device))
+        flush()
         reference = _steps_from_anchor(
             config, anchor, device, start=completed, count=_segment_end(case, iteration) - iteration
         )
@@ -474,16 +504,14 @@ def _run_sequence(rank, world_size, device, backend, case_name, result_dir):
         # this is where it lands, not where it was asked to go.
         on_gpu &= bool(next(control.training_run.stage.parameters()).is_cuda)
 
-    result = {
-        "rank": rank,
-        "plans": plans,
-        "events": events,
-        "iterations": iterations,
-        "stop": stop,
-        "backend": None if control.tp_group is None else dist.get_backend(control.tp_group),
-        "is_cuda": on_gpu,
-        "checkpoint": _reload_checkpoint(config, checkpoint) if rank == 0 else None,
-    }
+    result.update(
+        stop=stop,
+        backend=None if control.tp_group is None else dist.get_backend(control.tp_group),
+        is_cuda=on_gpu,
+        # Every surviving rank reloads it: which ranks survive is the schedule's
+        # choice, so no fixed rank can be the designated reporter.
+        checkpoint=_reload_checkpoint(config, checkpoint),
+    )
     control.shutdown()
     result["initialized"] = dist.is_initialized()
 
@@ -496,6 +524,7 @@ def _run_sequence(rank, world_size, device, backend, case_name, result_dir):
     result["final_held_by"] = [] if final is None else _owners(final)
     resources.append(_resources("shutdown", control, result_dir, device))
     result["resources"] = resources
+    flush()
     return result
 
 
@@ -549,14 +578,27 @@ def _assert_plan_stream(results, case, label):
     # The case table's expected ending is the planner's, not a hand-written guess.
     assert stop_code == case.stop, (label, stop_code, case.stop)
     published = len(case.events) + 1 if stop_code is None else len(case.events)
+    complete = _complete(results, case)
     for result in results:
-        assert len(result["iterations"]) == len(results[0]["iterations"]), (label, result["rank"])
+        # A rank that was killed stops mid-stream, and everything it did record has to
+        # be exactly the survivors' prefix -- same versions, same digests, same events.
+        acted = len(result["plans"])
+        assert acted == published or result["rank"] in _deaths(case), (
+            label,
+            result["rank"],
+            acted,
+        )
         versions = [entry["version"] for entry in result["plans"]]
-        assert versions == list(range(published)), (label, result["rank"], versions)
-        assert [entry["digest"] for entry in result["plans"]] == digests, (label, result["rank"])
+        assert versions == list(range(acted)), (label, result["rank"], versions)
+        assert [entry["digest"] for entry in result["plans"]] == digests[:acted], (
+            label,
+            result["rank"],
+        )
         assert [entry["iteration"] for entry in result["events"]] == [
-            after for after, _victim in case.events[: published - 1]
+            after for after, _victim in case.events[: acted - 1]
         ], (label, result["rank"])
+    for result in _survivors(results, case):
+        assert len(result["iterations"]) == len(complete["iterations"]), (label, result["rank"])
         # The failure set the broadcast confirmed is the one the plan was built from.
         for order, entry in enumerate(result["events"]):
             assert entry["failed"] == result["plans"][order + 1]["failed"], (
@@ -582,20 +624,24 @@ def _assert_layers_and_placements(results, case, label):
     # One rank's copy of the plans is every rank's: the digest covers the stages and
     # the placements in full, and ``_assert_plan_stream`` has already required the
     # digests to be identical on every rank.
-    for version, entry in enumerate(results[0]["plans"]):
+    for version, entry in enumerate(_complete(results, case)["plans"]):
         for replica in {row[0] for row in entry["stages"]}:
             ranges = sorted(row[4] for row in entry["stages"] if row[0] == replica)
             covered = [layer for low, high in ranges for layer in range(low, high)]
             assert covered == list(range(config.num_layers)), (label, version, replica, ranges)
         assert {place[0] for place in entry["placements"]} == set(range(micro)), (label, version)
 
-    plan_of = _plan_by_iteration(results[0], case)
+    plan_of = _plan_by_iteration(_complete(results, case), case)
     for iteration in range(1, config.iterations + 1):
         entry = plan_of.get(iteration)
         if entry is None:
             continue  # the run stopped before this iteration
+        # Every rank that reached this iteration, killed ones included: what the plan
+        # placed on a rank that later died still had to be executed while it was alive.
         executed: dict[tuple[int, int], list[int]] = {}
         for result in results:
+            if len(result["iterations"]) < iteration:
+                continue
             for pair in result["iterations"][iteration - 1].get("processed", []):
                 executed.setdefault((pair[0], pair[1]), []).append(result["rank"])
         planned = {(place[0], place[1]): sorted(place[3]) for place in entry["placements"]}
@@ -641,7 +687,7 @@ def _plan_by_iteration(result, case) -> dict[int, dict]:
 
 def _assert_failed_ranks_and_data(results, case, label):
     """A failed rank never trains again; the token stream is walked once, in order."""
-    plan_of = _plan_by_iteration(results[0], case)
+    plan_of = _plan_by_iteration(_complete(results, case), case)
     for result in results:
         for record in result["iterations"]:
             entry = plan_of[record["iteration"]]
@@ -659,7 +705,8 @@ def _assert_failed_ranks_and_data(results, case, label):
         seen = {
             result["iterations"][iteration - 1]["cursor"]
             for result in results
-            if result["iterations"][iteration - 1]["trained"]
+            if len(result["iterations"]) >= iteration
+            and result["iterations"][iteration - 1]["trained"]
         }
         assert seen == {iteration - 1}, (label, iteration, seen)
 
@@ -684,9 +731,11 @@ def _assert_principle_a(results, case, label):
             assert record["grad_close"], detail
             assert record["step_close"], detail
     # The replicas' losses partition the global batch, so they sum to the reference's.
-    for iteration in _plan_by_iteration(results[0], case):
+    for iteration in _plan_by_iteration(_complete(results, case), case):
         by_replica, reference_loss = {}, None
         for result in results:
+            if len(result["iterations"]) < iteration:
+                continue
             record = result["iterations"][iteration - 1]
             if not record["trained"] or record["loss"] is None:
                 continue
@@ -705,8 +754,12 @@ def _assert_principle_a(results, case, label):
 
 
 def _assert_no_leaks(results, case, label):
-    """Groups, files, and generations never accumulate, and the checkpoint reloads."""
-    for result in results:
+    """Groups, files, and generations never accumulate, and the checkpoint reloads.
+
+    The survivors only: releasing what it held on the way out is something a killed
+    process never gets to do, and its shutdown snapshot does not exist.
+    """
+    for result in _survivors(results, case):
         # Every reconfiguration released the generation it replaced, and the run
         # released the last one on the way out (``_resources`` says why this is a
         # weakref rather than a byte count).
@@ -728,35 +781,25 @@ def _assert_no_leaks(results, case, label):
         assert result["initialized"] is False, (label, result["rank"])
     # The checkpoint the last safe point committed is still the one on disk, and it
     # still reloads end to end.
-    last_event, _victim = case.events[-1]
-    reloaded = [result["checkpoint"] for result in results if result["rank"] == 0][0]
-    assert reloaded == [last_event, len(case.events) - 1], (label, reloaded)
+    # It is committed every iteration, so the file that survives the run is the last
+    # iteration's, under the last plan the events published -- and every rank agrees.
+    expected = [case.config.iterations, len(case.events)]
+    for result in _survivors(results, case):
+        assert result["checkpoint"] == expected, (label, result["rank"], result["checkpoint"])
 
 
-def _assert_stop(results, case, label):
-    """Resource exhaustion ends the run once, for one agreed reason, on every rank."""
-    if case.stop is None:
-        for result in results:
-            assert result["stop"] is None, (label, result["rank"], result["stop"])
-        return
+def _assert_no_stop(results, case, label):
+    """Every sequence here recovers and trains on -- none of them may end in a stop.
+
+    The stop conditions themselves are T14's gates; what these cases are about is the
+    other outcome, so a stop appearing here is a failure to recover, not a scenario.
+    """
+    assert case.stop is None, (label, case.stop)
     for result in results:
-        assert result["stop"] is not None, (label, result["rank"])
-        # A condition the control plane cannot name would be a bug escaping as a
-        # resource condition, which plan 3.6 forbids.
-        assert result["stop"]["code"] in STOP_CODES, (label, result["rank"], result["stop"])
-        # The rejected plan was never published; the snapshot taken where the run
-        # stopped is the one ``_assert_no_leaks`` checks for a half-built group.
-        assert len(result["plans"]) == len(case.events), (label, result["rank"])
-        assert any(entry["at"] == "stop" for entry in result["resources"]), (
-            label,
-            result["rank"],
-        )
-    assert {result["stop"]["code"] for result in results} == {case.stop}, [
-        result["stop"] for result in results
-    ]
-    assert len({result["stop"]["message"] for result in results}) == 1, [
-        result["stop"]["message"] for result in results
-    ]
+        assert result["stop"] is None, (label, result["rank"], result["stop"])
+    # And the survivors really did reach the last iteration rather than stopping early.
+    for result in _survivors(results, case):
+        assert len(result["iterations"]) == case.config.iterations, (label, result["rank"])
 
 
 def _assert_donor_stream(results, case, label):
@@ -770,7 +813,7 @@ def _assert_donor_stream(results, case, label):
     ``_assert_principle_a``'s ``torch.equal`` with the anchor, which a silently
     zero-filled or half-kept shard could not satisfy.
     """
-    plans = results[0]["plans"]
+    plans = _complete(results, case)["plans"]
     assert [tuple(entry["donors"]) for entry in plans] == list(case.donors), (
         label,
         [entry["donors"] for entry in plans],
@@ -780,13 +823,53 @@ def _assert_donor_stream(results, case, label):
         assert alive == 1, (label, alive, plans[-1])
 
 
+#: The fields a rank writes only on its way out of :func:`_run_sequence` -- after its
+#: last iteration, when it shuts the control plane down and reloads the checkpoint. A
+#: killed process never reaches that code.
+_CLOSING_FIELDS = (
+    "backend",
+    "is_cuda",
+    "checkpoint",
+    "initialized",
+    "released_final",
+    "final_held_by",
+    "resources",
+)
+
+
+def _assert_account_kinds(results, case, label):
+    """A victim left a partial account and a survivor a complete one.
+
+    :func:`harness.assert_killed` has already matched the schedule against the exit
+    codes, so a victim is known to have died on ``SIGKILL`` rather than exited. This is
+    the converse, asserted on what it wrote: its file stops at exactly the iteration it
+    died in -- it flushed after that iteration and never again -- and carries not one
+    field that is only written after the last one. A survivor's carries all of them, so
+    a run that quietly stopped short of shutdown cannot pass either.
+    """
+    deaths = _deaths(case)
+    for result in results:
+        rank = result["rank"]
+        closing = tuple(field for field in _CLOSING_FIELDS if field in result)
+        if rank in deaths:
+            assert closing == (), (label, rank, closing)
+            assert len(result["iterations"]) == deaths[rank], (
+                label,
+                rank,
+                len(result["iterations"]),
+            )
+        else:
+            assert closing == _CLOSING_FIELDS, (label, rank, closing)
+
+
 def _assert_sequence(results, case, label):
+    _assert_account_kinds(results, case, label)
     _assert_plan_stream(results, case, label)
     _assert_layers_and_placements(results, case, label)
     _assert_failed_ranks_and_data(results, case, label)
     _assert_principle_a(results, case, label)
     _assert_no_leaks(results, case, label)
-    _assert_stop(results, case, label)
+    _assert_no_stop(results, case, label)
     if case.donors is not None:
         _assert_donor_stream(results, case, label)
 
@@ -794,11 +877,9 @@ def _assert_sequence(results, case, label):
 # --- process entry point ----------------------------------------------------------
 
 
-def _entry(rank, world_size, backend, case_name, result_dir, port):
-    """One spawned rank: Gloo world, training groups on ``backend``, then the case."""
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE=str(world_size)
-    )
+def _entry(rank, env, backend, case_name, result_dir):
+    """One spawned rank: join the world from the store, then run the case."""
+    os.environ.update(env)
     # Kept open for the process's lifetime: faulthandler writes into it from a timer.
     stack_file = Path(result_dir, f"stack_{rank}.txt").open("w")
     faulthandler.dump_traceback_later(STACK_DUMP_AFTER, repeat=True, file=stack_file)
@@ -808,41 +889,51 @@ def _entry(rank, world_size, backend, case_name, result_dir, port):
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
         assert torch.cuda.current_device() == rank
-    # The world group is Gloo on both backends -- it is the control plane's
-    # always-alive group (plan 3.2); only the training groups switch to NCCL.
-    dist.init_process_group(backend="gloo")
-    result = _run_sequence(rank, world_size, device, backend, case_name, Path(result_dir))
+    # The world group is Gloo on both backends -- it carries the object collectives and
+    # is re-formed on every fail-stop; only the training groups switch to NCCL.
+    _run_sequence(rank, device, backend, case_name, Path(result_dir))
     faulthandler.cancel_dump_traceback_later()
-    Path(result_dir, f"result_{rank}.json").write_text(json.dumps(result))
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
 def _spawn(backend, case_name, tmp_path):
-    """Spawn the case's ranks and require *all* of them to exit before the timeout."""
-    import torch.multiprocessing as mp
+    """Run the case for real; return every rank's account, in rank order.
 
-    world_size = CASES[case_name].config.world_size
-    context = mp.spawn(
-        _entry,
-        args=(world_size, backend, case_name, str(tmp_path), _free_port()),
-        nprocs=world_size,
-        join=False,
-    )
-    deadline = time.monotonic() + JOIN_TIMEOUT
-    while not context.join(timeout=5):
-        if time.monotonic() > deadline:
-            for process in context.processes:
-                process.terminate()
-            stacks = "\n".join(
-                f"--- rank {peer} ---\n{Path(tmp_path, f'stack_{peer}.txt').read_text()}"
-                for peer in range(world_size)
-                if Path(tmp_path, f"stack_{peer}.txt").exists()
-            )
-            pytest.fail(f"{case_name}/{backend}: a rank is blocked and did not exit\n{stacks}")
-    return [
-        json.loads(Path(tmp_path, f"result_{rank}.json").read_text()) for rank in range(world_size)
-    ]
+    A killed rank's file stops at the iteration it died in (see :func:`_run_sequence`),
+    so the invariants that are about *what ran* still see the whole job, while the ones
+    that are about how the run ended ask :func:`_survivors`.
+    """
+    case = CASES[case_name]
+    world_size = case.config.world_size
+    exit_codes = run_ranks(_entry, world_size, backend, case_name, str(tmp_path))
+    assert_killed(exit_codes, _killed(case), tmp_path, f"{case_name}/{backend}")
+    accounts = read_results(tmp_path, range(world_size))
+    return [accounts[rank] for rank in sorted(accounts)]
+
+
+def _deaths(case):
+    """``rank -> the iteration after which the schedule kills it``, in kill order.
+
+    The one authority on which ranks die: it is the case's own event list, so nothing
+    has to infer a death from a missing field or a short file.
+    """
+    return {victim: after for after, victim in case.events}
+
+
+def _killed(case):
+    """The ranks this case really kills, in the order it kills them."""
+    return list(_deaths(case))
+
+
+def _survivors(results, case):
+    """The ranks still running at the end -- the only ones with a full account."""
+    return [result for result in results if result["rank"] not in _deaths(case)]
+
+
+def _complete(results, case):
+    """One surviving rank's account: every plan, every iteration, every event."""
+    return _survivors(results, case)[0]
 
 
 def _skip_if_few_gpus(count):
@@ -864,13 +955,24 @@ def test_fault_sequence_gloo(tmp_path, case_name):
 
 @pytest.mark.parametrize("case_name", sorted(CASES))
 def test_fault_sequence_cuda_nccl(tmp_path, case_name):
-    """The same sequences on real GPU tensors and real NCCL training groups."""
+    """The same sequences on real GPU tensors and real NCCL training groups.
+
+    Only the survivors report a device and a backend: both are written on the way out
+    of :func:`_run_sequence`, and a killed process has no way out. What holds a victim
+    to the same standard is not a field it never wrote but what it had to do while it
+    was alive: :func:`_entry` binds it to its own GPU before anything runs, its TP and
+    pipeline collectives ride the NCCL training groups -- which reject a CPU tensor
+    outright, so a victim running on the wrong device would end the job rather than be
+    reaped with ``-9`` -- and ``_assert_sequence`` holds the iterations it did complete
+    to exactly the numerical contract a survivor's are held to.
+    """
     case = CASES[case_name]
     _skip_if_few_gpus(case.config.world_size)
     results = _spawn("nccl", case_name, tmp_path)
-    for result in results:
+    survivors = _survivors(results, case)
+    for result in survivors:
         assert result["is_cuda"], result["rank"]
     # An idle rank holds no training group; every rank that holds one is on NCCL.
-    backends = {result["backend"] for result in results} - {None}
-    assert backends == {"nccl"}, [result["backend"] for result in results]
+    backends = {result["backend"] for result in survivors} - {None}
+    assert backends == {"nccl"}, [result["backend"] for result in survivors]
     _assert_sequence(results, case, f"{case_name} NCCL")

@@ -20,23 +20,33 @@ never inferred from an older layout: which micro-batches this rank runs, which s
 is, how many stages its pipeline has, and which ranks its neighbours are all come from
 the plan's :class:`~resihp.planner.dp.DPAssignment`.
 
-**Stage boundaries.** A stage's activation (and the gradient of its input) is
-replicated across its TP group, so a boundary moves exactly one authoritative copy
-between the two stages' leaders and the receiving group replicates it -- never a
-per-rank sum, which would double-count, and never a single rank holding it, which would
-starve the others. That is what makes a boundary between stages of *different* TP degree
-work, and it is the project's only heterogeneous-boundary implementation.
+**Stage boundaries: scatter/gather.** A stage's activation (and the gradient of its
+input) is replicated across its TP group, so exactly one authoritative copy has to cross
+the boundary -- never a per-rank sum, which would double-count, and never a single rank
+holding it, which would starve the others. Following ResiHP's P2P communication
+optimization (paper Fig 7), that copy is *not* moved leader to leader: it is cut into
+``N = max(TP_send, TP_recv)`` equal contiguous chunks, each chunk is P2P-sent on its own
+``(sender, receiver)`` rank pair (:func:`scatter_routing`), and the receiving stage
+rebuilds the whole tensor with a fast intra-node **all-gather** over its own TP group.
+Every pair is distinct and carries ``1/N`` of the tensor, so the slow inter-stage link
+still moves one copy in total -- now spread across ``N`` parallel links instead of one
+leader link, and reassembled by a gather rather than a broadcast. That is also what
+makes a boundary between stages of *different* TP degree work, and it is the project's
+only boundary implementation.
 
 The two places where a send and a receive must overlap -- ``send_forward +
 recv_backward`` and ``send_backward + recv_forward`` in the steady state -- are issued
 as one fused :func:`torch.distributed.batch_isend_irecv`. That is not an optimization:
 each stage's transfers are ordered on its own stream, so issuing those two separately
 deadlocks (a stage blocks on a send its peer cannot match until the peer's own blocked
-send is matched). Fusing them lets both directions progress together. Because NCCL runs
-*batched* P2P on the group's own collective communicator -- every rank of that group
-would then have to issue it, in the same order -- each hop rides a process group holding
-**exactly its two leaders** (:func:`resihp.plan.boundary_pairs` names them, the control
-plane builds them). The un-fused hops use the same group for the same reason.
+send is matched). Fusing them lets both directions progress together -- a chunk's
+forward activation and its gradient ride the same rank pair, so the fused batch pairs up
+chunk for chunk. Because NCCL runs *batched* P2P on the group's own collective
+communicator -- every rank of that group would then have to issue it, in the same order
+-- every chunk of a hop rides one process group holding **the union of both stages'
+ranks** (:func:`resihp.plan.boundary_hops` names them, the control plane builds them),
+so one communicator serves the whole hop. The un-fused hops use the same group for the
+same reason.
 
 Splitting the batch into micro-batches reorders the FP32 loss reduction relative to the
 reference's single full-batch pass, so results match the single-process reference within
@@ -44,12 +54,13 @@ reference's single full-batch pass, so results match the single-process referenc
 micro-batch.
 """
 
+import math
+
 import torch
 import torch.distributed as dist
-from torch.nn import functional as F
 
 from ..planner.pp import pipeline_phases
-from ..reference import ADAM_BETAS, ADAM_EPS, LEARNING_RATE, WEIGHT_DECAY
+from ..reference import adamw, next_token_loss
 from .dp import (
     ActivationLog,
     dp_combine_gradients,
@@ -59,28 +70,57 @@ from .dp import (
 )
 
 
+def scatter_routing(up_members, down_members):
+    """The ``(sender, receiver)`` rank pair carrying each chunk of one pipeline hop.
+
+    ResiHP's P2P communication optimization. The boundary tensor is replicated inside
+    each stage's TP group, so only one copy has to cross the link between the stages;
+    it is cut into ``N = max(U, D)`` equal contiguous chunks and chunk ``k`` travels
+    from ``up_members[k*U//N]`` to ``down_members[k*D//N]``.
+
+    TP degrees are powers of two, so ``N`` is a multiple of both ``U`` and ``D``: every
+    sender owns a contiguous run of ``N/U`` chunks, every receiver a contiguous run of
+    ``N/D``, every member of both stages appears, and the ``N`` pairs are distinct. The
+    cross-link volume is therefore still exactly one copy, now spread over ``N`` parallel
+    links. The backward pass reuses this table with the roles reversed, so a chunk's
+    activation and its gradient ride the same rank pair and the steady state's fused
+    ``batch_isend_irecv`` still pairs up chunk for chunk.
+
+    Pure: no tensor, no device, no process group.
+    """
+    up, down = tuple(up_members), tuple(down_members)
+    chunks = max(len(up), len(down))
+    return tuple(
+        (up[index * len(up) // chunks], down[index * len(down) // chunks])
+        for index in range(chunks)
+    )
+
+
 class PipelineRuntime:
     """One rank's 1F1B execution of one training iteration, driven by the assignment.
 
     ``stage`` is this rank's :class:`resihp.parallel.tp.TensorParallelStage`;
     ``assignment`` is the plan's :class:`~resihp.planner.dp.DPAssignment`, which names
-    the executor ranks of every ``(micro_batch, stage)``. ``boundary_groups`` maps a
-    sorted leader pair to the two-rank process group its hop rides on, and ``group`` is
-    the group spanning every rank the plan places -- the DP gradient combine rides
-    there. Ranks are **global** throughout, because that is what the assignment names.
+    the executor ranks of every ``(micro_batch, stage)``. ``boundary_groups`` maps the
+    sorted union of two adjacent stages' ranks to the process group every chunk of that
+    hop rides on, and ``group`` is the group spanning every rank the plan places -- the
+    DP gradient combine rides there. Ranks are **plan ranks** throughout, because that
+    is what the assignment names: the stable identity a rank keeps for the whole run,
+    not its index in the current world, which changes every time a fail-stop re-forms
+    it. :meth:`_peer_rank` is the one place the two meet.
 
     :meth:`train_step` runs the schedule, combines gradients across DP replicas, and
     applies one AdamW WeightUpdate; :attr:`schedule` records the primitives it issued,
     in order, tagged with the micro-batch each acted on.
     """
 
-    def __init__(self, stage, *, replica_id, assignment, boundary_groups=None, group=None):
+    def __init__(self, stage, *, rank, replica_id, assignment, boundary_groups=None, group=None):
         self.stage = stage
         self.replica_id = int(replica_id)
         self.assignment = assignment
         self.group = group
         self.boundary_groups = dict(boundary_groups or {})
-        self.rank = dist.get_rank()
+        self.rank = int(rank)
         self.routes = executor_route(assignment, self.rank)
         self.micro_batches = [route["micro_batch"] for route in self.routes]
         self.micro_total = global_micro_count(assignment)
@@ -97,13 +137,13 @@ class PipelineRuntime:
             or (self.downstream is None) != stage.is_last
         ):
             raise ValueError("the stage's pipeline ends disagree with the assignment")
-        self.optimizer = torch.optim.AdamW(
-            stage.parameters(),
-            lr=LEARNING_RATE,
-            betas=ADAM_BETAS,
-            eps=ADAM_EPS,
-            weight_decay=WEIGHT_DECAY,
-        )
+        # The scatter routing indexes the stage's executors in ascending order and the
+        # gather reassembles the chunks in TP-rank order; the two are the same ordering
+        # only because the TP group is built from those very executors. A mismatch would
+        # reassemble the tensor wrongly or hang in the gather, so it is rejected here.
+        if self.routes and len(self.executors) != stage.tp_size:
+            raise ValueError("the stage's TP group disagrees with the assignment's executors")
+        self.optimizer = adamw(stage.parameters())
 
     # --- reading the assignment (the only authority on who talks to whom) ----------
 
@@ -145,77 +185,156 @@ class PipelineRuntime:
             raise ValueError("assignment gives this rank differing neighbours across micro-batches")
         return seen.pop() if seen else ((self.rank,), None, None)
 
-    def _hop(self, peer_leader: int):
-        """The two-rank process group this rank's hop to ``peer_leader`` rides on."""
-        return self.boundary_groups[(min(self.rank, peer_leader), max(self.rank, peer_leader))]
+    # --- Send / Recv primitives: the scatter/gather boundary ------------------------
+    #
+    # Every hop is named by the two stages it joins, upstream first, whichever side this
+    # rank is on: :func:`scatter_routing` is then the one table both sides read, so the
+    # forward chunk and its gradient always agree on which rank pair they belong to.
 
-    # --- Send / Recv primitives ----------------------------------------------------
+    def _hop(self, up_members, down_members):
+        """This hop's members, and the union process group every one of its chunks rides.
+
+        The member tuple is sorted, which is the order the group was built in, so a
+        member's position in it is its rank *inside* that group.
+        """
+        key = tuple(sorted(set(up_members) | set(down_members)))
+        return key, self.boundary_groups[key]
+
+    def _peer_rank(self, hop, group, peer):
+        """The torch rank a P2P op must name for the plan rank ``peer``.
+
+        A fail-stop kills a process and the survivors re-form the world, so a rank's
+        torch rank is only its index in the current membership while its plan rank is
+        fixed. Going through the hop group -- position in the hop, then that group's
+        own translation -- keeps this correct after any number of re-formations without
+        the runtime having to know the membership at all.
+        """
+        return dist.get_global_rank(group, hop.index(peer))
+
+    def _my_chunks(self, up_members, down_members):
+        """``(chunk index, peer rank)`` for every chunk of this hop this rank carries.
+
+        Adjacent stages own disjoint ranks, so this rank is the hop's sender or its
+        receiver, never both, and the peer is whichever end it is not. Because the
+        degrees are powers of two the indices are a contiguous run -- exactly this rank's
+        ``1/tp_size`` share of the flat tensor, which is what :meth:`_reconstruct` needs.
+        """
+        sending = self.rank in up_members
+        return tuple(
+            (index, receiver if sending else sender)
+            for index, (sender, receiver) in enumerate(
+                scatter_routing(up_members, down_members)
+            )
+            if (sender if sending else receiver) == self.rank
+        )
 
     def _exchange(self, ops) -> None:
-        # ``ops`` stays referenced for the whole call, keeping every send buffer alive
-        # until its transfer has completed.
-        for work in dist.batch_isend_irecv(list(ops)):
+        """Issue one hop's chunks as a single batch and wait for all of them.
+
+        A chunk is a slice of the flattened activation, so ``ops`` holds the only
+        reference keeping those buffers alive; it stays referenced for the whole call and
+        every transfer is waited on before returning, so no chunk is dropped in flight.
+        """
+        ops = list(ops)
+        for work in dist.batch_isend_irecv(ops):
             work.wait()
 
-    def _send_op(self, tensor, peer):
-        return dist.P2POp(dist.isend, tensor.contiguous(), peer, self._hop(peer))
+    def _scatter_send_ops(self, tensor, up_members, down_members):
+        """Sends of this rank's chunks of ``tensor``, one per pair it takes part in.
 
-    def _recv_op(self, buffer, peer):
-        return dist.P2POp(dist.irecv, buffer, peer, self._hop(peer))
+        The chunk index is global to the hop, because this rank holds the whole
+        replicated tensor and must put the receiver's own slice on the wire.
+        """
+        hop, group = self._hop(up_members, down_members)
+        flat = tensor.detach().reshape(-1)
+        width = flat.numel() // max(len(up_members), len(down_members))
+        return [
+            dist.P2POp(
+                dist.isend,
+                flat[index * width : (index + 1) * width].contiguous(),
+                self._peer_rank(hop, group, peer),
+                group,
+            )
+            for index, peer in self._my_chunks(up_members, down_members)
+        ]
 
-    def _replicate(self, buffer):
-        """Give every TP rank of this stage the copy its leader moved across the hop."""
-        if self.stage.tp_size > 1:
-            dist.broadcast(buffer, src=self.executors[0], group=self.stage.group)
-        return buffer
+    def _gather_recv(self, shape, device, up_members, down_members):
+        """A slab for this rank's chunks of the hop, and the receives that fill it.
 
-    @property
-    def _is_leader(self) -> bool:
-        return self.rank == self.executors[0]
+        The chunks are a contiguous run, so filling the slab in order makes it precisely
+        this rank's contiguous share of the flat tensor -- the shape
+        :meth:`_reconstruct` all-gathers.
+        """
+        hop, group = self._hop(up_members, down_members)
+        mine = self._my_chunks(up_members, down_members)
+        width = math.prod(shape) // max(len(up_members), len(down_members))
+        slab = torch.empty(len(mine) * width, device=device)
+        ops = [
+            dist.P2POp(
+                dist.irecv,
+                slab[slot * width : (slot + 1) * width],
+                self._peer_rank(hop, group, peer),
+                group,
+            )
+            for slot, (_index, peer) in enumerate(mine)
+        ]
+        return slab, ops
+
+    def _reconstruct(self, slab, shape):
+        """Rebuild the whole boundary tensor from this stage's slabs (intra-node gather).
+
+        Each TP rank holds its own contiguous share and the group is built from the
+        stage's executors -- the same ascending order the routing indexed them by -- so
+        concatenating the gathered shares in TP-rank order restores the flat tensor
+        exactly. At degree 1 the rank already holds all of it and no collective is issued.
+        """
+        if self.stage.tp_size == 1:
+            return slab.view(shape)
+        shares = [torch.empty_like(slab) for _ in range(self.stage.tp_size)]
+        dist.all_gather(shares, slab, group=self.stage.group)
+        return torch.cat(shares).view(shape)
 
     def _recv_forward(self, shape, device):
         if self.upstream is None:
             return None
-        received = torch.empty(shape, device=device)
-        if self._is_leader:
-            self._exchange([self._recv_op(received, self.upstream[0])])
-        return self._replicate(received).requires_grad_(True)
+        slab, ops = self._gather_recv(shape, device, self.upstream, self.executors)
+        self._exchange(ops)
+        return self._reconstruct(slab, shape).requires_grad_(True)
 
     def _send_forward(self, output) -> None:
-        if self.downstream is not None and self._is_leader:
-            self._exchange([self._send_op(output.detach(), self.downstream[0])])
+        if self.downstream is not None:
+            self._exchange(self._scatter_send_ops(output, self.executors, self.downstream))
 
     def _send_forward_recv_backward(self, output, shape, device):
         """Push this activation downstream while pulling the oldest gradient back."""
         if self.downstream is None:
             return None
-        grad = torch.empty(shape, device=device)
-        if self._is_leader:
-            peer = self.downstream[0]
-            self._exchange([self._send_op(output.detach(), peer), self._recv_op(grad, peer)])
-        return self._replicate(grad)
+        slab, receives = self._gather_recv(shape, device, self.executors, self.downstream)
+        self._exchange(
+            self._scatter_send_ops(output, self.executors, self.downstream) + receives
+        )
+        return self._reconstruct(slab, shape)
 
     def _recv_backward(self, shape, device):
         if self.downstream is None:
             return None
-        grad = torch.empty(shape, device=device)
-        if self._is_leader:
-            self._exchange([self._recv_op(grad, self.downstream[0])])
-        return self._replicate(grad)
+        slab, ops = self._gather_recv(shape, device, self.executors, self.downstream)
+        self._exchange(ops)
+        return self._reconstruct(slab, shape)
 
     def _send_backward(self, grad) -> None:
-        if self.upstream is not None and self._is_leader:
-            self._exchange([self._send_op(grad, self.upstream[0])])
+        if self.upstream is not None:
+            self._exchange(self._scatter_send_ops(grad, self.upstream, self.executors))
 
     def _send_backward_recv_forward(self, grad, shape, device):
         """Return the oldest gradient upstream while pulling the next activation."""
         if self.upstream is None:
             return None
-        received = torch.empty(shape, device=device)
-        if self._is_leader:
-            peer = self.upstream[0]
-            self._exchange([self._send_op(grad, peer), self._recv_op(received, peer)])
-        return self._replicate(received).requires_grad_(True)
+        slab, receives = self._gather_recv(shape, device, self.upstream, self.executors)
+        self._exchange(
+            self._scatter_send_ops(grad, self.upstream, self.executors) + receives
+        )
+        return self._reconstruct(slab, shape).requires_grad_(True)
 
     # --- the iteration -------------------------------------------------------------
 
@@ -256,10 +375,12 @@ class PipelineRuntime:
             if self.stage.is_last:
                 # Scale by the global micro-batch count so the accumulated gradient is
                 # the full-batch mean, matching the reference's single-pass loss.
-                output = F.cross_entropy(
-                    output[:, :-1].reshape(-1, self.stage.vocab_size),
-                    chunks[index][:, 1:].reshape(-1).to(device),
-                ) / self.micro_total
+                output = (
+                    next_token_loss(
+                        output, chunks[index].to(device), self.stage.vocab_size
+                    )
+                    / self.micro_total
+                )
                 total_loss.add_(output.detach())
             # An activation is counted in memory from here until its backward retires it
             # (plan 3.5), which is what makes the peak the 1F1B in-flight count.

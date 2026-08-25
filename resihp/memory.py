@@ -10,6 +10,7 @@ schedule warms up; callers derive it from :func:`resihp.planner.pp.peak_in_fligh
 from dataclasses import dataclass
 
 from .config import TrainConfig
+from .validate import positive_int
 
 
 _BYTES_PER_FP32 = 4
@@ -34,11 +35,6 @@ class MemoryBreakdown:
             + self.adam_exp_avg_sq
             + self.activation
         )
-
-
-def _positive(name: str, value: int) -> None:
-    if type(value) is not int or value <= 0:
-        raise ValueError(f"{name} must be a positive integer")
 
 
 def estimate_memory(
@@ -71,7 +67,7 @@ def estimate_memory(
         ("vocab_size", vocab_size),
         ("in_flight_micro_batches", in_flight_micro_batches),
     ):
-        _positive(name, value)
+        positive_int(name, value)
     if in_flight_micro_batches > micro_batches:
         raise ValueError("in_flight_micro_batches cannot exceed micro_batches")
     if config.model_dim % tp_degree or config.num_heads % tp_degree:
@@ -117,7 +113,7 @@ def memory_feasible(
     memory_budget: int,
     in_flight_micro_batches: int,
 ) -> bool:
-    _positive("memory_budget", memory_budget)
+    positive_int("memory_budget", memory_budget)
     return estimate_memory(
         config,
         tp_degree=tp_degree,

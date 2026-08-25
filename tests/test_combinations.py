@@ -13,8 +13,9 @@ elsewhere:
   the project's one runtime: the control plane drives this same class.
   T10 runs TP with a single stage and T12 runs the pipeline at TP degree 1; nothing
   ran real TP all-reduces *inside* a 1F1B schedule. The boundary activation is
-  replicated within a TP group, so the pipeline hop is per TP index: two columns,
-  ``(0,2)`` and ``(1,3)``, which is how TP and PP compose.
+  replicated within a TP group, so scatter/gather cuts the one crossing copy per TP
+  index -- chunks routed ``0 -> 2`` and ``1 -> 3`` -- and both ride the single union
+  hop group ``(0,1,2,3)``, which is how TP and PP compose.
 * ``tp_dp`` -- TP2 x DP2 through the same :class:`~resihp.parallel.pp.PipelineRuntime`,
   here as single-stage replicas: the DP dimension enters as which micro-batches a rank
   runs and as the cross-replica gradient combine.
@@ -43,9 +44,14 @@ elsewhere:
   group churn itself.
 
 Every gate runs on CPU/**Gloo** and on GPU/**NCCL** with real device tensors and real
-NCCL training groups; the world group is Gloo on both, because it is the control
-plane's always-alive group (plan 3.2). NCCL gates skip only when there are fewer GPUs
-than the case needs.
+NCCL training groups; the world group is Gloo on both, because control collectives
+never need the accelerator. NCCL gates skip only when there are fewer GPUs than the
+case needs.
+
+The two fail-stop gates kill rank 1 for real: it sends itself ``SIGKILL`` at the safe
+point, writes no result, and exits ``-9``. So the results are keyed by rank rather than
+positional -- a dead rank has no entry -- and what the surviving ranks then rebuild is
+a genuinely new world, not the old one minus a name.
 
 Tolerance: TP all-reduce and micro-batch splitting each reorder FP32 accumulation
 relative to the reference's single full-batch pass, so the comparison is the
@@ -56,8 +62,6 @@ import faulthandler
 import importlib.util
 import json
 import os
-import socket
-import time
 from pathlib import Path
 
 import pytest
@@ -67,6 +71,7 @@ torch = pytest.importorskip("torch")
 import torch.distributed as dist
 from torch.nn import functional as F
 
+from harness import KILLED, assert_killed, read_results, run_ranks
 from resihp.checkpoint import load_anchor
 from resihp.config import TrainConfig
 from resihp.control import ControlPlane
@@ -75,9 +80,9 @@ from resihp.parallel.reshard import shard_dims, shard_logical_state
 from resihp.parallel.tp import TensorParallelStage
 from resihp.plan import build_plan
 from resihp.planner.dp import DPAssignment, DPPlacement
-from resihp.plan import boundary_pairs
 from resihp.planner.pp import balanced_layers, peak_in_flight
 from resihp.recovery import dp_assignment, initial_run, stage_of
+from resihp.train import fail_stop
 from resihp import verify
 
 
@@ -109,6 +114,8 @@ LAYOUTS = {
     "solo_pp": dict(_BASE, tp=1, pp=2, dp=1),
 }
 MICRO = _BASE["batch_size"] // _BASE["micro_batch_size"]  # 4 micro-batches
+#: The fail-stop gates' schedule: rank 1 is killed after iteration 1.
+KILL = {1: 1}
 
 #: The 1F1B primitive order at 2 stages / 4 micro-batches, by pipeline index (T12).
 EXPECTED_SCHEDULE = {
@@ -116,8 +123,6 @@ EXPECTED_SCHEDULE = {
     1: ["F0", "B0", "F1", "B1", "F2", "B2", "F3", "B3", "W"],
 }
 
-#: A rank stuck in a collective would hang the suite forever; fail the gate instead.
-JOIN_TIMEOUT = 300.0
 #: A blocked rank is invisible from outside, so each dumps its own stack after this long.
 STACK_DUMP_AFTER = 60.0
 
@@ -128,12 +133,6 @@ requires_torch = pytest.mark.skipif(
 
 def _config(name) -> TrainConfig:
     return TrainConfig(**LAYOUTS[name])
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _batch(config, index, device):
@@ -276,19 +275,25 @@ def _micro_batch_map(plan):
 # --- gate runners -----------------------------------------------------------------
 
 
-def _run_tp_pp(rank, world_size, device, backend, result_dir):
+def _run_tp_pp(control, rank, world_size, device, backend, result_dir):
     """TP2 inside PP2: a heterogeneous-capable boundary between two TP2 stages.
 
-    The activation is replicated inside each stage's TP group, so the boundary moves one
-    authoritative copy between the two stage leaders (ranks 0 and 2) and each receiving
-    group broadcasts it -- the same single implementation a TP1 -> TP2 boundary uses.
+    The activation is replicated inside each stage's TP group, so exactly one copy
+    crosses the boundary: scatter/gather cuts it into two chunks carried by the distinct
+    pairs ``0 -> 2`` and ``1 -> 3``, and the receiving stage all-gathers them back into
+    the whole tensor -- the same single implementation a TP1 -> TP2 boundary uses.
     """
     from resihp.parallel.pp import PipelineRuntime
 
     config = _config("tp_pp")
     stage_id, tp_index = rank // config.tp, rank % config.tp
     mine = _groups(
-        [("tp0", (0, 1)), ("tp1", (2, 3)), ("hop", (0, 2)), ("exec", tuple(range(world_size)))],
+        [
+            ("tp0", (0, 1)),
+            ("tp1", (2, 3)),
+            ("hop", tuple(range(world_size))),
+            ("exec", tuple(range(world_size))),
+        ],
         backend,
         rank,
     )
@@ -312,11 +317,12 @@ def _run_tp_pp(rank, world_size, device, backend, result_dir):
     )
     runtime = PipelineRuntime(
         stage,
+        rank=rank,
         replica_id=0,
         assignment=assignment,
-        # Only the two leaders join the hop group; the others reach the activation
-        # through their stage's TP broadcast and hold no hop of their own.
-        boundary_groups={(0, 2): mine["hop"]} if "hop" in mine else {},
+        # One union group for the whole hop -- every rank of both stages joins it,
+        # because every one of them carries a chunk.
+        boundary_groups={tuple(range(world_size)): mine["hop"]},
         group=executors,
     )
     loss = runtime.train_step(_batch(config, 0, device))
@@ -334,7 +340,7 @@ def _run_tp_pp(rank, world_size, device, backend, result_dir):
     return result
 
 
-def _run_tp_dp(rank, world_size, device, backend, result_dir):
+def _run_tp_dp(control, rank, world_size, device, backend, result_dir):
     """TP2 x DP2 through the assignment-driven runtime: sharded execution, then combine."""
     from resihp.parallel.pp import PipelineRuntime
 
@@ -363,7 +369,12 @@ def _run_tp_dp(rank, world_size, device, backend, result_dir):
     )
     # Single-stage replicas: no pipeline hop exists, so no boundary group is needed.
     runtime = PipelineRuntime(
-        stage, replica_id=replica, assignment=assignment, boundary_groups={}, group=executors
+        stage,
+        rank=rank,
+        replica_id=replica,
+        assignment=assignment,
+        boundary_groups={},
+        group=executors,
     )
     loss = runtime.train_step(_batch(config, 0, device))
 
@@ -380,7 +391,7 @@ def _run_tp_dp(rank, world_size, device, backend, result_dir):
     return result
 
 
-def _run_pp_dp(rank, world_size, device, backend, result_dir):
+def _run_pp_dp(control, rank, world_size, device, backend, result_dir):
     """PP2 x DP2 with an imbalanced 3-vs-1 split across two pipelined replicas."""
     from resihp.parallel.pp import PipelineRuntime
 
@@ -412,6 +423,7 @@ def _run_pp_dp(rank, world_size, device, backend, result_dir):
     spec += [(3, index, 1, (2 + index,)) for index in (0, 1)]
     runtime = PipelineRuntime(
         stage,
+        rank=rank,
         replica_id=replica,
         assignment=_assignment(spec),
         boundary_groups={hop: mine[f"hop{replica}"]},
@@ -433,12 +445,9 @@ def _run_pp_dp(rank, world_size, device, backend, result_dir):
     return result
 
 
-def _run_scheduler_groups(rank, world_size, device, backend, result_dir):
+def _run_scheduler_groups(control, rank, world_size, device, backend, result_dir):
     """The scheduler's plan builds the process groups, and training rides on them."""
     config = _config("tp_dp")
-    control = ControlPlane(
-        rank, world_size, dist.group.WORLD, backend, vocab_size=VOCAB, sequence_length=SEQLEN
-    )
     plan = build_plan(config, step=0, version=0)
     control.build_training_groups(plan)
     run = _attach(control, plan, rank, device, result_dir / "ckpt.pt")
@@ -463,7 +472,7 @@ def _run_scheduler_groups(rank, world_size, device, backend, result_dir):
     return result
 
 
-def _run_scheduler_migration(rank, world_size, device, backend, result_dir):
+def _run_scheduler_migration(control, rank, world_size, device, backend, result_dir):
     """A replan plus the migration it implies, then principle A's after-resume half.
 
     Rank 1 fails, so replica 0 drops to TP1 while replica 1 keeps TP2 -- the replicas
@@ -473,16 +482,14 @@ def _run_scheduler_migration(rank, world_size, device, backend, result_dir):
     """
     config = _config("tp_dp")
     checkpoint = result_dir / "ckpt.pt"
-    control = ControlPlane(
-        rank, world_size, dist.group.WORLD, backend, vocab_size=VOCAB, sequence_length=SEQLEN
-    )
     plan = build_plan(config, step=0, version=0)
     control.build_training_groups(plan)
     run = _attach(control, plan, rank, device, checkpoint)
     is_cuda = bool(next(run.stage.parameters()).is_cuda)
     control.training_step()  # iteration 1 on the pristine topology
-
-    plan, failed = control.safe_point(config, plan, (), 1, next_step=1)
+    control.commit_checkpoint(plan)  # committed while rank 1 is still alive
+    fail_stop(KILL, rank, 1)  # rank 1 dies here: SIGKILL, no cleanup, no farewell
+    plan, failed = control.safe_point(config, plan, (), control.observe(), next_step=1)
     anchor, completed = load_anchor(checkpoint)
     stage = stage_of(plan, rank)
     result = {
@@ -506,7 +513,7 @@ def _run_scheduler_migration(rank, world_size, device, backend, result_dir):
     return result
 
 
-def _run_migration_checkpoint(rank, world_size, device, backend, result_dir):
+def _run_migration_checkpoint(control, rank, world_size, device, backend, result_dir):
     """State migration and the one atomic checkpoint, round-tripped.
 
     TP2 x PP2 over six layers: dropping a rank of stage 0 halves its degree *and*
@@ -515,9 +522,6 @@ def _run_migration_checkpoint(rank, world_size, device, backend, result_dir):
     """
     config = _config("pipeline")
     checkpoint = result_dir / "ckpt.pt"
-    control = ControlPlane(
-        rank, world_size, dist.group.WORLD, backend, vocab_size=VOCAB, sequence_length=SEQLEN
-    )
     plan = build_plan(config, step=0, version=0)
     control.build_training_groups(plan)
     run = _attach(control, plan, rank, device, checkpoint)
@@ -525,8 +529,9 @@ def _run_migration_checkpoint(rank, world_size, device, backend, result_dir):
 
     reference = _reference_steps(config, device, 1)[0]
     first_loss = control.training_step()  # iteration 1: real TP2 x PP2 forward/backward
-
-    plan, failed = control.safe_point(config, plan, (), 1, next_step=1)
+    control.commit_checkpoint(plan)  # committed while rank 1 is still alive
+    fail_stop(KILL, rank, 1)  # rank 1 dies here: SIGKILL, no cleanup, no farewell
+    plan, failed = control.safe_point(config, plan, (), control.observe(), next_step=1)
     anchor, completed = load_anchor(checkpoint)
 
     # The gather-and-commit is lossless: the anchor holds the whole logical model at
@@ -572,7 +577,7 @@ def _run_migration_checkpoint(rank, world_size, device, backend, result_dir):
     return result
 
 
-def _run_dynamic_groups_pipeline(rank, world_size, device, backend, result_dir):
+def _run_dynamic_groups_pipeline(control, rank, world_size, device, backend, result_dir):
     """Groups torn down and rebuilt between iterations, with 1F1B on the new ones.
 
     The safe point destroys and rebuilds every training group in unison; this gate
@@ -585,9 +590,6 @@ def _run_dynamic_groups_pipeline(rank, world_size, device, backend, result_dir):
     from resihp.parallel.pp import PipelineRuntime
 
     config = _config("solo_pp")
-    control = ControlPlane(
-        rank, world_size, dist.group.WORLD, backend, vocab_size=VOCAB, sequence_length=SEQLEN
-    )
     plan = build_plan(config, step=0, version=0)
     control.build_training_groups(plan)
 
@@ -606,6 +608,7 @@ def _run_dynamic_groups_pipeline(rank, world_size, device, backend, result_dir):
         # this gate: the runtime must ride communicators created after the run began.
         return PipelineRuntime(
             stage,
+            rank=rank,
             replica_id=mine.replica_id,
             assignment=assignment,
             boundary_groups=control.boundary_groups,
@@ -662,7 +665,7 @@ def _run_dynamic_groups_pipeline(rank, world_size, device, backend, result_dir):
 
 def _assert_numerics(results, label, *, ranks=None):
     """Every listed rank's gradients and post-AdamW weights match the reference."""
-    for rank, result in enumerate(results):
+    for rank, result in sorted(results.items()):
         if ranks is not None and rank not in ranks:
             continue
         # Surfaced so a failure shows the magnitude (reassociation vs a real bug).
@@ -682,12 +685,12 @@ def _assert_loss(results, label):
     """
     seen = {}
     reference_loss = None
-    for result in results:
+    for result in results.values():
         if result.get("loss") is None:
             continue
         seen[result["replica"]] = result["loss"]
         reference_loss = result["reference_loss"]
-    assert reference_loss is not None, (label, results)
+    assert reference_loss is not None, (label, sorted(results))
     assert abs(sum(seen.values()) - reference_loss) < 1e-4, (label, seen, reference_loss)
 
 
@@ -707,14 +710,14 @@ def _assert_tiles_the_model(results, indices, all_names):
 
 def _assert_tp_pp(results, label):
     _assert_numerics(results, label)
-    for result in results:
+    for result in results.values():
         assert result["tp_size"] == 2, result  # real TP inside the pipeline
         assert result["schedule"] == EXPECTED_SCHEDULE[result["pipeline_index"]], result
         # 1F1B holds one activation per stage still downstream, not one per micro-batch.
         assert result["activation_peak"] == peak_in_flight(
             MICRO, stage_index=result["pipeline_index"], num_stages=2
         ), result
-    assert [result["activation_peak"] for result in results] == [2, 2, 1, 1], results
+    assert [results[rank]["activation_peak"] for rank in sorted(results)] == [2, 2, 1, 1]
     # TP peers of a stage own the same names; the two stages tile the model.
     assert results[1]["owned"] == results[0]["owned"], results
     assert results[3]["owned"] == results[2]["owned"], results
@@ -727,7 +730,7 @@ def _assert_tp_pp(results, label):
 
 def _assert_tp_dp(results, label):
     _assert_numerics(results, label)
-    for result in results:
+    for result in results.values():
         assert result["tp_size"] == 2, result
         assert result["activation_drained"], result
         # One stage per replica: each forward is retired by the next backward, so the
@@ -736,9 +739,12 @@ def _assert_tp_dp(results, label):
             len(result["processed"]), stage_index=0, num_stages=1
         ), result
         assert result["activation_peak"] == 1, result
-    assert [result["replica"] for result in results] == [0, 0, 1, 1], results
+    assert [results[rank]["replica"] for rank in sorted(results)] == [0, 0, 1, 1]
     # Each replica ran its own two micro-batches; together, every one exactly once.
-    micro = {result["replica"]: sorted(pair[0] for pair in result["processed"]) for result in results}
+    micro = {
+        result["replica"]: sorted(pair[0] for pair in result["processed"])
+        for result in results.values()
+    }
     assert micro == {0: [0, 1], 1: [2, 3]}, micro
     _assert_loss(results, label)
 
@@ -746,54 +752,62 @@ def _assert_tp_dp(results, label):
 def _assert_pp_dp(results, label):
     _assert_numerics(results, label)
     # The imbalanced split: replica 0 runs three micro-batches, replica 1 runs one.
-    assert [len(result["processed"]) for result in results] == [3, 3, 1, 1], results
-    for index, result in enumerate(results):
+    assert [len(results[rank]["processed"]) for rank in sorted(results)] == [3, 3, 1, 1]
+    for index, result in sorted(results.items()):
         assert result["activation_drained"], result
         # 1F1B: stage 0 warms up one extra forward, stage 1 retires immediately. Under
         # the old GPipe order replica 0's stage 0 would have held all three at once.
         assert result["activation_peak"] == peak_in_flight(
             len(result["processed"]), stage_index=index % 2, num_stages=2
         ), result
-    assert [result["activation_peak"] for result in results] == [2, 1, 1, 1], results
+    assert [results[rank]["activation_peak"] for rank in sorted(results)] == [2, 1, 1, 1]
     for indices in ((0, 1), (2, 3)):  # each replica really is a two-stage pipeline
         _assert_tiles_the_model(results, indices, results[0]["all_names"])
     # Every (micro, stage) executed exactly once across all ranks.
-    pairs = [tuple(pair) for result in results for pair in result["processed"]]
+    pairs = [tuple(pair) for result in results.values() for pair in result["processed"]]
     assert len(pairs) == len(set(pairs)) == 2 * MICRO, pairs
     _assert_loss(results, label)
 
 
 def _assert_scheduler_groups(results, label):
     _assert_numerics(results, label)
-    assert len({result["digest"] for result in results}) == 1, results  # one agreed plan
-    for result in results:
+    assert len({result["digest"] for result in results.values()}) == 1  # one agreed plan
+    for result in results.values():
         assert result["version"] == 0, result
         assert result["tp_size"] == 2, result  # groups built at the plan's TP degree
         assert result["initialized"] is False, result  # no residual process group
-    assert [result["tp_members"] for result in results] == [[0, 1], [0, 1], [2, 3], [2, 3]]
+    assert [results[rank]["tp_members"] for rank in sorted(results)] == [
+        [0, 1],
+        [0, 1],
+        [2, 3],
+        [2, 3],
+    ]
     # The scheduler's own micro-batch split, executed exactly as it was planned.
     assert results[0]["micro_batches"] == [[0, 0], [0, 1], [1, 2], [1, 3]], results[0]
     _assert_loss(results, label)
 
 
 def _assert_scheduler_migration(results, label):
-    for result in results:
+    # Rank 1 is a dead process: it has no result at all, which the harness already
+    # checked against its ``-9`` exit code.
+    assert sorted(results) == [0, 2, 3], sorted(results)
+    for result in results.values():
         assert result["version"] == 1 and result["failed"] == [1], result
         assert result["completed"] == 1, result  # one iteration ran before the event
         assert result["matches_checkpoint"], result  # principle A, before resume
         assert result["initialized"] is False, result
     # Replica 0 halved to TP1 while replica 1 kept TP2: different degrees, one plan.
-    assert [result["degree"] for result in results] == [1, None, 2, 2], results
-    assert results[1]["loss"] is None, results[1]  # the dead rank does no training work
+    assert {rank: results[rank]["degree"] for rank in results} == {0: 1, 2: 2, 3: 2}
     assert results[0]["micro_batches"] == [[0, 0], [0, 1], [1, 2], [1, 3]], results[0]
     # Principle A, after resume: the migrated run matches the checkpoint-anchored
     # reference for the new topology.
-    _assert_numerics(results, label, ranks={0, 2, 3})
-    _assert_loss([results[0], results[2]], label)
+    _assert_numerics(results, label)
+    _assert_loss({0: results[0], 2: results[2]}, label)
 
 
 def _assert_migration_checkpoint(results, label):
-    for result in results:
+    assert sorted(results) == [0, 2, 3], sorted(results)  # rank 1 is a dead process
+    for result in results.values():
         print(f"{label}: anchor diff {result['max_anchor_diff']:.2e}")
         assert result["version"] == 1 and result["failed"] == [1], result
         assert result["anchor_close"], result  # the commit gathered a lossless anchor
@@ -805,18 +819,18 @@ def _assert_migration_checkpoint(results, label):
     assert results[0]["first_loss"] is None, results[0]
     assert abs(results[2]["first_loss"] - results[2]["first_reference_loss"]) < 1e-4, results[2]
     # The event both halved stage 0's degree and moved a layer across the boundary.
-    assert [result["degree"] for result in results] == [1, None, 2, 2], results
+    assert {rank: results[rank]["degree"] for rank in results} == {0: 1, 2: 2, 3: 2}
     assert results[0]["layers"] == [0, 1], results[0]
     assert results[2]["layers"] == [2, 3, 4, 5], results[2]
     # And training continues correctly from the migrated state.
-    _assert_numerics(results, label, ranks={0, 2, 3})
-    assert results[0]["loss"] is None and results[2]["loss"] is not None, results
+    _assert_numerics(results, label)
+    assert results[0]["loss"] is None and results[2]["loss"] is not None
     assert abs(results[2]["loss"] - results[2]["reference_loss"]) < 1e-4, results[2]
 
 
 def _assert_dynamic_groups_pipeline(results, label):
     every = set(results[0]["all_names"])
-    for rank, result in enumerate(results):
+    for rank, result in sorted(results.items()):
         assert result["rebuilt"], result  # the groups really were replaced
         assert result["initialized"] is False, result
         for index, round_result in enumerate(result["rounds"]):
@@ -830,31 +844,29 @@ def _assert_dynamic_groups_pipeline(results, label):
             assert set(round_result["owned"]) < every, round_result
     # Both rounds still produce exactly one loss, on the last stage.
     for index in (0, 1):
-        first_stage, last_stage = (result["rounds"][index] for result in results)
+        first_stage, last_stage = (results[rank]["rounds"][index] for rank in sorted(results))
         assert first_stage["loss"] is None, (index, first_stage)
         assert abs(last_stage["loss"] - last_stage["reference_loss"]) < 1e-4, (index, last_stage)
 
 
-#: ``gate -> (runner, world size, assertion)``.
+#: ``gate -> (runner, world size, ranks really killed, assertion)``.
 GATES = {
-    "tp_pp": (_run_tp_pp, 4, _assert_tp_pp),
-    "tp_dp": (_run_tp_dp, 4, _assert_tp_dp),
-    "pp_dp": (_run_pp_dp, 4, _assert_pp_dp),
-    "scheduler_groups": (_run_scheduler_groups, 4, _assert_scheduler_groups),
-    "scheduler_migration": (_run_scheduler_migration, 4, _assert_scheduler_migration),
-    "migration_checkpoint": (_run_migration_checkpoint, 4, _assert_migration_checkpoint),
-    "dynamic_groups_pipeline": (_run_dynamic_groups_pipeline, 2, _assert_dynamic_groups_pipeline),
+    "tp_pp": (_run_tp_pp, 4, (), _assert_tp_pp),
+    "tp_dp": (_run_tp_dp, 4, (), _assert_tp_dp),
+    "pp_dp": (_run_pp_dp, 4, (), _assert_pp_dp),
+    "scheduler_groups": (_run_scheduler_groups, 4, (), _assert_scheduler_groups),
+    "scheduler_migration": (_run_scheduler_migration, 4, (1,), _assert_scheduler_migration),
+    "migration_checkpoint": (_run_migration_checkpoint, 4, (1,), _assert_migration_checkpoint),
+    "dynamic_groups_pipeline": (_run_dynamic_groups_pipeline, 2, (), _assert_dynamic_groups_pipeline),
 }
 
 
 # --- process entry point ----------------------------------------------------------
 
 
-def _entry(rank, world_size, gate, backend, result_dir, port):
-    """One spawned rank: Gloo world, training groups on ``backend``, then the gate."""
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE=str(world_size)
-    )
+def _entry(rank, env, gate, backend, result_dir):
+    """One spawned rank: join the world from the store, then run the gate."""
+    os.environ.update(env)
     # Kept open for the process's lifetime: faulthandler writes into it from a timer.
     stack_file = Path(result_dir, f"stack_{rank}.txt").open("w")
     faulthandler.dump_traceback_later(STACK_DUMP_AFTER, repeat=True, file=stack_file)
@@ -864,10 +876,14 @@ def _entry(rank, world_size, gate, backend, result_dir, port):
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
         assert torch.cuda.current_device() == rank
-    # The world group is Gloo on both backends -- it is the control plane's
-    # always-alive group (plan 3.2); only the training groups switch to NCCL.
-    dist.init_process_group(backend="gloo")
-    result = GATES[gate][0](rank, world_size, device, backend, Path(result_dir))
+    # The world group is Gloo on both backends -- control collectives never need the
+    # accelerator; only the training groups switch to NCCL.
+    control = ControlPlane.initialize(
+        training_backend=backend, vocab_size=VOCAB, sequence_length=SEQLEN
+    )
+    result = GATES[gate][0](
+        control, rank, control.world_size, device, backend, Path(result_dir)
+    )
     faulthandler.cancel_dump_traceback_later()
     Path(result_dir, f"result_{rank}.json").write_text(json.dumps(result))
     if dist.is_initialized():
@@ -875,30 +891,23 @@ def _entry(rank, world_size, gate, backend, result_dir, port):
 
 
 def _spawn(gate, backend, tmp_path):
-    """Spawn the ranks and require *all* of them to exit before the timeout."""
-    import torch.multiprocessing as mp
+    """Run the gate's ranks under a real supervisor; return the survivors' results.
 
-    world_size = GATES[gate][1]
-    context = mp.spawn(
-        _entry,
-        args=(world_size, gate, backend, str(tmp_path), _free_port()),
-        nprocs=world_size,
-        join=False,
-    )
-    deadline = time.monotonic() + JOIN_TIMEOUT
-    while not context.join(timeout=5):
-        if time.monotonic() > deadline:
-            for process in context.processes:
-                process.terminate()
-            stacks = "\n".join(
-                f"--- rank {peer} ---\n{Path(tmp_path, f'stack_{peer}.txt').read_text()}"
-                for peer in range(world_size)
-                if Path(tmp_path, f"stack_{peer}.txt").exists()
-            )
-            pytest.fail(f"{gate}/{backend}: a rank is blocked and did not exit\n{stacks}")
-    return [
-        json.loads(Path(tmp_path, f"result_{rank}.json").read_text()) for rank in range(world_size)
-    ]
+    A gate that kills a rank gets back one result fewer, keyed by rank, plus the exit
+    codes that prove the kill was a kill and not a list entry.
+    """
+    _runner, world_size, killed, _assertion = GATES[gate]
+    exit_codes = run_ranks(_entry, world_size, gate, backend, str(tmp_path))
+    label = f"{gate}/{backend}"
+    if [rank for rank, code in exit_codes.items() if code not in (0, KILLED)]:
+        stacks = "\n".join(
+            f"--- rank {peer} ---\n{Path(tmp_path, f'stack_{peer}.txt').read_text()}"
+            for peer in range(world_size)
+            if Path(tmp_path, f"stack_{peer}.txt").exists()
+        )
+        pytest.fail(f"{label}: a rank exited unexpectedly {exit_codes}\n{stacks}")
+    assert_killed(exit_codes, killed, tmp_path, label)
+    return read_results(tmp_path, [r for r in range(world_size) if r not in set(killed)])
 
 
 def _skip_if_few_gpus(count):
@@ -915,7 +924,7 @@ def _skip_if_few_gpus(count):
 @pytest.mark.parametrize("gate", sorted(GATES))
 def test_combination_gloo(tmp_path, gate):
     results = _spawn(gate, "gloo", tmp_path)
-    GATES[gate][2](results, f"{gate} Gloo")
+    GATES[gate][3](results, f"{gate} Gloo")
 
 
 # --- NCCL gates (real GPU tensors and real NCCL training groups) ------------------
@@ -926,9 +935,9 @@ def test_combination_gloo(tmp_path, gate):
 def test_combination_cuda_nccl(tmp_path, gate):
     _skip_if_few_gpus(GATES[gate][1])
     results = _spawn(gate, "nccl", tmp_path)
-    for result in results:
+    for result in results.values():
         assert result["is_cuda"], result
     # An idle rank holds no training group; every rank that holds one is on NCCL.
-    backends = {result["backend"] for result in results} - {None}
-    assert backends == {"nccl"}, [result["backend"] for result in results]
-    GATES[gate][2](results, f"{gate} NCCL")
+    backends = {result["backend"] for result in results.values()} - {None}
+    assert backends == {"nccl"}, sorted(results)
+    GATES[gate][3](results, f"{gate} NCCL")

@@ -1,21 +1,28 @@
-"""Tests for the fail-stop control plane and nine-step safe point (T9).
+"""Tests for the fail-stop control plane and the safe point (T9).
 
-The pure ``reconfigure`` test runs anywhere. The eight-process Gloo test runs a real
+The pure replan test runs anywhere. The eight-process Gloo test runs a real
 ``TP2 x PP2 x DP2`` layout -- every rank holds the stage its plan gives it and steps
 through the plan's own micro-batch assignment -- and needs torch, so it is skipped
 without it (the plan forbids installing torch on this machine, so that gate runs on
 the target box).
+
+**The fail-stop is a real kill.** Ranks 1 and 5 send themselves ``SIGKILL`` at their
+scheduled safe points and are gone: no result file, an exit code of ``-9``, and a world
+group the survivors can no longer use. What the gate locks is that the survivors notice
+without being told by the dead rank, dissolve that world, re-form one over themselves,
+and carry the run to the end -- which is the whole difference between killing a process
+and merely excluding it from a list.
 """
 
 import importlib.util
 import json
-import socket
+import os
 from pathlib import Path
 
 import pytest
 
+from harness import assert_killed, read_results, run_ranks
 from resihp.config import TrainConfig
-from resihp.control import reconfigure
 from resihp.plan import build_plan
 
 
@@ -34,16 +41,17 @@ CONFIG = TrainConfig(
 VOCAB = 32
 SEQLEN = 8
 FAILURES = {2: 1, 4: 5}  # after_iteration -> failed_rank
+SURVIVORS = (0, 2, 3, 4, 6, 7)
 requires_torch = pytest.mark.skipif(
     importlib.util.find_spec("torch") is None, reason="torch not installed"
 )
 
 
-def test_reconfigure_is_deterministic_and_increments_version():
+def test_replanning_is_deterministic_and_increments_version():
     initial = build_plan(CONFIG, step=0, version=0)
-    v1 = reconfigure(CONFIG, initial, (1,), version=1, step=2)
-    v1_again = reconfigure(CONFIG, initial, (1,), version=1, step=2)
-    v2 = reconfigure(CONFIG, v1, (1, 5), version=2, step=4)
+    v1 = build_plan(CONFIG, step=2, version=1, failed_ranks=(1,), previous=initial)
+    v1_again = build_plan(CONFIG, step=2, version=1, failed_ranks=(1,), previous=initial)
+    v2 = build_plan(CONFIG, step=4, version=2, failed_ranks=(1, 5), previous=v1)
 
     assert v1.version == 1 and v2.version == 2
     assert v1.digest == v1_again.digest  # deterministic across identical inputs
@@ -52,31 +60,21 @@ def test_reconfigure_is_deterministic_and_increments_version():
     assert v2.live_ranks == (0, 2, 3, 4, 6, 7)
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+def _worker(rank, env, result_dir):
+    os.environ.update(env)
 
-
-def _worker(rank, world_size, result_dir, port):
-    import os
-
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1",
-        MASTER_PORT=str(port),
-        RANK=str(rank),
-        WORLD_SIZE=str(world_size),
-    )
     import torch.distributed as dist
 
     from resihp.control import ControlPlane
     from resihp.recovery import initial_run, stage_of
-    from resihp.train import build_initial_plan
+    from resihp.train import fail_stop
 
     control = ControlPlane.initialize(
         training_backend="gloo", vocab_size=VOCAB, sequence_length=SEQLEN
     )
-    plan = build_initial_plan(CONFIG, vocab_size=VOCAB, sequence_length=SEQLEN)
+    plan = build_plan(
+        CONFIG, step=0, version=0, vocab_size=VOCAB, sequence_length=SEQLEN
+    )
     control.build_training_groups(plan)
     control.attach_run(
         initial_run(
@@ -92,19 +90,22 @@ def _worker(rank, world_size, result_dir, port):
     )
 
     failed = ()
-    versions, digests, trained, layers = [], [], [], []
+    versions, digests, trained, layers, epochs = [], [], [], [], []
     for step in range(CONFIG.iterations):
         iteration = step + 1
         if control.training_run is not None:
             control.training_step()
             trained.append(iteration)
-        failed_rank = FAILURES.get(iteration)
-        if failed_rank is not None:
+        control.commit_checkpoint(plan)
+        fail_stop(FAILURES, rank, iteration)  # the scheduled rank dies here, for real
+        lost = control.observe()
+        if lost:
             plan, failed = control.safe_point(
-                CONFIG, plan, failed, failed_rank, next_step=iteration
+                CONFIG, plan, failed, lost, next_step=iteration
             )
             versions.append(plan.version)
             digests.append(plan.digest)
+            epochs.append(control.epoch)
             stage = stage_of(plan, rank)
             layers.append(None if stage is None else list(range(*stage.layer_range)))
     control.shutdown()
@@ -114,8 +115,10 @@ def _worker(rank, world_size, result_dir, port):
             {
                 "versions": versions,
                 "digests": digests,
+                "epochs": epochs,
                 "trained": trained,
                 "layers": layers,
+                "members": list(control.members),
                 "final_failed": list(plan.failed_ranks),
                 "final_live": list(plan.live_ranks),
                 "still_initialized": dist.is_initialized(),
@@ -125,48 +128,40 @@ def _worker(rank, world_size, result_dir, port):
 
 
 @requires_torch
-def test_control_plane_eight_process_gloo(tmp_path):
-    import torch.multiprocessing as mp
+def test_control_plane_survives_two_real_kills(tmp_path):
+    exit_codes = run_ranks(_worker, CONFIG.world_size, str(tmp_path))
 
-    world_size = CONFIG.world_size
-    assert world_size == 8
-    mp.spawn(
-        _worker,
-        args=(world_size, str(tmp_path), _free_port()),
-        nprocs=world_size,
-        join=True,
-    )
-    results = {
-        rank: json.loads(Path(tmp_path, f"result_{rank}.json").read_text())
-        for rank in range(world_size)
-    }
+    # The failed ranks are dead processes, not excluded list entries: the operating
+    # system reports the kill, and nothing of theirs was written after it.
+    assert_killed(exit_codes, killed=(1, 5), tmp_path=tmp_path, label="control")
+    for rank in (1, 5):
+        assert not Path(tmp_path, f"result_{rank}.json").exists(), rank
+    survivors = read_results(tmp_path, SURVIVORS)
 
-    # Each fail-stop event yields exactly one new, strictly increasing version.
-    for result in results.values():
+    # Each fail-stop event yields exactly one new, strictly increasing version, and one
+    # newly formed world -- the old one contained a killed process and is unusable.
+    for result in survivors.values():
         assert result["versions"] == [1, 2]
+        assert result["epochs"] == [1, 2]
 
-    # Failed ranks permanently leave the training path at their safe point.
-    assert results[1]["trained"] == [1, 2]
-    assert results[5]["trained"] == [1, 2, 3, 4]
-    for rank in (0, 2, 3, 4, 6, 7):
-        assert results[rank]["trained"] == [1, 2, 3, 4, 5, 6]
+    # The survivors trained through both kills, right to the end.
+    for rank in SURVIVORS:
+        assert survivors[rank]["trained"] == [1, 2, 3, 4, 5, 6]
 
-    # Every rank agrees on each event's plan digest.
+    # Every rank agrees on each event's plan digest, and on the membership it ended in.
     for event in range(2):
-        assert len({results[rank]["digests"][event] for rank in results}) == 1
+        assert len({survivors[rank]["digests"][event] for rank in SURVIVORS}) == 1
+    for result in survivors.values():
+        assert result["members"] == list(SURVIVORS)
 
-    # Real PP ownership: each rank keeps only its stage's contiguous layers, and a
-    # rank the plan drops keeps none at all.
+    # Real PP ownership: each rank keeps only its stage's contiguous layers.
     for rank in (0, 2, 4, 6):
-        assert results[rank]["layers"] == [[0, 1], [0, 1]] or results[rank]["layers"] == [
-            [2, 3],
-            [2, 3],
-        ], results[rank]
-    assert results[1]["layers"] == [None, None]
-    assert results[5]["layers"][1] is None
+        assert survivors[rank]["layers"] == [[0, 1], [0, 1]] or survivors[rank][
+            "layers"
+        ] == [[2, 3], [2, 3]], survivors[rank]
 
     # Consistent final topology and no residual process group anywhere.
-    for result in results.values():
+    for result in survivors.values():
         assert result["final_failed"] == [1, 5]
         assert result["final_live"] == [0, 2, 3, 4, 6, 7]
         assert result["still_initialized"] is False

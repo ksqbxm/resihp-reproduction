@@ -157,13 +157,31 @@ def test_balanced_layers_rejects_more_stages_than_layers():
         balanced_layers(2, 3)
 
 
-def test_the_plan_derives_its_pristine_partition_from_balanced_layers():
-    """One definition of the initial split, so plan and planner cannot disagree."""
-    from resihp.plan import _initial_stage_layers
+def test_the_plan_lays_its_pristine_partition_out_from_balanced_layers():
+    """One definition of the initial split, so plan and planner cannot disagree.
+
+    Asserted on the layer ranges ``build_plan`` actually publishes, so the plan has no
+    private copy of either the split or the way counts become ownership ranges.
+    """
+    from resihp.config import TrainConfig
+    from resihp.plan import build_plan
 
     for num_layers, pp in ((4, 2), (6, 2), (7, 3), (6, 4)):
-        assert _initial_stage_layers(num_layers, pp) == tuple(
-            len(stage) for stage in balanced_layers(num_layers, pp)
+        config = TrainConfig(
+            model_dim=16,
+            num_layers=num_layers,
+            num_heads=8,
+            batch_size=4,
+            micro_batch_size=2,
+            seed=1,
+            tp=1,
+            pp=pp,
+            dp=1,
+            iterations=1,
+        )
+        plan = build_plan(config, step=0, version=0)
+        assert tuple(stage.layer_range for stage in plan.stages) == tuple(
+            (stage[0], stage[-1] + 1) for stage in balanced_layers(num_layers, pp)
         )
 
 

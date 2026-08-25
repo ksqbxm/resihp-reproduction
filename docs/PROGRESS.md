@@ -1186,3 +1186,391 @@ python -m pytest -q  ->  125 passed, 12 skipped
 12 项 skip 是 10 个 torch 门禁模块整模块 skip + 2 项 GPU/torch 条件 skip。分布式与数值门禁
 **必须在 8 卡目标机复跑**，命令见 `docs/ACCEPTANCE.md` 第 5 节。本轮改动触及真实通信结构
 （每跳两 rank 组、leader→leader + TP broadcast、1F1B 接入生产），这些**尚未在本机执行过**。
+
+## P11 P2P scatter/gather 边界优化（ResiHP §"P2P Communication Optimization"，Fig 7）
+
+**根因**：当前 [resihp/parallel/pp.py](../resihp/parallel/pp.py) 的 stage 边界只把一份激活
+**leader→leader** 经一个两-rank 跳组搬过 InfiniBand，再在接收侧 TP 组内 **broadcast**（`_replicate`）。
+异构 TP degree 下功能正确，但不等价于论文性能：只走一条 leader 链、用 broadcast 而非 all-gather，
+未把跨节点流量摊到 N 条并行链路上。
+
+**修法**：全量替换、**不留前向兼容**，删除 leader-pair / `_replicate` 逻辑，scatter/gather 作为
+唯一边界路径。论文规则：把边界激活切成 `N = max(TP_send, TP_recv)` 等长连续块，chunk `k` 的
+sender = `up_members[k*U//N]`、receiver = `down_members[k*D//N]`，每个 `(sender,receiver)` 对恰搬
+一块（1/N），接收侧用节点内 all-gather 快速重构。净跨节点流量一份、摊到 N 条链路。分 3 个可独立
+验收的 commit：
+
+- **Commit 1（控制面，运行时不动）**：`plan.boundary_pairs` → `boundary_hops(plan)`，每个不同跳返回
+  两相邻 stage 全部 `executor_ranks` 的**排序并集元组**（去重）；`control.build_training_groups` 每个并集
+  建一个 `new_group`、以并集元组为 key。TP1↔TP1 并集 == 旧两-rank 对，故 TP1 跳不受影响。
+  验收 `pytest tests/test_plan.py tests/test_control.py -v`。**本机（无 torch）已跑：test_plan 35 passed；
+  test_control 1 passed / 1 skipped（8 进程 Gloo 门禁 skip）。**
+- **Commit 2（运行时）**：pp.py 新增纯函数 `scatter_routing`（torch-free，返回 N 个不重复
+  (sender,receiver) 对，即流量减少证明），重写 Send/Recv 为 `_scatter_send_ops` / `_gather_recv` /
+  `_reconstruct`（节点内 all-gather，TP1 退化 no-op），每跳一次 `batch_isend_irecv`；新增 TP2↔TP1
+  异构 CPU/Gloo 门禁。验收 `pytest tests/test_parallel_pp.py -v`。
+- **Commit 3（集成 + NCCL + 清理）**：更新 `test_combinations._run_tp_pp` 为并集组，回归
+  end_to_end / fault_sequences / recovery，目标机跑 GPU/NCCL 门禁，确保 `boundary_pairs` / `_replicate`
+  彻底删除（`grep -rn "boundary_pairs\|_replicate" resihp/` 为空）。
+
+分布式 + NCCL 门禁必须在 8 卡目标机复跑（本机无 torch）。
+
+### Commit 2 执行记录（运行时 scatter/gather，已完成）
+
+**改动**：`resihp/parallel/pp.py` + `tests/test_parallel_pp.py`。旧的 leader→leader 逻辑
+（`_hop` / `_replicate` / `_is_leader` / `_send_op` / `_recv_op`）**整体删除，不留兼容分支**；
+scatter/gather 是边界的唯一路径。
+
+- 新增模块级纯函数 `scatter_routing(up_members, down_members)`：返回 `N = max(U,D)` 个
+  `(sender, receiver)` 对，`chunk k` 由 `up[k*U//N] → down[k*D//N]` 承载。无 tensor / 无 device /
+  无进程组。
+- 运行时新方法：`_hop_group(up, down)`（并集元组查表）、`_my_chunks`（本 rank 承担的
+  `(chunk 序号, 对端 rank)`；相邻 stage rank 集合不相交，故本 rank 非发即收）、`_scatter_send_ops`、
+  `_gather_recv`（slab + irecv P2POp）、`_reconstruct`（`stage.group` 上 all-gather 后按 TP rank 序
+  cat 再 reshape；`tp_size==1` 时不发任何集合调用）。六个 Send/Recv 方法全部改写，每跳仍只一次
+  `batch_isend_irecv`，返回值与 `requires_grad_` 语义不变。
+- 关键不变量：因 degree 是 2 的幂，`N` 同时是 `U`、`D` 的倍数，故**每个 rank 的 chunk 序号是连续段**，
+  恰是它自己的 `1/degree` 连续份额——这正是接收侧能用**普通 all-gather**（而非 broadcast）重构的前提。
+  TP 组由 stage 的 `executor_ranks` 建立，所以「members 升序 == TP rank 序 == chunk 升序」；
+  `__init__` 新增 `len(executors) == stage.tp_size` 校验，因为不一致只会重构出错张量或在 gather 处挂死。
+- 前反向共用同一张路由表（角色互换），故 1F1B 稳态的融合 `batch_isend_irecv` 仍逐 chunk 配对。
+
+**新增测试**：
+- 纯函数门禁 `test_scatter_routing_spreads_one_copy_over_n_links` /
+  `..._gives_every_rank_a_contiguous_share`，覆盖 `(1,1),(2,2),(2,1),(1,2),(4,2)`：恰 N 个 chunk、
+  N 个**互不相同**的 rank 对（=流量减少证明：总量仍是一份，摊到 N 条链路）、每个成员都不空转、
+  每个成员的 chunk 连续且份额相等、升序拼接恰好覆盖 `0..N-1`。
+- 异构分布式门禁 `test_pp_heterogeneous_boundary_matches_reference_gloo` 与
+  `..._cuda_nccl`（world=3）：`TP2→TP1`（stage0=(0,1), stage1=(2,)）与 `TP1→TP2`
+  （stage0=(0,), stage1=(1,2)），走真实 `PipelineRuntime`，并集跳组 `(0,1,2)`；用
+  `resihp.verify.compare_shards` / `assert_matches_reference`（项目唯一的 Principle A 数值契约，
+  按各 rank 自身 TP 布局切片）断言梯度与一步 AdamW 后参数对齐单进程参考，另断言两 stage 名字不相交
+  且并集为全模型、1F1B 顺序不变、路由确实是 N 个跨两 stage 的不同对。
+- TP1↔TP1 并集 == 旧两-rank 对，`_pipeline` 辅助函数与既有 PP1/PP2 门禁**无需改动**（仅更新注释措辞）。
+
+**本机（无 torch）已做的验证**：
+- `python -m pytest -q`：125 passed, 12 skipped——与改动前基线一致，无回归。
+- `py_compile resihp/parallel/pp.py tests/test_parallel_pp.py`：通过。
+- `grep -rn "boundary_pairs\|_replicate" resihp/`：**空**（旧逻辑已彻底清除；`tests/test_combinations.py`
+  的引用属 Commit 3）。
+- **离线仿真**（scratchpad 假 torch/`torch.distributed`，`object.__new__` 造裸 runtime 后调用**生产方法本身**
+  `_scatter_send_ops`/`_gather_recv`/`_reconstruct`）：`U×D ∈ {1×1, 2×2, 2×1, 1×2, 4×2, 2×4}` 的前向与
+  反向共 12 组，全部满足「每个 rank 对恰一个 chunk、发收一一配对无残留、接收侧重构结果与源张量逐元素相等」。
+  同一 stub 下直接执行上面两个纯函数门禁的函数体，全部通过。
+
+**待目标机执行的门禁**：`python3 -m pytest -q tests/test_parallel_pp.py`（Gloo 必跑；NCCL 需 ≥3 卡，
+异构用例 world=3）。
+
+
+### Commit 3 执行记录（全栈接入 + 清理，已完成）
+
+**改动**：只动测试与文档措辞，运行时与控制面不再变更（Commit 1/2 已定型）。
+
+- `tests/test_combinations.py`：删除已失效的 `from resihp.plan import boundary_pairs`（该函数在
+  Commit 1 已改名，这一行是整个仓库最后一处引用；因模块级 `importorskip("torch")` 先行 skip，
+  本机跑不出 ImportError，属实打实的坏引用）。`_run_tp_pp` 的跳组由两-leader
+  `{(0,2): group over (0,2)}` 改为**并集组** `{(0,1,2,3): group over (0,1,2,3)}`，四个 rank 全部加入，
+  因为每个 rank 都承担一个 chunk；随之删掉 `if "hop" in mine else {}` 的非成员分支。
+  `tp_dp`（无跳）与 `pp_dp`（TP1 跳，并集 == 旧两-rank 对）按设计无需改动。
+- `tests/test_parallel_reshard.py`：异构边界门禁 `_run_boundary`（stage0=TP1 rank0，
+  stage1=TP2 ranks1,2）的跳组 `(0,1)`（旧「两个 stage leader」）改为并集 `(0,1,2)`。
+  这一处是 Commit 2 遗留的坏引用——旧 key 会在 `_hop_group` 直接 KeyError，本机因无 torch 未暴露。
+- 文档措辞对齐（旧 leader→broadcast 说法已不成立）：`resihp/parallel/reshard.py` 模块 docstring、
+  `tests/test_parallel_reshard.py` 模块 docstring、`tests/test_combinations.py` 模块 docstring 与
+  `_run_tp_pp` docstring、`tests/test_fault_sequences.py` 的组泄漏说明（「每跳两-rank 组、该 rank 是
+  leader 的跳」→「每跳一个并集组、该 rank 参与的跳」）。
+- `tests/test_fault_sequences.py:310` 的 `len(control.boundary_groups)` 断言无需改动：期望值本就从控制面
+  实时读出（`baseline + training_group_count`），并集化只改 key 与成员、不改跳的数量。
+  `test_end_to_end` / `test_recovery` / `test_control` / `test_parallel_tp` 均只透传
+  `control.boundary_groups`，`recovery.py` / `train.py` 同理，全部无需改动。
+
+**本机（无 torch）已做的验证**：
+- `python -m pytest -q`：125 passed, 12 skipped——与 Commit 2 后基线一致，无回归。
+- `python -m pytest -q tests/test_plan.py tests/test_control.py`：36 passed, 1 skipped。
+- `python -m compileall resihp/ tests/`：通过。
+- `grep -rn "boundary_pairs\|_replicate" resihp/`：**空**；`grep -rn "boundary_pairs" tests/`：**空**。
+  旧逻辑与最后的引用全部清除，scatter/gather 是边界的唯一路径。
+- **离线索引仿真**：按生产代码的 `scatter_routing` + slab/all-gather 下标算法在纯 Python 上跑
+  `(0,1)→(2,3)`、`(0,)→(1,2)`、`(0,1)→(2,)`、`(0,)→(1,)`、`(0,1,2,3)→(4,5)`，逐例断言
+  ①N 个 rank 对互不相同 ②上线总量恰为一份拷贝 ③每个接收 rank 的 chunk 连续 ④按 TP rank 序拼接后
+  与源张量逐元素相等；并据此确认本次写入的并集 key 与 `_hop_group` 的 `sorted(set(up)|set(down))`
+  完全一致：tp_pp = `(0,1,2,3)`、reshard 异构 = `(0,1,2)`、TP1 跳 = `(0,1)`（未变）。
+
+**待目标机执行的门禁**（本机无 torch，分布式/数值/NCCL 全部 skip）：
+```bash
+python3 -m pytest -q tests/test_combinations.py tests/test_end_to_end.py tests/test_fault_sequences.py tests/test_recovery.py
+python3 -m pytest -q tests/test_parallel_pp.py tests/test_parallel_reshard.py tests/test_parallel_dp.py tests/test_parallel_tp.py
+python3 -m pytest -q          # 全量，含 8 卡 NCCL 门禁
+```
+
+---
+
+## 真 kill fail-stop：故障发现、通信域重建、单一路径（本轮）
+
+状态：实现完成，待目标机验证。**旧的「逻辑排除」路径已完全删除，不保留兼容层。**
+
+### 问题
+
+此前的 fail-stop 是**模拟**的：被点名的 rank 进程不死，只是被踢出训练组、不再做训练工作，
+但仍留在始终存活的 Gloo `WORLD` 控制组里，继续参与故障广播、停止协商和 checkpoint 收集。
+论文里的 fail-stop 是设备真的没了，因此这条实现绕过了三件真问题：故障发现、NCCL 死对端、
+通信域重建。
+
+### 现在的路径（唯一）
+
+1. **真 kill**：`resihp.train.fail_stop` 在排程点让被点名的 rank 对自己 `os.kill(SIGKILL)`。
+   不是异常、不是 `exit`、不是标志位——进程当场消失，没有 atexit、没有进程组析构、没有缓冲写出。
+   时刻是**安全点边界**：完成本轮 → 写完 checkpoint → 死 → （幸存者才去会合）。
+2. **发现**：`resihp/launch.py` 的 supervisor（起进程的父进程）唯一依据操作系统报告的子进程
+   退出状态。没有心跳、没有超时猜测、不可能把活着的 rank 判死。每个迭代边界所有存活 rank 在
+   `TCPStore` 上会合（`ControlPlane.observe`），supervisor 收完尸再公布本轮成员表。
+   被杀的 rank 从来没到过会合点 ⇒ 幸存者在**发起下一次训练集合通信之前**就知道它没了。
+3. **NCCL 死对端**：靠上一条从根上避免——任何训练组集合通信都不会在成员已死的情况下发起。
+   陈旧通信域在重配时销毁，且此时必然静默（边界会合已证明没有在途传输）；每个进程组都带有限
+   `timeout`（`control.GROUP_TIMEOUT`），卡住会抛错而不是永久挂起。
+4. **通信域重建**：含死进程的 world 组永久不可用（`new_group` 是它上面的集合操作），所以每次
+   fail-stop **整体销毁 world 并在幸存者上重建**（`dissolve_world` / `form_world`，每个 epoch 一个
+   `PrefixStore` 前缀），再建新训练组。
+5. **plan rank / torch rank 分离**：plan rank 是进程启动时的固定身份，planner、checkpoint、
+   `ExecutionPlan` 只讲这一种；torch rank 是它在当前成员表里的下标，每次重建都变。翻译只在
+   `ControlPlane.torch_rank` 一处；`PipelineRuntime` 的 P2P 对端改走 hop 组组内下标
+   （`_peer_rank` → `dist.get_global_rank`），运行时因此完全不需要知道成员表。
+6. **checkpoint 改为每轮提交**：死进程事后无法贡献分片，唯一还可能持有它那份的 checkpoint 就是
+   它活着时写下的那个。这也是「恢复前状态精确等于故障前 checkpoint」（原则 A 前半）在真 kill 下
+   仍然成立的前提。
+
+### 入口变更（硬性）
+
+`torchrun` **不能**作为入口：elastic agent 见到一个 worker 被信号杀死就会连带杀掉/重启其余
+worker，而 ResiHP 的恢复是幸存者原地重配、不是整个作业重启。唯一入口改为：
+
+```bash
+python3 -m resihp.launch --config configs/train.json --failures configs/failures.json
+```
+
+`resihp.launch` 托管全 run 唯一的 `TCPStore`（放在 launcher 而不是 rank 0，故任何 rank 的死亡都
+带不走 rendezvous）、起 worker、子进程死掉时**不动其余进程**，并汇总退出码（被杀的应为 -9）。
+`resihp.train` 变成它起的 worker（不带 `RANK` 时仍是不依赖 torch 的配置回显）。
+
+### 新增 / 改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `resihp/membership.py` | **新增**：store 键协议、worker 侧 `connect`/`boundary`、父侧 `Supervisor`（托管 store、收尸、公布成员表） |
+| `resihp/launch.py` | **新增**：唯一入口，起 8 个 worker 子进程并汇总退出码 |
+| `resihp/control.py` | 重写：删除 `broadcast_failure` 与始终存活控制组；新增 `observe` / `form_world` / `dissolve_world` / `torch_rank`；`_commit_checkpoint` → 公开的 `commit_checkpoint`；`safe_point(config, plan, failed, lost, ...)` 收「发现的丢失集合」而不是注入的 victim |
+| `resihp/train.py` | 重写为 worker：每轮 commit → `fail_stop` → `observe` → 需要时 `safe_point`；acceptance 行新增 `world_members` |
+| `resihp/parallel/pp.py` | `PipelineRuntime` 新增必填 `rank=`（plan rank，不再 `dist.get_rank()`）；P2P 对端经 hop 组换算 |
+| `resihp/recovery.py` | `control_group` → `world_group`；`PlannedRun` 透传 `rank`；删除「failed rank 仍持有状态」的死分支 |
+| `tests/harness.py` | **新增**：多进程门禁共用的真 kill harness（`run_ranks` / `read_results` / `assert_killed`） |
+| 六个多进程测试文件 | 全部改为真 kill：`mp.spawn` → `Supervisor`，注入 victim → `fail_stop` + `observe`，断言改为「幸存者结果 + 退出码 -9」 |
+
+### 语义变化（需要知情）
+
+- **`no_executable_pp` 不再是 rank 能观察到的一致停止**。planner 只在**所有 replica 全灭**时报它，
+  真 kill 下这等于一个进程都不剩：没有 rank 能观察、协商、正常退出。它变成作业结束本身，
+  验收口径改为「最后一次完成迭代的 checkpoint 完整可重载」
+  （`test_recovery.py::test_losing_every_rank_ends_the_job`）。planner 侧这条不可行原因仍由
+  `test_the_planner_stop_codes_come_out_of_a_real_replan` 锁定。因此分布式停止门禁从 6 条变为 5 条 + 1 条作业结束门禁。
+- **`plan_disagreement` 的注入对象改为幸存者**（4 rank 的 `replicated` 布局，注入 rank 2）：
+  原来注入 rank 1，而 rank 1 正是被杀的那个——死进程没法跟任何人不一致。
+- **随机故障序列不再杀到最后一个 rank**（`while len(live) > 1`），否则序列末尾没有任何进程能留下
+  可断言的结果；两条随机序列的期望结局从 `no_executable_pp` 改为「杀到只剩一个 rank 仍继续训练」。
+- **被杀 rank 不再写结果文件**。`test_end_to_end` 因此改为**每轮重写**自己的结果文件，
+  使被杀 rank 留下它活过的那些轮次的账本（这恰好证明它停在自己死的那一刻）；其余门禁只断言幸存者。
+- 故障表仍可点名 rank 0：store 托管在 launcher，不存在「rank 0 特殊」的角色。
+
+### 本机（无 torch）已做的验证
+
+- `python -m pytest -q`：**125 passed, 12 skipped**，与改动前基线一致。
+- `python -m compileall -q resihp tests`：通过。
+- `grep -rn "broadcast_failure\|_commit_checkpoint\|control_group\|dist.group.WORLD" resihp tests`：
+  仅 `control.py:243` 一处（`form_world` 里取新建的 WORLD 句柄），旧路径引用全清。
+- 纯 planner 实跑核对：截断后的两条随机序列 + `interval_n` / `interval_2n` / `donor_exhaustion`
+  全部不触发 `InfeasiblePlan`，末态 active rank 数分别为 1/1/4/6/1——与新的用例期望一致。
+- `test_acceptance.py::test_no_banned_constructs` 仍全绿（新代码措辞避开 Detector/心跳/速度等禁用词，
+  发现机制的依据只有子进程退出状态，与被禁的 fail-slow Detector 无关）。
+
+### 待目标机执行的门禁
+
+```bash
+python3 -m pytest -q tests/test_control.py tests/test_recovery.py
+python3 -m pytest -q tests/test_combinations.py tests/test_end_to_end.py tests/test_fault_sequences.py
+python3 -m pytest -q          # 全量，含 8 卡 NCCL 门禁
+python3 -m resihp.launch --config configs/train.json --failures configs/failures.json
+```
+
+最后一条应打印 3 行 `{"acceptance": ...}`（rank 0/2/3）与 1 行 `{"launch": ...}`，其中
+`killed_ranks == [1,4,5,6,7]`、这五个进程退出码为 -9、其余为 0。
+
+**已知风险（目标机首跑要盯的两处）**：
+1. `dist.destroy_process_group()` 销毁「成员已死但已静默」的 NCCL 通信域。设计上此时无在途传输，
+   `ncclCommDestroy` 应当本地完成；若目标机上出现挂起，改用 torch 2.5+ 的
+   `torch.distributed.distributed_c10d._abort_process_group()`。
+2. `dist.get_global_rank(group, i)`（`parallel/pp.py`）与 `dist.new_group(..., timeout=)` 的可用性
+   ——两者在 torch 2.8（NGC 25.06）都存在，但本机无 torch，无法实跑确认。
+
+## P12 重复逻辑入口收敛（本轮）
+
+**问题**：同一件事有多套入口，改一处不改另一处就会分叉。逐条核对后确认属实的有八处。
+
+| 重复项 | 原来 | 现在 |
+|---|---|---|
+| 层数 → 归属区间 | `plan._owner_ranges` 与 `planner/pp._owner_ranges` 两份逐字相同 | `planner/pp.owner_ranges` 唯一一份；`plan._old_layout` 直接用 `balanced_layers` + `owner_ranges` 铺初始布局，`plan._initial_stage_layers` 删除 |
+| 整数校验 | `planner/tp._positive_integer` / `_non_negative_integer`、`planner/dp._integer`、`planner/pp._integer_sequence`、`memory._positive`，加 `plan` 里 `step` / `version` 两处内联 | 新建 `resihp/validate.py`：`positive_int` / `non_negative_int` 各一份，全部改为引用 |
+| rank 序列归一化 | `tp._normalize_active_ranks` / `dp._normalize_failure_signature` / `plan._normalize_failed` 三份「去重 + 排序 + 非负」 | `validate.unique_ranks` 一份；`plan` 只额外多一行 world_size 越界检查（只有它有这个约束） |
+| TP 选择入口 | `feasible_degrees` 与 `choose_tp` 十参数签名逐字相同，前者只有测试在用 | 删除 `feasible_degrees`；`choose_tp` 是 TP 唯一入口，测试改为断言它选出的 degree 与结构化 `InfeasibleTP` |
+| 计划构建入口 | `plan.build_plan`、`control.reconfigure`、`train.build_initial_plan` 三个入口，后两个只是转发 | 只剩 `build_plan`；`safe_point` 与 `run_distributed` 直接调它，两个转发函数删除 |
+| AdamW 构造 | `reference.ReferenceRun`、`parallel/pp.PipelineRuntime`、`verify.adamw` 三份（`verify.adamw` 的注释还写着「唯一一份」），测试里另有四份 | `reference.adamw` 唯一一份，生产与测试全部引用 |
+| next-token 损失 | `reference.ReferenceRun.step`、`verify.step_record`、`parallel/pp` 最后一段 forward 三份 | `reference.next_token_loss` 一份；micro-batch 归一化仍留在 `pp` 的调用点 |
+| anchor 装载进 model+optimizer | `recovery._anchor_run` 与 `verify.steps_from_anchor` 两份 | `checkpoint.install_anchor` 一份，张量统一落到 model 自己的 device |
+| 层/边界归属查询 | `plan._owner_of` + `_boundary_owner_of` + `_group_owner` 三层，只有最外层有调用者 | 折叠成 `_group_owner` 一个函数 |
+
+### 语义变化（需要知情）
+
+- `memory` 的整数校验从 `type(value) is not int` 放宽到「`Integral` 且不是 `bool`」，与 planner 侧
+  一致。既有用例只用 0 触发，行为不变。
+- `build_plan(failed_ranks=...)` 传负数时报 `failed_ranks must be a non-negative integer`，
+  越界仍报 `out-of-range`；`repartition_pp` 的负数报错信息统一为同一句。
+- `PipelineRuntime` 最后一段 forward 现在把整个 `chunks[index]` 搬到 device 再切目标，原来只搬
+  切完的目标；多搬一列 token，数值完全等价。
+- `recovery._anchor_run` 装 moment 时现在会 `.clone()`（`install_anchor` 的统一行为）。原来是直接
+  引用刚重建出来的字典，写完即弃，两者结果相同。
+
+### 未合并的两处（有意保留）
+
+- `config._positive_int` 从 JSON 字段读值并抛 `ConfigError`（中文消息），`checkpoint.save_checkpoint`
+  的 `plan_version` 校验抛 `CheckpointError`。异常类型与消息是各自模块的对外契约，套一层转译比
+  重复的一行判断更长，不动。
+
+### 本机（无 torch）已做的验证
+
+- `python -m pytest -q`：**125 passed, 12 skipped**，与改动前基线逐项一致。
+- `python -m compileall -q resihp tests`：通过。
+- 全仓 grep 被删名字（`feasible_degrees` / `_owner_ranges` / `_initial_stage_layers` /
+  `_normalize_*` / `_positive_integer` / `reconfigure` / `build_initial_plan`）：无残留引用。
+- AST 扫全仓未使用 import：只剩 `tests/test_planner_dp.py:3` 的 `replace`，是既有问题，未动。
+
+### 待目标机执行的门禁
+
+```bash
+python3 -m pytest -q          # 全量，含 8 卡 NCCL 门禁
+python3 -m resihp.launch --config configs/train.json --failures configs/failures.json
+```
+
+本轮改到的 torch 路径是 `reference` / `verify` / `parallel/pp` / `recovery` / `checkpoint`
+五个文件的构造与装载，本机无法实跑，需目标机门禁确认。
+
+## P13 目标机全量门禁 4 个 failed —— 都是真 kill / scatter-gather 那轮留下的，本轮修掉
+
+**归属核对**（先做的事）：4 条全部在 P12（`1c14ba2` 去重重构）之前就存在。
+`test_combinations.py` / `test_end_to_end.py` P12 **一行都没动**；P12 对
+`test_parallel_dp.py` 只删了 `_adamw`，对 `test_recovery.py` 只改了 4 行 monkeypatch 目标。
+四处失效点分别由 `65e7cb5`（`tp_size` 校验）、`6547f60`（`STOP_SCENARIOS` 去掉
+`no_executable_pp`）、`65e7cb5`（`PipelineRuntime` 加 `rank=`）、`6547f60`（被杀 rank 的结果
+文件不再等长）引入——都是"生产改了、门禁没跟上"。
+
+| 门禁 | 根因 | 修法 |
+|---|---|---|
+| `test_parallel_dp.py::test_a_micro_batch_split_mid_pipeline_is_rejected_not_executed` | `PipelineRuntime` 现在校验 `len(executors) == stage.tp_size`，但 `_StubStage` 没有 `tp_size` | 桩补上 `tp_size = 1`（两个 spec 给 rank 0 的都是单 rank stage） |
+| `test_recovery.py::test_the_planner_stop_codes_come_out_of_a_real_replan` | `STOP_SCENARIOS` 有意去掉了 `no_executable_pp`，但这条用例仍按三个 planner code 查它 | 场景数据合成一张 `SCENARIOS`（含 `no_executable_pp`，victims 直接引用 `VICTIMS["pair"]`）；`STOP_SCENARIOS` 变成从它派生的**幸存者可观测**码表，只做 parametrize；所有查表统一走 `_scenario(code)` |
+| `test_combinations.py::test_combination_gloo[dynamic_groups_pipeline]` | 重建组后的 `PipelineRuntime(...)` 漏传必填的 `rank=`，两个 rank 都以 TypeError 退出 1 | 补 `rank=rank` |
+| `test_end_to_end.py::test_end_to_end_three_d_gloo` | `_assert_micro_batch_stage_executed_once` 对**所有** result 直接 `["iterations"][iteration-1]`，被杀 rank 的账本只到它死的那轮 → IndexError | 让 `_iteration` 返回 `(rank, record)`，三个按轮次读的门禁全部改走它——"哪些 rank 到达了第 N 轮"只剩一处定义 |
+
+### 本机（无 torch）已做的验证
+
+- 用真 planner 合成 end-to-end 的 8 rank 结果结构（被杀 rank 的账本按真实死亡轮次截断），
+  **旧代码复现出报告里同一句 `IndexError: list index out of range`，新代码 6 轮全过**；
+  顺带核对 `EXPECTED_PLANS` 三张表与当前 `build_plan` 输出逐项相同。
+- 纯 planner 复跑 `test_the_planner_stop_codes_come_out_of_a_real_replan` 的循环：
+  三个 code 各由自己的真实故障序列抛出（`no_executable_pp` 来自 `pair` 布局杀掉两个 rank）。
+- `python -m pytest -q`：125 passed, 12 skipped（本机可跑的部分不受影响）；`compileall` 通过。
+- 全仓扫同类问题：`PipelineRuntime(` 的 11 个调用点只有那一处漏 `rank=`；
+  `result["iterations"][...]` 的其余调用点（`test_fault_sequences.py`）本来就带长度判断。
+
+### 待目标机执行的门禁
+
+```bash
+python3 -m pytest -q
+```
+
+## P14 八卡实机：`test_fault_sequence_cuda_nccl` 5 条全挂 —— 门禁没适配 partial account
+
+**现象**：`assert result["is_cuda"]` 抛 `KeyError: 'is_cuda'`（`tests/test_fault_sequences.py:908`），
+五个 case 全中。Gloo 侧同样的 `_assert_sequence` 全绿。
+
+**根因**：这个文件的被杀 rank **会**留下 partial account——`_run_sequence` 每轮 `flush()` 一次，
+所以它的文件停在它死的那一轮；而 `is_cuda` / `backend` / `checkpoint` / `initialized` /
+`released_final` / `final_held_by` / `resources` 是**收尾字段**，只在最后一轮之后、
+`control.shutdown()` 那一段写出，死掉的进程根本走不到。NCCL 门禁却对 `results` 全量断言
+`is_cuda`，把「所有 rank 都正常跑到结尾」这个 true fail-stop 之前的假设留在了那里。
+`test_end_to_end.py` 的 NCCL 门禁早就改成只问 `_survivors(...)`，这里漏了。
+**生产代码没有 bug，结果契约本身是自洽的**：两类账本的区别是设计，不是缺陷。
+
+模块 docstring 里那句「a killed rank writes no result at all」也是错的（与 `_spawn` 自己的
+docstring 打架），正是它把门禁引到了错误的假设上，一并改掉。
+
+### 改动（只动测试）
+
+- **一处死亡表**：新增 `_deaths(case)` → `{rank: 被杀的那一轮}`，按击杀顺序。
+  `_killed(case)` 变成 `list(_deaths(case))`，`_survivors` / `_assert_plan_stream` 都查它。
+  「谁会死、什么时候死」只由 case 自己的事件表决定，不靠「某字段在不在」去猜。
+- **NCCL 门禁按幸存者断言**：`is_cuda` 与 `backend == nccl` 只问 `_survivors(results, case)`，
+  强度不变——幸存者仍然必须 `is_cuda == True`、必须持 NCCL 训练组。
+  被杀 rank 的设备不是没人管：`_entry` 在任何东西跑起来之前就把它绑到自己的 GPU 上，
+  它活着时的 TP / pipeline collective 走 NCCL 组（CPU 张量会被直接拒绝，那样它就不是
+  以 `-9` 被收尸而是把整个作业搞崩），而且 `_assert_principle_a` 对它跑完的那几轮
+  用的是和幸存者**一模一样**的数值契约。
+- **补上反向断言** `_assert_account_kinds`（进 `_assert_sequence`，Gloo/NCCL 都过）：
+  被杀 rank 的账本**一个收尾字段都不能有**，且 `len(iterations)` 必须**正好等于**它死的那一轮；
+  幸存者的账本必须七个收尾字段齐全。
+  SIGKILL 本身的判定仍然只有 `harness.assert_killed` 一处（OS 退出码必须是 `-9`），没有第二套。
+
+### 本机（无 torch）已做的验证
+
+把 `_deaths` / `_killed` / `_survivors` / `_assert_account_kinds` 从模块里切片出来单独 exec，
+用合成账本逐条打靶——一次正确的运行通过，六类回归全部被抓住：
+
+| 注入的回归 | 结果 |
+|---|---|
+| 被杀 rank 在 SIGKILL 之后继续写迭代 | 抓住（迭代数 ≠ 死亡轮次） |
+| 被杀 rank 写出完整的最终账本 | 抓住（收尾字段不为空） |
+| 被杀 rank 只伪造 `is_cuda` | 抓住 |
+| 幸存者缺 `is_cuda` | 抓住 |
+| 幸存者缺 `resources` 快照 | 抓住 |
+| 被杀 rank 的账本比它实际活的还短 | 抓住 |
+
+另外核对了五个 case 的死亡表：victim 互不重复、都落在运行区间内、每个 case 至少留一个幸存者
+（`random_a` / `random_b` 各只剩 rank 5，`donor_exhaustion` 只剩 rank 0）。
+`python -m pytest -q`：125 passed, 12 skipped；`compileall` 通过。
+
+### 待目标机执行的门禁
+
+```bash
+python3 -m pytest -q tests/test_fault_sequences.py
+python3 -m pytest -q
+```
+
+## P15 八卡目标机全量绿灯（2026-08-26）
+
+`python3 -m pytest -q` → **249 passed, 0 skipped**。0 skipped 意味着 37 条 NCCL 门禁**全部真的跑了**
+（它们唯一的跳过条件是卡不够），所以这一次覆盖到了真 GPU 张量、真 NCCL 训练组、真 `SIGKILL`
+下的重配与恢复，是当前代码的**有效确认**。
+
+这轮之前的三次失败各自的根因与修法见 P13（真 kill / scatter-gather 那轮遗留的四条门禁）、
+P14（`test_fault_sequence_cuda_nccl` 没适配 partial account）。中间还有一次 37 skipped 的跑法，
+原因是那个环境里 `torch.cuda.is_available()` 为假，不是门禁问题——skip 数与可见卡数的对应关系
+（8→0，4→6，2→24，1→34，0→37）已经写进两份交接文档，避免下次再误读。
+
+### 交接文档同步
+
+- `docs/交接-人类.md` / `docs/交接-AI.md` 的「当前状态」改为这次的绿灯结果，并写清 skip 数
+  是环境体温计而不是门禁故障。
+- `docs/交接-AI.md` 新增 **§10 测试门禁的结构（改测试前必读）**：真 `SIGKILL` 把门禁结果分成
+  「幸存者完整账本」与「被杀 rank 的 partial account」两类，哪些门禁属于哪一类，收尾字段有哪七个，
+  碰它们的断言必须先过 `_survivors(...)`，SIGKILL 判定只准用 `harness.assert_killed`，
+  以及禁止用 `.get(field, default)` 糊缺字段。P13/P14 两次都栽在这一条上，写进文档止血。
+- `docs/交接-AI.md` 不变量 5「唯一性纪律」补齐 P12 收敛出来的那批唯一入口：
+  `build_plan` / `choose_tp` / `owner_ranges` / `reference.adamw` / `reference.next_token_loss` /
+  `checkpoint.install_anchor` / `validate.py`，并写明 `config.py`、`checkpoint.py` 里那两条
+  整数校验是**有意**不并的（异常类型属于各自模块的对外契约）。

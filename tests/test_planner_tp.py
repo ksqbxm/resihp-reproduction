@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from resihp.config import TrainConfig
-from resihp.planner.tp import InfeasibleTP, choose_tp, feasible_degrees
+from resihp.planner.tp import InfeasibleTP, choose_tp
 
 
 CONFIG = TrainConfig(
@@ -23,27 +23,38 @@ CONFIG = TrainConfig(
 
 
 def test_candidates_are_powers_of_two_and_respect_divisibility():
-    assert feasible_degrees(CONFIG, active_ranks=range(8), min_degree=1) == (1, 2, 4, 8)
-    assert feasible_degrees(
-        CONFIG,
-        active_ranks=range(8),
-        min_degree=1,
-        memory_budget=1,
-        sequence_length=8,
-        vocab_size=32,
-        in_flight_micro_batches=1,
-    ) == ()
+    # Five live ranks: only the powers of two are candidates, so the choice is 4.
+    assert choose_tp(CONFIG, active_ranks=range(5), min_degree=1).degree == 4
+    assert choose_tp(CONFIG, active_ranks=range(8), min_degree=1).degree == 8
+
+
+def test_a_budget_no_degree_fits_is_a_structured_reason():
+    with pytest.raises(InfeasibleTP) as error:
+        choose_tp(
+            CONFIG,
+            active_ranks=range(8),
+            min_degree=1,
+            memory_budget=1,
+            sequence_length=8,
+            vocab_size=32,
+            in_flight_micro_batches=1,
+        )
+
+    assert error.value.reason.code == "no_feasible_tp"
 
 
 def test_minimum_degree_lower_bound_rounds_to_next_power_candidate():
-    assert feasible_degrees(CONFIG, active_ranks=range(8), min_degree=3) == (4, 8)
-    assert feasible_degrees(CONFIG, active_ranks=range(8), min_degree=5) == (8,)
-    assert feasible_degrees(CONFIG, active_ranks=range(8), min_degree=9) == ()
+    # A non-power-of-two bound selects the next power-of-two candidate above it: six
+    # live ranks and min_degree 3 give 4, eight ranks and min_degree 5 give 8.
+    assert choose_tp(CONFIG, active_ranks=range(6), min_degree=3).degree == 4
+    assert choose_tp(CONFIG, active_ranks=range(8), min_degree=5).degree == 8
+    with pytest.raises(InfeasibleTP):
+        choose_tp(CONFIG, active_ranks=range(8), min_degree=9)
 
 
 def test_memory_budget_requires_explicit_shape_and_inflight_inputs():
     with pytest.raises(ValueError, match="required when memory_budget is set"):
-        feasible_degrees(CONFIG, active_ranks=range(8), min_degree=1, memory_budget=1)
+        choose_tp(CONFIG, active_ranks=range(8), min_degree=1, memory_budget=1)
 
 
 def test_maximum_degree_and_ascending_stage_local_members_are_deterministic():
@@ -82,18 +93,18 @@ def test_invalid_model_head_config_is_rejected_as_bad_input():
 
 def test_invalid_inputs_are_not_hidden_by_empty_rank_set():
     with pytest.raises(ValueError, match="stage_layers"):
-        feasible_degrees(CONFIG, active_ranks=(), min_degree=1, stage_layers=0)
+        choose_tp(CONFIG, active_ranks=(), min_degree=1, stage_layers=0)
 
 
 @pytest.mark.parametrize("bad_rank", [-1, True, 1.5])
 def test_invalid_active_rank_values_are_rejected(bad_rank):
     with pytest.raises(ValueError, match="active_ranks"):
-        feasible_degrees(CONFIG, active_ranks=[0, bad_rank], min_degree=1)
+        choose_tp(CONFIG, active_ranks=[0, bad_rank], min_degree=1)
 
 
 def test_duplicate_active_ranks_are_rejected():
     with pytest.raises(ValueError, match="duplicate"):
-        feasible_degrees(CONFIG, active_ranks=[0, 0, 1], min_degree=1)
+        choose_tp(CONFIG, active_ranks=[0, 0, 1], min_degree=1)
 
 
 def test_vocab_parallel_divisibility_filters_candidate_degrees():
@@ -104,20 +115,11 @@ def test_vocab_parallel_divisibility_filters_candidate_degrees():
     turns a runtime ``ValueError`` into the structured ``no_feasible_tp`` reason.
     """
     # 24 = 8 * 3: divisible by 1, 2, 4, 8; 12 = 4 * 3: only by 1, 2, 4.
-    assert feasible_degrees(
-        CONFIG, active_ranks=range(8), min_degree=1, vocab_size=24
-    ) == (1, 2, 4, 8)
-    assert feasible_degrees(
-        CONFIG, active_ranks=range(8), min_degree=1, vocab_size=12
-    ) == (1, 2, 4)
+    assert choose_tp(CONFIG, active_ranks=range(8), min_degree=1, vocab_size=24).degree == 8
+    assert choose_tp(CONFIG, active_ranks=range(8), min_degree=1, vocab_size=12).degree == 4
     # Left out entirely, only the dimension constraints apply -- pure planning tests
     # that never build a stage keep working unchanged.
-    assert feasible_degrees(CONFIG, active_ranks=range(8), min_degree=1) == (1, 2, 4, 8)
-
-
-def test_vocab_divisibility_picks_the_largest_buildable_degree():
-    assert choose_tp(CONFIG, active_ranks=range(8), min_degree=1, vocab_size=12).degree == 4
-    assert choose_tp(CONFIG, active_ranks=range(8), min_degree=1, vocab_size=24).degree == 8
+    assert choose_tp(CONFIG, active_ranks=range(8), min_degree=1).degree == 8
 
 
 def test_an_indivisible_vocabulary_is_a_structured_reason_not_a_crash():

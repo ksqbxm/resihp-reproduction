@@ -14,10 +14,9 @@ production runtime, whose backward gradient must match the single-process refere
 (no double counting, nothing dropped).
 
 There is exactly one heterogeneous-boundary implementation in the project, the
-leader-to-leader hop plus TP broadcast inside
-:class:`resihp.parallel.pp.PipelineRuntime`, and this gate drives that one. Nothing
-here reshards a ``grad``: gradients are not persistent state, so they are in no
-checkpoint and no transfer (plan principle A).
+scatter/gather hop inside :class:`resihp.parallel.pp.PipelineRuntime`, and this gate
+drives that one. Nothing here reshards a ``grad``: gradients are not persistent state,
+so they are in no checkpoint and no transfer (plan principle A).
 """
 
 import importlib.util
@@ -253,11 +252,12 @@ def _run_boundary(rank, device):
 
     The two stages run at *different* TP degrees, which is the case plan 3.3 singles
     out. The activation is replicated inside each stage's TP group, so the boundary
-    must move exactly one authoritative copy between the two stage leaders and let the
-    receiving group broadcast it: a per-rank sum would double the gradient the upstream
-    stage sees (by the downstream degree), and a single receiving rank would starve its
-    peer. Both failures show up as a gradient that no longer matches the single-process
-    reference, which is what this asserts.
+    must move exactly one authoritative copy: scatter/gather cuts it into
+    ``N = max(1, 2) = 2`` chunks on the distinct pairs ``0 -> 1`` and ``0 -> 2``, and
+    the downstream group all-gathers them back. A per-rank sum would double the gradient
+    the upstream stage sees (by the downstream degree), and a single receiving rank
+    would starve its peer. Both failures show up as a gradient that no longer matches
+    the single-process reference, which is what this asserts.
 
     This drives :class:`resihp.parallel.pp.PipelineRuntime` -- the project's only
     heterogeneous-boundary implementation and the one the control plane runs. Three
@@ -274,7 +274,7 @@ def _run_boundary(rank, device):
     from resihp.parallel.tp import TensorParallelStage
     from resihp.planner.dp import DPAssignment, DPPlacement
     from resihp.planner.pp import balanced_layers
-    from resihp.reference import ADAM_BETAS, ADAM_EPS, LEARNING_RATE, WEIGHT_DECAY
+    from resihp.reference import adamw
 
     config = TrainConfig(**BOUNDARY_CONFIG_KWARGS)
     torch.manual_seed(config.seed)
@@ -289,7 +289,7 @@ def _run_boundary(rank, device):
     stage_id = 0 if rank == 0 else 1
     tp_group = tp_groups[stage_id]
     executors = ((0,), (1, 2))
-    hop = dist.new_group([0, 1])  # the two stage leaders
+    hop = dist.new_group([0, 1, 2])  # the union of both stages: every rank carries a chunk
 
     layers = balanced_layers(config.num_layers, 2)[stage_id]
     stage = TensorParallelStage(
@@ -315,13 +315,7 @@ def _run_boundary(rank, device):
     ).to(device)
 
     reference = reference.to(device).train()
-    ref_opt = torch.optim.AdamW(
-        reference.parameters(),
-        lr=LEARNING_RATE,
-        betas=ADAM_BETAS,
-        eps=ADAM_EPS,
-        weight_decay=WEIGHT_DECAY,
-    )
+    ref_opt = adamw(reference.parameters())
     logits = reference(tokens)
     ref_loss = F.cross_entropy(
         logits[:, :-1].reshape(-1, BOUNDARY_VOCAB), tokens[:, 1:].reshape(-1)
@@ -340,7 +334,7 @@ def _run_boundary(rank, device):
         ),
     )
     runtime = PipelineRuntime(
-        stage, replica_id=0, assignment=assignment, boundary_groups={(0, 1): hop}
+        stage, rank=rank, replica_id=0, assignment=assignment, boundary_groups={(0, 1, 2): hop}
     )
     loss = runtime.train_step(tokens)
 

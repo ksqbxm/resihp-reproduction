@@ -9,7 +9,8 @@ than from a closed form is what keeps the memory model and the runtime one seman
 """
 
 from dataclasses import dataclass
-from numbers import Integral
+
+from ..validate import non_negative_int
 
 
 def balanced_layers(num_layers: int, num_stages: int) -> tuple[tuple[int, ...], ...]:
@@ -41,10 +42,7 @@ def pipeline_phases(num_micro_batches: int, *, stage_index: int, num_stages: int
     """
     if num_stages < 1 or not 0 <= stage_index < num_stages:
         raise ValueError("stage_index must identify a stage of the pipeline")
-    if not isinstance(num_micro_batches, Integral) or isinstance(num_micro_batches, bool):
-        raise ValueError("num_micro_batches must be an integer")
-    if num_micro_batches < 0:
-        raise ValueError("num_micro_batches must not be negative")
+    non_negative_int("num_micro_batches", num_micro_batches)
     warmup = min(num_stages - 1 - stage_index, num_micro_batches)
     return warmup, num_micro_batches - warmup
 
@@ -102,16 +100,21 @@ class PPPlan:
     lm_head_owner: int
 
 
-def _integer_sequence(name: str, values) -> tuple[int, ...]:
-    result = tuple(values)
+def _stage_counts(name: str, values) -> tuple[int, ...]:
+    """A per-stage sequence of non-negative counts: layer counts or TP degrees alike."""
+    result = tuple(non_negative_int(name, value) for value in values)
     if not result:
         raise ValueError(f"{name} must not be empty")
-    if any(not isinstance(value, Integral) or isinstance(value, bool) for value in result):
-        raise ValueError(f"{name} must contain integers")
-    return tuple(int(value) for value in result)
+    return result
 
 
-def _owner_ranges(stage_layers: tuple[int, ...]) -> tuple[tuple[int, int] | None, ...]:
+def owner_ranges(stage_layers: tuple[int, ...]) -> tuple[tuple[int, int] | None, ...]:
+    """Contiguous ``(start, end)`` layer range per stage, ``None`` for an empty stage.
+
+    The one definition of "layer counts laid out into ownership ranges":
+    :func:`resihp.plan.build_plan` lays the pristine partition out with it too, so the
+    repartitioned layout and the initial one cannot be built two different ways.
+    """
     ranges = []
     start = 0
     for count in stage_layers:
@@ -194,17 +197,11 @@ def repartition_pp(old_stage_layers, old_tp_degrees, new_tp_degrees) -> PPPlan:
     Old stages may already be empty after an earlier repartition; an empty
     stage must be represented by ``old_stage_layers == old_tp_degrees == 0``.
     """
-    old_layers = _integer_sequence("old_stage_layers", old_stage_layers)
-    old_tp = _integer_sequence("old_tp_degrees", old_tp_degrees)
-    new_tp = _integer_sequence("new_tp_degrees", new_tp_degrees)
+    old_layers = _stage_counts("old_stage_layers", old_stage_layers)
+    old_tp = _stage_counts("old_tp_degrees", old_tp_degrees)
+    new_tp = _stage_counts("new_tp_degrees", new_tp_degrees)
     if len(old_layers) != len(old_tp) or len(old_layers) != len(new_tp):
         raise ValueError("stage layer and TP degree sequences must have the same length")
-    if any(count < 0 for count in old_layers):
-        raise ValueError("old_stage_layers must contain non-negative integers")
-    if any(degree < 0 for degree in old_tp):
-        raise ValueError("old_tp_degrees must contain non-negative integers")
-    if any(degree < 0 for degree in new_tp):
-        raise ValueError("new_tp_degrees must contain non-negative integers")
     if any((count == 0) != (degree == 0) for count, degree in zip(old_layers, old_tp)):
         raise ValueError("empty old stages must have zero TP degree")
 
@@ -229,8 +226,8 @@ def repartition_pp(old_stage_layers, old_tp_degrees, new_tp_degrees) -> PPPlan:
     ):
         raise AssertionError("PP stage executability invariant failed")
 
-    old_ranges = _owner_ranges(old_layers)
-    new_ranges = _owner_ranges(new_layers)
+    old_ranges = owner_ranges(old_layers)
+    new_ranges = owner_ranges(new_layers)
     migrations = tuple(
         (layer, old_owner, new_owner)
         for layer in range(total_layers)
