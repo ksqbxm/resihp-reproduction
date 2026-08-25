@@ -44,9 +44,8 @@ the distributed gates measure inside spawned ranks and assert in the parent proc
 import math
 
 import torch
-from torch.nn import functional as F
 
-from .checkpoint import load_anchor
+from .checkpoint import install_anchor, load_anchor
 from .model import ReferenceTransformer
 from .parallel.reshard import local_slice
 from .recovery import stage_layout, stage_of
@@ -54,22 +53,16 @@ from .reference import (
     ADAM_BETAS,
     ADAM_EPS,
     LEARNING_RATE,
-    WEIGHT_DECAY,
     _OPTIM_STATES,
     _token_stream,
+    adamw,
+    next_token_loss,
 )
 
 
 #: Reassociation band: real TP all-reduce plus micro-batch splitting (T10/T12/T13).
 RTOL = 1e-4
 ATOL = 1e-5
-
-
-def adamw(params):
-    """The project's one optimizer configuration, so a reference cannot drift from a run."""
-    return torch.optim.AdamW(
-        params, lr=LEARNING_RATE, betas=ADAM_BETAS, eps=ADAM_EPS, weight_decay=WEIGHT_DECAY
-    )
 
 
 def batch(config, index, *, vocab_size, sequence_length, device):
@@ -97,9 +90,7 @@ def denominator(state):
 def step_record(model, optimizer, tokens, *, vocab_size) -> dict:
     """One full-batch reference iteration: its gradients, new weights, new moments."""
     logits = model(tokens)
-    loss = F.cross_entropy(
-        logits[:, :-1].reshape(-1, vocab_size), tokens[:, 1:].reshape(-1)
-    )
+    loss = next_token_loss(logits, tokens, vocab_size)
     optimizer.zero_grad()
     loss.backward()
     named = model.logical_state_dict()
@@ -153,20 +144,8 @@ def steps_from_anchor(
         config, vocab_size=vocab_size, sequence_length=sequence_length
     ).to(device)
     model.train()
-    named = model.logical_state_dict()
-    with torch.no_grad():
-        for name, param in named.items():
-            param.copy_(anchor[name]["param"].to(device))
     optimizer = adamw(model.parameters())
-    optimizer.state.clear()
-    for name, fields in anchor.items():
-        if "exp_avg" not in fields:
-            continue
-        optimizer.state[named[name]] = {
-            "exp_avg": fields["exp_avg"].to(device).clone(),
-            "exp_avg_sq": fields["exp_avg_sq"].to(device).clone(),
-            "step": fields["step"].clone(),  # AdamW keeps its step count on the CPU
-        }
+    install_anchor(model, optimizer, anchor)
     return [
         step_record(
             model,

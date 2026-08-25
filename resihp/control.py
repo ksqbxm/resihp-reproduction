@@ -85,39 +85,6 @@ class ConsistentStop(RuntimeError):
         self.reason = reason
 
 
-def reconfigure(
-    config: TrainConfig,
-    previous: ExecutionPlan | None,
-    failed_ranks,
-    *,
-    version: int,
-    step: int,
-    memory_budget: int | None = None,
-    vocab_size: int = 1,
-    sequence_length: int = 1,
-) -> ExecutionPlan:
-    """Pure TP->PP->DP replan into one new versioned plan (safe-point step 5).
-
-    Deterministic in its inputs, so every rank that calls it with the same
-    ``(config, previous, failed_ranks, version, step)`` produces a byte-identical
-    plan and therefore an identical digest (``build_plan`` normalizes/sorts the
-    failed ranks itself, so the order they arrive in does not matter). With a
-    ``memory_budget`` the replan is memory-gated, which is what makes the
-    ``no_feasible_tp`` stop reachable: a degree drop can push a surviving rank's
-    resident bytes past the budget.
-    """
-    return build_plan(
-        config,
-        step=step,
-        version=version,
-        failed_ranks=failed_ranks,
-        previous=previous,
-        memory_budget=memory_budget,
-        vocab_size=vocab_size,
-        sequence_length=sequence_length,
-    )
-
-
 class ControlPlane:
     """Owns this rank's place in the world, and rebuilds both after a real fail-stop."""
 
@@ -450,13 +417,16 @@ class ControlPlane:
 
         new_plan = None
         reason = None
-        try:  # 5. TP->PP->DP replan (one new version)
-            new_plan = reconfigure(
+        # 5. TP->PP->DP replan (one new version). ``build_plan`` is deterministic in its
+        # inputs and normalizes the failed ranks itself, so every rank that reaches this
+        # point produces a byte-identical plan and therefore an identical digest.
+        try:
+            new_plan = build_plan(
                 config,
-                plan,
-                failed,
-                version=plan.version + 1,
                 step=next_step,
+                version=plan.version + 1,
+                failed_ranks=failed,
+                previous=plan,
                 memory_budget=self.memory_budget,
                 vocab_size=self.vocab_size,
                 sequence_length=self.sequence_length,

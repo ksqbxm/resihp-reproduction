@@ -58,10 +58,9 @@ import math
 
 import torch
 import torch.distributed as dist
-from torch.nn import functional as F
 
 from ..planner.pp import pipeline_phases
-from ..reference import ADAM_BETAS, ADAM_EPS, LEARNING_RATE, WEIGHT_DECAY
+from ..reference import adamw, next_token_loss
 from .dp import (
     ActivationLog,
     dp_combine_gradients,
@@ -144,13 +143,7 @@ class PipelineRuntime:
         # reassemble the tensor wrongly or hang in the gather, so it is rejected here.
         if self.routes and len(self.executors) != stage.tp_size:
             raise ValueError("the stage's TP group disagrees with the assignment's executors")
-        self.optimizer = torch.optim.AdamW(
-            stage.parameters(),
-            lr=LEARNING_RATE,
-            betas=ADAM_BETAS,
-            eps=ADAM_EPS,
-            weight_decay=WEIGHT_DECAY,
-        )
+        self.optimizer = adamw(stage.parameters())
 
     # --- reading the assignment (the only authority on who talks to whom) ----------
 
@@ -382,10 +375,12 @@ class PipelineRuntime:
             if self.stage.is_last:
                 # Scale by the global micro-batch count so the accumulated gradient is
                 # the full-batch mean, matching the reference's single-pass loss.
-                output = F.cross_entropy(
-                    output[:, :-1].reshape(-1, self.stage.vocab_size),
-                    chunks[index][:, 1:].reshape(-1).to(device),
-                ) / self.micro_total
+                output = (
+                    next_token_loss(
+                        output, chunks[index].to(device), self.stage.vocab_size
+                    )
+                    / self.micro_total
+                )
                 total_loss.add_(output.detach())
             # An activation is counted in memory from here until its backward retires it
             # (plan 3.5), which is what makes the peak the 1F1B in-flight count.

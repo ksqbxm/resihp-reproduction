@@ -189,19 +189,12 @@ def test_activation_log_holds_each_activation_until_its_backward():
 # --- distributed helpers ----------------------------------------------------------
 
 
-def _adamw(params):
-    from resihp.reference import ADAM_BETAS, ADAM_EPS, LEARNING_RATE, WEIGHT_DECAY
-
-    return torch.optim.AdamW(
-        params, lr=LEARNING_RATE, betas=ADAM_BETAS, eps=ADAM_EPS, weight_decay=WEIGHT_DECAY
-    )
-
-
 def _reference(device):
     """The single-process reference: initial weights, one full-batch step, its gradients."""
     from torch.nn import functional as F
 
     from resihp.model import ReferenceTransformer
+    from resihp.reference import adamw
 
     config = _config()
     torch.manual_seed(config.seed)
@@ -212,7 +205,7 @@ def _reference(device):
     tokens = torch.randint(0, VOCAB, (config.batch_size, SEQLEN), generator=generator).to(device)
 
     reference = reference.to(device).train()
-    opt = _adamw(reference.parameters())
+    opt = adamw(reference.parameters())
     logits = reference(tokens)
     loss = F.cross_entropy(logits[:, :-1].reshape(-1, VOCAB), tokens[:, 1:].reshape(-1))
     opt.zero_grad()

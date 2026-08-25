@@ -186,12 +186,7 @@ def _compare_pp(rank, num_stages, device):
     from resihp.parallel.pp import PipelineRuntime
     from resihp.parallel.reshard import shard_dims, shard_logical_state
     from resihp.parallel.tp import TensorParallelStage
-    from resihp.reference import ADAM_BETAS, ADAM_EPS, LEARNING_RATE, WEIGHT_DECAY
-
-    def adamw(params):
-        return torch.optim.AdamW(
-            params, lr=LEARNING_RATE, betas=ADAM_BETAS, eps=ADAM_EPS, weight_decay=WEIGHT_DECAY
-        )
+    from resihp.reference import adamw
 
     torch.manual_seed(CONFIG.seed)
     reference = ReferenceTransformer(CONFIG, vocab_size=VOCAB, sequence_length=SEQLEN)

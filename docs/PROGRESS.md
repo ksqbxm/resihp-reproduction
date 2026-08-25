@@ -1409,3 +1409,54 @@ python3 -m resihp.launch --config configs/train.json --failures configs/failures
    `torch.distributed.distributed_c10d._abort_process_group()`。
 2. `dist.get_global_rank(group, i)`（`parallel/pp.py`）与 `dist.new_group(..., timeout=)` 的可用性
    ——两者在 torch 2.8（NGC 25.06）都存在，但本机无 torch，无法实跑确认。
+
+## P12 重复逻辑入口收敛（本轮）
+
+**问题**：同一件事有多套入口，改一处不改另一处就会分叉。逐条核对后确认属实的有八处。
+
+| 重复项 | 原来 | 现在 |
+|---|---|---|
+| 层数 → 归属区间 | `plan._owner_ranges` 与 `planner/pp._owner_ranges` 两份逐字相同 | `planner/pp.owner_ranges` 唯一一份；`plan._old_layout` 直接用 `balanced_layers` + `owner_ranges` 铺初始布局，`plan._initial_stage_layers` 删除 |
+| 整数校验 | `planner/tp._positive_integer` / `_non_negative_integer`、`planner/dp._integer`、`planner/pp._integer_sequence`、`memory._positive`，加 `plan` 里 `step` / `version` 两处内联 | 新建 `resihp/validate.py`：`positive_int` / `non_negative_int` 各一份，全部改为引用 |
+| rank 序列归一化 | `tp._normalize_active_ranks` / `dp._normalize_failure_signature` / `plan._normalize_failed` 三份「去重 + 排序 + 非负」 | `validate.unique_ranks` 一份；`plan` 只额外多一行 world_size 越界检查（只有它有这个约束） |
+| TP 选择入口 | `feasible_degrees` 与 `choose_tp` 十参数签名逐字相同，前者只有测试在用 | 删除 `feasible_degrees`；`choose_tp` 是 TP 唯一入口，测试改为断言它选出的 degree 与结构化 `InfeasibleTP` |
+| 计划构建入口 | `plan.build_plan`、`control.reconfigure`、`train.build_initial_plan` 三个入口，后两个只是转发 | 只剩 `build_plan`；`safe_point` 与 `run_distributed` 直接调它，两个转发函数删除 |
+| AdamW 构造 | `reference.ReferenceRun`、`parallel/pp.PipelineRuntime`、`verify.adamw` 三份（`verify.adamw` 的注释还写着「唯一一份」），测试里另有四份 | `reference.adamw` 唯一一份，生产与测试全部引用 |
+| next-token 损失 | `reference.ReferenceRun.step`、`verify.step_record`、`parallel/pp` 最后一段 forward 三份 | `reference.next_token_loss` 一份；micro-batch 归一化仍留在 `pp` 的调用点 |
+| anchor 装载进 model+optimizer | `recovery._anchor_run` 与 `verify.steps_from_anchor` 两份 | `checkpoint.install_anchor` 一份，张量统一落到 model 自己的 device |
+| 层/边界归属查询 | `plan._owner_of` + `_boundary_owner_of` + `_group_owner` 三层，只有最外层有调用者 | 折叠成 `_group_owner` 一个函数 |
+
+### 语义变化（需要知情）
+
+- `memory` 的整数校验从 `type(value) is not int` 放宽到「`Integral` 且不是 `bool`」，与 planner 侧
+  一致。既有用例只用 0 触发，行为不变。
+- `build_plan(failed_ranks=...)` 传负数时报 `failed_ranks must be a non-negative integer`，
+  越界仍报 `out-of-range`；`repartition_pp` 的负数报错信息统一为同一句。
+- `PipelineRuntime` 最后一段 forward 现在把整个 `chunks[index]` 搬到 device 再切目标，原来只搬
+  切完的目标；多搬一列 token，数值完全等价。
+- `recovery._anchor_run` 装 moment 时现在会 `.clone()`（`install_anchor` 的统一行为）。原来是直接
+  引用刚重建出来的字典，写完即弃，两者结果相同。
+
+### 未合并的两处（有意保留）
+
+- `config._positive_int` 从 JSON 字段读值并抛 `ConfigError`（中文消息），`checkpoint.save_checkpoint`
+  的 `plan_version` 校验抛 `CheckpointError`。异常类型与消息是各自模块的对外契约，套一层转译比
+  重复的一行判断更长，不动。
+
+### 本机（无 torch）已做的验证
+
+- `python -m pytest -q`：**125 passed, 12 skipped**，与改动前基线逐项一致。
+- `python -m compileall -q resihp tests`：通过。
+- 全仓 grep 被删名字（`feasible_degrees` / `_owner_ranges` / `_initial_stage_layers` /
+  `_normalize_*` / `_positive_integer` / `reconfigure` / `build_initial_plan`）：无残留引用。
+- AST 扫全仓未使用 import：只剩 `tests/test_planner_dp.py:3` 的 `replace`，是既有问题，未动。
+
+### 待目标机执行的门禁
+
+```bash
+python3 -m pytest -q          # 全量，含 8 卡 NCCL 门禁
+python3 -m resihp.launch --config configs/train.json --failures configs/failures.json
+```
+
+本轮改到的 torch 路径是 `reference` / `verify` / `parallel/pp` / `recovery` / `checkpoint`
+五个文件的构造与装载，本机无法实跑，需目标机门禁确认。

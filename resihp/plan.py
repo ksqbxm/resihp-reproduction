@@ -14,13 +14,19 @@ each ``(replica, stage)`` owns a contiguous block of ``TP`` ranks.
 from dataclasses import dataclass
 from hashlib import sha256
 import json
-from numbers import Integral
 from typing import Iterable
 
 from .config import TrainConfig
 from .planner.dp import DPPlacement, DPStage, DPTopology, InfeasibleDP, assign
-from .planner.pp import InfeasiblePP, balanced_layers, peak_in_flight, repartition_pp
+from .planner.pp import (
+    InfeasiblePP,
+    balanced_layers,
+    owner_ranges,
+    peak_in_flight,
+    repartition_pp,
+)
 from .planner.tp import InfeasibleTP, choose_tp
+from .validate import non_negative_int, unique_ranks
 
 
 #: The persistent training state a migrating logical tensor carries. ``grad`` is
@@ -161,20 +167,6 @@ class ExecutionPlan:
         return tuple(rank for rank in range(self.config.world_size) if rank not in set(self.failed_ranks))
 
 
-def _owner_ranges(stage_layers: tuple[int, ...]) -> tuple[tuple[int, int] | None, ...]:
-    ranges = []
-    start = 0
-    for count in stage_layers:
-        ranges.append((start, start + count) if count else None)
-        start += count
-    return tuple(ranges)
-
-
-def _initial_stage_layers(num_layers: int, pp: int) -> tuple[int, ...]:
-    """Layer counts of the pristine partition, from the planner's one definition."""
-    return tuple(len(stage) for stage in balanced_layers(num_layers, pp))
-
-
 def _stage_domains(config: TrainConfig) -> dict[int, dict[int, tuple[int, ...]]]:
     domains: dict[int, dict[int, tuple[int, ...]]] = {}
     for replica in range(config.dp):
@@ -182,17 +174,6 @@ def _stage_domains(config: TrainConfig) -> dict[int, dict[int, tuple[int, ...]]]
             first = (replica * config.pp + stage) * config.tp
             domains.setdefault(replica, {})[stage] = tuple(range(first, first + config.tp))
     return domains
-
-
-def _normalize_failed(failed_ranks: Iterable[int], world_size: int) -> tuple[int, ...]:
-    ranks = []
-    for rank in failed_ranks:
-        if not isinstance(rank, Integral) or isinstance(rank, bool) or not 0 <= rank < world_size:
-            raise ValueError(f"failed_ranks contains an out-of-range rank: {rank!r}")
-        ranks.append(int(rank))
-    if len(set(ranks)) != len(ranks):
-        raise ValueError("failed_ranks must not contain duplicate ranks")
-    return tuple(sorted(ranks))
 
 
 def _old_layout(config: TrainConfig, previous: "ExecutionPlan | None") -> dict[int, dict[int, tuple[tuple[int, ...], tuple[int, int]]]]:
@@ -207,27 +188,15 @@ def _old_layout(config: TrainConfig, previous: "ExecutionPlan | None") -> dict[i
         return layout
 
     domains = _stage_domains(config)
-    ranges = _owner_ranges(_initial_stage_layers(config.num_layers, config.pp))
+    # The pristine layout is the planner's own base partition, laid out by the planner's
+    # own range function -- never a second copy of either rule.
+    ranges = owner_ranges(
+        tuple(len(stage) for stage in balanced_layers(config.num_layers, config.pp))
+    )
     return {
         replica: {stage: (domains[replica][stage], ranges[stage]) for stage in range(config.pp)}
         for replica in range(config.dp)
     }
-
-
-def _owner_of(stage_layout: dict[int, tuple[tuple[int, ...], tuple[int, int]]], layer: int) -> tuple[int, ...]:
-    """Return the TP members of the stage owning ``layer``."""
-    for members, layer_range in stage_layout.values():
-        if layer_range[0] <= layer < layer_range[1]:
-            return members
-    raise AssertionError("layer is not owned by any stage in the layout")
-
-
-def _boundary_owner_of(
-    stage_layout: dict[int, tuple[tuple[int, ...], tuple[int, int]]], boundary: str
-) -> tuple[int, ...]:
-    """TP members of the stage owning ``boundary`` -- the first / last executable one."""
-    ordered = sorted(stage_layout)
-    return stage_layout[ordered[0 if boundary == "embedding" else -1]][0]
 
 
 def _group_owner(
@@ -235,8 +204,18 @@ def _group_owner(
     layer: int | None,
     boundary: str,
 ) -> tuple[int, ...]:
-    """TP members currently owning one state group, layer or boundary alike."""
-    return _owner_of(stage_layout, layer) if boundary == "" else _boundary_owner_of(stage_layout, boundary)
+    """TP members currently owning one state group, layer or boundary alike.
+
+    A boundary group follows the replica's first / last executable stage (plan 3.4); a
+    layer follows the stage whose range contains it.
+    """
+    if boundary:
+        ordered = sorted(stage_layout)
+        return stage_layout[ordered[0 if boundary == "embedding" else -1]][0]
+    for members, layer_range in stage_layout.values():
+        if layer_range[0] <= layer < layer_range[1]:
+            return members
+    raise AssertionError("layer is not owned by any stage in the layout")
 
 
 def _repartition(old_layers, old_tp, new_tp):
@@ -353,14 +332,14 @@ def build_plan(
     comes from :func:`resihp.planner.pp.peak_in_flight`, replayed from the very 1F1B
     schedule :class:`resihp.parallel.pp.PipelineRuntime` executes.
     """
-    if not isinstance(step, Integral) or isinstance(step, bool) or step < 0:
-        raise ValueError("step must be a non-negative integer")
-    if not isinstance(version, Integral) or isinstance(version, bool) or version < 0:
-        raise ValueError("version must be a non-negative integer")
+    step = non_negative_int("step", step)
+    version = non_negative_int("version", version)
     if previous is not None and not isinstance(previous, ExecutionPlan):
         raise TypeError("previous must be an ExecutionPlan or None")
 
-    failed = _normalize_failed(failed_ranks, config.world_size)
+    failed = unique_ranks("failed_ranks", failed_ranks)
+    if failed and failed[-1] >= config.world_size:
+        raise ValueError(f"failed_ranks contains an out-of-range rank: {failed[-1]}")
     failed_set = set(failed)
     micro_batches = config.batch_size // config.micro_batch_size
     domains = _stage_domains(config)

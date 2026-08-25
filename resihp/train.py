@@ -91,6 +91,7 @@ def run_distributed(loaded):
     them.
     """
     from .control import ConsistentStop, ControlPlane
+    from .plan import build_plan
     from .recovery import initial_run
 
     config = loaded.train
@@ -102,11 +103,16 @@ def run_distributed(loaded):
         sequence_length=SEQUENCE_LENGTH,
         memory_budget=config.memory_budget_bytes,
     )
-    plan = build_initial_plan(
+    # The first plan comes from the same call every replan makes, with the same run
+    # constants and the same budget: one planner, one set of constraints, no privileged
+    # starting topology.
+    plan = build_plan(
         config,
+        step=0,
+        version=0,
+        memory_budget=config.memory_budget_bytes,
         vocab_size=VOCAB_SIZE,
         sequence_length=SEQUENCE_LENGTH,
-        memory_budget=config.memory_budget_bytes,
     )
     control.build_training_groups(plan)
     control.attach_run(
@@ -170,26 +176,6 @@ def run_distributed(loaded):
     )
     control.shutdown()
     return plan
-
-
-def build_initial_plan(config, *, vocab_size, sequence_length, memory_budget=None):
-    """The pristine plan a run starts from, gated by the inputs every replan uses.
-
-    Passing the run constants and the budget here rather than defaulting them is what
-    makes the launched run's first plan subject to the same feasibility rules as the
-    ones a fail-stop produces: one planner, one set of constraints, no privileged
-    starting topology.
-    """
-    from .plan import build_plan
-
-    return build_plan(
-        config,
-        step=0,
-        version=0,
-        memory_budget=memory_budget,
-        vocab_size=vocab_size,
-        sequence_length=sequence_length,
-    )
 
 
 def main(argv=None):

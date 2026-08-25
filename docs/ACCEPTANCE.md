@@ -34,8 +34,8 @@ python3 -m resihp.launch --config configs/train.json --failures configs/failures
 **同一个事件既降 TP degree 又把一层搬过 stage 边界**。故障序列也不再是两次就收手——只有把整个
 replica 1 打空，micro-batch 归属才会真的换 replica，这才是**真实 DP reroute**。
 
-纯 planner 对这套配置给出的计划序列（本机实跑 `build_plan` 核对过；`resihp/train.py` 里
-`build_initial_plan` 用同一套入参，所以 digest 逐版相同）：
+纯 planner 对这套配置给出的计划序列（本机实跑 `build_plan` 核对过；`resihp/train.py` 与
+`ControlPlane.safe_point` 都直接调同一个 `build_plan`、同一套入参，所以 digest 逐版相同）：
 
 | 版本 | 生效轮次 | 失效 rank | active ranks | replica 0 stages | replica 1 stages | micro-batch 归属 |
 |---|---|---|---|---|---|---|

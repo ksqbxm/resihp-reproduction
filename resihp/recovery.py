@@ -41,7 +41,7 @@ transfer.
 
 import torch
 
-from .checkpoint import load_anchor, save_checkpoint
+from .checkpoint import install_anchor, load_anchor, save_checkpoint
 from .parallel.pp import PipelineRuntime
 from .parallel.reshard import ReshardError, reshard_tp_state, shard_dims, shard_logical_state
 from .parallel.tp import TensorParallelStage
@@ -332,14 +332,7 @@ def _anchor_run(config, vocab_size, sequence_length, full, cursor) -> ReferenceR
     finally:
         torch.set_rng_state(rng_state)
 
-    param_by_name = {name: param for param, name in run.name_by_param.items()}
-    with torch.no_grad():
-        for name, param in run.model.logical_state_dict().items():
-            param.copy_(full[name]["param"])
-    run.optimizer.state.clear()
-    for name, fields in full.items():
-        if "exp_avg" in fields:
-            run.optimizer.state[param_by_name[name]] = {key: fields[key] for key in _OPTIM_STATES}
+    install_anchor(run.model, run.optimizer, full)
     run.cursor = cursor
     return run
 

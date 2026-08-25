@@ -73,14 +73,9 @@ def _compare(rank, world_size, device):
     from torch.nn import functional as F
 
     from resihp.model import ReferenceTransformer
-    from resihp.reference import ADAM_BETAS, ADAM_EPS, LEARNING_RATE, WEIGHT_DECAY
+    from resihp.reference import adamw
     from resihp.parallel.reshard import shard_dims, shard_logical_state
     from resihp.parallel.tp import TensorParallelStage
-
-    def adamw(params):
-        return torch.optim.AdamW(
-            params, lr=LEARNING_RATE, betas=ADAM_BETAS, eps=ADAM_EPS, weight_decay=WEIGHT_DECAY
-        )
 
     def close(a, b):
         return torch.allclose(a, b, rtol=RTOL, atol=ATOL)

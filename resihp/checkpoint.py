@@ -245,6 +245,30 @@ def load_anchor(path: str | Path) -> tuple[dict[str, dict[str, torch.Tensor]], i
     return anchor, payload["completed_steps"]
 
 
+def install_anchor(model, optimizer, anchor) -> None:
+    """Load a full logical anchor into ``model`` and ``optimizer``.
+
+    The one way an anchor -- :func:`load_anchor`'s form, or a freshly gathered logical
+    state in the same shape -- becomes a live model/optimizer pair. Recovery's
+    checkpoint writer and the Principle A2 reference both start from it, so neither can
+    install a moment the other leaves out, and both land on the model's own device.
+    """
+    named = model.logical_state_dict()
+    device = next(iter(named.values())).device
+    with torch.no_grad():
+        for name, param in named.items():
+            param.copy_(anchor[name]["param"].to(device))
+    optimizer.state.clear()
+    for name, fields in anchor.items():
+        if "exp_avg" not in fields:
+            continue
+        optimizer.state[named[name]] = {
+            "exp_avg": fields["exp_avg"].to(device).clone(),
+            "exp_avg_sq": fields["exp_avg_sq"].to(device).clone(),
+            "step": fields["step"].clone(),  # AdamW keeps its step count on the CPU
+        }
+
+
 def load_checkpoint(path: str | Path, run: ReferenceRun) -> tuple[int, int]:
     """Validate and load a checkpoint into ``run``; return ``(completed_steps, plan_version)``."""
     payload = _read_payload(Path(path))

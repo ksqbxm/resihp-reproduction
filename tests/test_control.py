@@ -1,6 +1,6 @@
 """Tests for the fail-stop control plane and the safe point (T9).
 
-The pure ``reconfigure`` test runs anywhere. The eight-process Gloo test runs a real
+The pure replan test runs anywhere. The eight-process Gloo test runs a real
 ``TP2 x PP2 x DP2`` layout -- every rank holds the stage its plan gives it and steps
 through the plan's own micro-batch assignment -- and needs torch, so it is skipped
 without it (the plan forbids installing torch on this machine, so that gate runs on
@@ -23,7 +23,6 @@ import pytest
 
 from harness import assert_killed, read_results, run_ranks
 from resihp.config import TrainConfig
-from resihp.control import reconfigure
 from resihp.plan import build_plan
 
 
@@ -48,11 +47,11 @@ requires_torch = pytest.mark.skipif(
 )
 
 
-def test_reconfigure_is_deterministic_and_increments_version():
+def test_replanning_is_deterministic_and_increments_version():
     initial = build_plan(CONFIG, step=0, version=0)
-    v1 = reconfigure(CONFIG, initial, (1,), version=1, step=2)
-    v1_again = reconfigure(CONFIG, initial, (1,), version=1, step=2)
-    v2 = reconfigure(CONFIG, v1, (1, 5), version=2, step=4)
+    v1 = build_plan(CONFIG, step=2, version=1, failed_ranks=(1,), previous=initial)
+    v1_again = build_plan(CONFIG, step=2, version=1, failed_ranks=(1,), previous=initial)
+    v2 = build_plan(CONFIG, step=4, version=2, failed_ranks=(1, 5), previous=v1)
 
     assert v1.version == 1 and v2.version == 2
     assert v1.digest == v1_again.digest  # deterministic across identical inputs
@@ -68,12 +67,14 @@ def _worker(rank, env, result_dir):
 
     from resihp.control import ControlPlane
     from resihp.recovery import initial_run, stage_of
-    from resihp.train import build_initial_plan, fail_stop
+    from resihp.train import fail_stop
 
     control = ControlPlane.initialize(
         training_backend="gloo", vocab_size=VOCAB, sequence_length=SEQLEN
     )
-    plan = build_initial_plan(CONFIG, vocab_size=VOCAB, sequence_length=SEQLEN)
+    plan = build_plan(
+        CONFIG, step=0, version=0, vocab_size=VOCAB, sequence_length=SEQLEN
+    )
     control.build_training_groups(plan)
     control.attach_run(
         initial_run(

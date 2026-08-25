@@ -493,8 +493,8 @@ def _diverge_one_rank(rank):
         return
     import resihp.control as control_module
 
-    real = control_module.reconfigure
-    control_module.reconfigure = lambda *args, **kwargs: real(
+    real = control_module.build_plan
+    control_module.build_plan = lambda *args, **kwargs: real(
         *args, **{**kwargs, "step": kwargs["step"] + 1}
     )
 

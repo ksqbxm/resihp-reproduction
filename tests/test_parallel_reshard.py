@@ -274,7 +274,7 @@ def _run_boundary(rank, device):
     from resihp.parallel.tp import TensorParallelStage
     from resihp.planner.dp import DPAssignment, DPPlacement
     from resihp.planner.pp import balanced_layers
-    from resihp.reference import ADAM_BETAS, ADAM_EPS, LEARNING_RATE, WEIGHT_DECAY
+    from resihp.reference import adamw
 
     config = TrainConfig(**BOUNDARY_CONFIG_KWARGS)
     torch.manual_seed(config.seed)
@@ -315,13 +315,7 @@ def _run_boundary(rank, device):
     ).to(device)
 
     reference = reference.to(device).train()
-    ref_opt = torch.optim.AdamW(
-        reference.parameters(),
-        lr=LEARNING_RATE,
-        betas=ADAM_BETAS,
-        eps=ADAM_EPS,
-        weight_decay=WEIGHT_DECAY,
-    )
+    ref_opt = adamw(reference.parameters())
     logits = reference(tokens)
     ref_loss = F.cross_entropy(
         logits[:, :-1].reshape(-1, BOUNDARY_VOCAB), tokens[:, 1:].reshape(-1)

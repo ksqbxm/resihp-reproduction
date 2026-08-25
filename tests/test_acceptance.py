@@ -32,7 +32,7 @@ import pytest
 
 from resihp.config import load_config
 from resihp.plan import build_plan
-from resihp.train import CHECKPOINT_PATH, SEQUENCE_LENGTH, VOCAB_SIZE, build_initial_plan
+from resihp.train import CHECKPOINT_PATH, SEQUENCE_LENGTH, VOCAB_SIZE
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -100,17 +100,19 @@ def test_no_banned_constructs():
 def _expected_plans(config, events):
     """Replay the failure schedule through ``build_plan`` alone.
 
-    This is the same call the entrypoint and ``ControlPlane.reconfigure`` make, with
-    the same run constants and the same (config-supplied) memory budget, so the digests
-    it produces are exactly the ones the launched job must publish. Comparing against it
+    This is the same call the entrypoint and ``ControlPlane.safe_point`` make, with the
+    same run constants and the same (config-supplied) memory budget, so the digests it
+    produces are exactly the ones the launched job must publish. Comparing against it
     -- rather than against a table copied into this file -- is what turns "the run
     finished" into "the run executed the plan the pure planner defines".
     """
-    plan = build_initial_plan(
+    plan = build_plan(
         config,
+        step=0,
+        version=0,
+        memory_budget=config.memory_budget_bytes,
         vocab_size=VOCAB_SIZE,
         sequence_length=SEQUENCE_LENGTH,
-        memory_budget=config.memory_budget_bytes,
     )
     plans = [plan]
     failed: tuple[int, ...] = ()
