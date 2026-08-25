@@ -336,13 +336,15 @@ def _run_end_to_end(rank, device, backend, result_dir):
 
 
 def _iteration(results, iteration):
-    """Every rank's record for one iteration -- from the ranks that reached it.
+    """``(rank, record)`` for one iteration, from every rank that reached it.
 
     A killed rank's file stops at the iteration it died in, so past that point it
-    contributes nothing, which is exactly what "it is gone" means here.
+    contributes nothing, which is exactly what "it is gone" means here. Every gate that
+    looks at a single iteration reads it through this, so none of them can index past a
+    victim's last entry.
     """
     return [
-        result["iterations"][iteration - 1]
+        (result["rank"], result["iterations"][iteration - 1])
         for result in results
         if len(result["iterations"]) >= iteration
     ]
@@ -423,9 +425,11 @@ def _assert_micro_batch_stage_executed_once(results, label):
     for iteration in range(1, CONFIG.iterations + 1):
         plan = results[0]["plans"][PLAN_BY_ITERATION[iteration - 1]]
         executed: dict[tuple[int, int], list[int]] = {}
-        for result in results:
-            for micro, stage_id in result["iterations"][iteration - 1].get("processed", []):
-                executed.setdefault((micro, stage_id), []).append(result["rank"])
+        # Killed ranks count too, up to the iteration they died in: what the plan placed
+        # on a rank that later died still had to be executed while it was alive.
+        for rank, record in _iteration(results, iteration):
+            for micro, stage_id in record.get("processed", []):
+                executed.setdefault((micro, stage_id), []).append(rank)
         planned = {
             (place[0], place[1]): sorted(place[3]) for place in plan["placements"]
         }
@@ -476,7 +480,11 @@ def _assert_data_is_neither_repeated_nor_skipped(results, label):
             assert event["cursor"] in (None, event["completed"]), (label, result["rank"], event)
     # In any one iteration, every training rank consumes the same batch index.
     for iteration in range(1, CONFIG.iterations + 1):
-        seen = {record["cursor"] for record in _iteration(results, iteration) if record["trained"]}
+        seen = {
+            record["cursor"]
+            for _rank, record in _iteration(results, iteration)
+            if record["trained"]
+        }
         assert seen == {iteration - 1}, (label, iteration, seen)
 
 
@@ -514,7 +522,7 @@ def _assert_matches_reference_after_resume(results, label):
     # The replicas' losses partition the global batch, so they sum to the reference's.
     for iteration in range(1, CONFIG.iterations + 1):
         by_replica, reference_loss = {}, None
-        for record in _iteration(results, iteration):
+        for _rank, record in _iteration(results, iteration):
             if not record["trained"] or record["loss"] is None:
                 continue
             # A replica contributes one loss: its last stage's TP peers each compute

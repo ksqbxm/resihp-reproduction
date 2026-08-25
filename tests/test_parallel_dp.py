@@ -143,9 +143,15 @@ def test_a_micro_batch_split_mid_pipeline_is_rejected_not_executed():
     from resihp.parallel.pp import PipelineRuntime
 
     class _StubStage:
-        """Enough of a stage to construct the runtime: its ends and one parameter."""
+        """Enough of a stage to construct the runtime: its ends, its TP degree, one parameter.
+
+        ``tp_size`` is 1 because both specs give rank 0 a one-rank stage: the runtime
+        checks the stage's TP group against the assignment's executors, since the
+        scatter routing indexes one by the other.
+        """
 
         is_first, is_last = True, False
+        tp_size = 1
 
         def parameters(self):
             return [torch.nn.Parameter(torch.zeros(1))]

@@ -43,7 +43,7 @@ plan, no residual process group, the pre-failure checkpoint still reloadable, an
 everyone exiting before the timeout rather than blocking in a collective.
 
 Every stop condition a surviving rank can observe is reached through the real
-``safe_point`` -> ``build_plan`` path; ``STOP_SCENARIOS`` says how. Only
+``safe_point`` -> ``build_plan`` path; ``SCENARIOS`` says how. Only
 ``plan_disagreement`` injects a fault, because deterministic replanning cannot disagree
 with itself -- and what is under test there is the control plane's reaction, not the
 disagreement. ``no_executable_pp`` is the one condition no rank can report under a real
@@ -105,17 +105,15 @@ SEQLEN = 8
 #: of its ranks, which is the end of the job rather than a recovery.
 VICTIMS = {"pipeline": (1,), "replicated": (1, 3), "reseat": (0, 1), "pair": (1, 0)}
 #: ``code -> (layout, victims, analytic budget as (tp_degree, stage_layers) or None)``.
-#: The budget is one the pristine layout fits and the post-failure layout does not.
-#:
-#: ``no_executable_pp`` is not here, and cannot be: the planner raises it only when
-#: *every* replica is gone, and a fail-stop that kills the last process leaves nobody
-#: to observe a stop, publish a plan, or exit consistently. Under real kills that
-#: condition is the end of the job, so it has its own gate
-#: (:func:`test_losing_every_rank_ends_the_job`) rather than a rank-observed one; the
-#: planner code itself is still locked by
-#: :func:`test_the_planner_stop_codes_come_out_of_a_real_replan`.
-STOP_SCENARIOS = {
+#: One table for every condition a real failure sequence drives, planner codes and
+#: control-plane codes alike. The budget is one the pristine layout fits and the
+#: post-failure layout does not.
+SCENARIOS = {
     "no_feasible_tp": ("pair", (1,), (2, 2)),
+    # Kills both ranks of the pair, which is what the planner means by "no replica
+    # survived". Nobody is left to observe it, so this one is not a rank-observed stop
+    # -- see ``STOP_SCENARIOS`` below.
+    "no_executable_pp": ("pair", VICTIMS["pair"], None),
     "no_feasible_dp_target": ("absorb", (1,), (1, 3)),
     "checkpoint_unusable": ("pair", (1,), None),
     # Four ranks, so that the rank made to diverge is a *survivor*: a disagreement
@@ -123,6 +121,14 @@ STOP_SCENARIOS = {
     "plan_disagreement": ("replicated", (1,), None),
     "state_mismatch": ("pair", (1,), None),
 }
+#: The codes a *surviving* rank can observe, agree on, and exit consistently for --
+#: exactly what the distributed stop gates drive. ``no_executable_pp`` is not among
+#: them and cannot be: a fail-stop that kills the last process leaves nobody to observe
+#: a stop, publish a plan, or exit consistently. Under real kills that condition is the
+#: end of the job, so it has its own gate (:func:`test_losing_every_rank_ends_the_job`);
+#: the planner code itself is locked by
+#: :func:`test_the_planner_stop_codes_come_out_of_a_real_replan`.
+STOP_SCENARIOS = tuple(code for code in SCENARIOS if code != "no_executable_pp")
 #: Which rank ``plan_disagreement`` makes replan differently -- never a victim.
 DIVERGING_RANK = 2
 
@@ -166,7 +172,7 @@ def _budget(config, tp_degree, stage_layers) -> int:
 
 
 def _scenario(code):
-    kind, victims, budget = STOP_SCENARIOS[code]
+    kind, victims, budget = SCENARIOS[code]
     config = _config(kind)
     return config, victims, None if budget is None else _budget(config, *budget)
 
@@ -318,8 +324,9 @@ def test_tampered_checkpoint_fails_the_stored_digest(tmp_path):
 def test_the_planner_stop_codes_come_out_of_a_real_replan():
     """Each planner code is produced by replanning a real failure, not by a stub call.
 
-    This also keeps ``STOP_SCENARIOS`` honest: the distributed gates drive exactly
-    these sequences through ``safe_point``.
+    This also keeps ``SCENARIOS`` honest: the distributed gates drive exactly these
+    sequences through ``safe_point`` -- all but ``no_executable_pp``, whose sequence
+    kills every rank and so ends the job instead of being reported by one.
     """
     from resihp.plan import InfeasiblePlan
 
@@ -685,7 +692,7 @@ def _assert_recovery(results, *, kind, label):
 
 
 def _assert_consistent_stop(results, code, label, tmp_path):
-    events = len(STOP_SCENARIOS[code][1])
+    events = len(_scenario(code)[1])
     assert {result["stopped"] for result in results.values()} == {code}, (label, results)
     # One agreed root cause, identical on every *surviving* rank -- not each rank's
     # local view. The victims are dead processes and report nothing at all.

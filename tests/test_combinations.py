@@ -608,6 +608,7 @@ def _run_dynamic_groups_pipeline(control, rank, world_size, device, backend, res
         # this gate: the runtime must ride communicators created after the run began.
         return PipelineRuntime(
             stage,
+            rank=rank,
             replica_id=mine.replica_id,
             assignment=assignment,
             boundary_groups=control.boundary_groups,

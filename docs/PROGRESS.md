@@ -1460,3 +1460,36 @@ python3 -m resihp.launch --config configs/train.json --failures configs/failures
 
 本轮改到的 torch 路径是 `reference` / `verify` / `parallel/pp` / `recovery` / `checkpoint`
 五个文件的构造与装载，本机无法实跑，需目标机门禁确认。
+
+## P13 目标机全量门禁 4 个 failed —— 都是真 kill / scatter-gather 那轮留下的，本轮修掉
+
+**归属核对**（先做的事）：4 条全部在 P12（`1c14ba2` 去重重构）之前就存在。
+`test_combinations.py` / `test_end_to_end.py` P12 **一行都没动**；P12 对
+`test_parallel_dp.py` 只删了 `_adamw`，对 `test_recovery.py` 只改了 4 行 monkeypatch 目标。
+四处失效点分别由 `65e7cb5`（`tp_size` 校验）、`6547f60`（`STOP_SCENARIOS` 去掉
+`no_executable_pp`）、`65e7cb5`（`PipelineRuntime` 加 `rank=`）、`6547f60`（被杀 rank 的结果
+文件不再等长）引入——都是"生产改了、门禁没跟上"。
+
+| 门禁 | 根因 | 修法 |
+|---|---|---|
+| `test_parallel_dp.py::test_a_micro_batch_split_mid_pipeline_is_rejected_not_executed` | `PipelineRuntime` 现在校验 `len(executors) == stage.tp_size`，但 `_StubStage` 没有 `tp_size` | 桩补上 `tp_size = 1`（两个 spec 给 rank 0 的都是单 rank stage） |
+| `test_recovery.py::test_the_planner_stop_codes_come_out_of_a_real_replan` | `STOP_SCENARIOS` 有意去掉了 `no_executable_pp`，但这条用例仍按三个 planner code 查它 | 场景数据合成一张 `SCENARIOS`（含 `no_executable_pp`，victims 直接引用 `VICTIMS["pair"]`）；`STOP_SCENARIOS` 变成从它派生的**幸存者可观测**码表，只做 parametrize；所有查表统一走 `_scenario(code)` |
+| `test_combinations.py::test_combination_gloo[dynamic_groups_pipeline]` | 重建组后的 `PipelineRuntime(...)` 漏传必填的 `rank=`，两个 rank 都以 TypeError 退出 1 | 补 `rank=rank` |
+| `test_end_to_end.py::test_end_to_end_three_d_gloo` | `_assert_micro_batch_stage_executed_once` 对**所有** result 直接 `["iterations"][iteration-1]`，被杀 rank 的账本只到它死的那轮 → IndexError | 让 `_iteration` 返回 `(rank, record)`，三个按轮次读的门禁全部改走它——"哪些 rank 到达了第 N 轮"只剩一处定义 |
+
+### 本机（无 torch）已做的验证
+
+- 用真 planner 合成 end-to-end 的 8 rank 结果结构（被杀 rank 的账本按真实死亡轮次截断），
+  **旧代码复现出报告里同一句 `IndexError: list index out of range`，新代码 6 轮全过**；
+  顺带核对 `EXPECTED_PLANS` 三张表与当前 `build_plan` 输出逐项相同。
+- 纯 planner 复跑 `test_the_planner_stop_codes_come_out_of_a_real_replan` 的循环：
+  三个 code 各由自己的真实故障序列抛出（`no_executable_pp` 来自 `pair` 布局杀掉两个 rank）。
+- `python -m pytest -q`：125 passed, 12 skipped（本机可跑的部分不受影响）；`compileall` 通过。
+- 全仓扫同类问题：`PipelineRuntime(` 的 11 个调用点只有那一处漏 `rank=`；
+  `result["iterations"][...]` 的其余调用点（`test_fault_sequences.py`）本来就带长度判断。
+
+### 待目标机执行的门禁
+
+```bash
+python3 -m pytest -q
+```
