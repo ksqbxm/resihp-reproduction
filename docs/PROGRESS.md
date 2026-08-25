@@ -1302,3 +1302,110 @@ python3 -m pytest -q tests/test_combinations.py tests/test_end_to_end.py tests/t
 python3 -m pytest -q tests/test_parallel_pp.py tests/test_parallel_reshard.py tests/test_parallel_dp.py tests/test_parallel_tp.py
 python3 -m pytest -q          # 全量，含 8 卡 NCCL 门禁
 ```
+
+---
+
+## 真 kill fail-stop：故障发现、通信域重建、单一路径（本轮）
+
+状态：实现完成，待目标机验证。**旧的「逻辑排除」路径已完全删除，不保留兼容层。**
+
+### 问题
+
+此前的 fail-stop 是**模拟**的：被点名的 rank 进程不死，只是被踢出训练组、不再做训练工作，
+但仍留在始终存活的 Gloo `WORLD` 控制组里，继续参与故障广播、停止协商和 checkpoint 收集。
+论文里的 fail-stop 是设备真的没了，因此这条实现绕过了三件真问题：故障发现、NCCL 死对端、
+通信域重建。
+
+### 现在的路径（唯一）
+
+1. **真 kill**：`resihp.train.fail_stop` 在排程点让被点名的 rank 对自己 `os.kill(SIGKILL)`。
+   不是异常、不是 `exit`、不是标志位——进程当场消失，没有 atexit、没有进程组析构、没有缓冲写出。
+   时刻是**安全点边界**：完成本轮 → 写完 checkpoint → 死 → （幸存者才去会合）。
+2. **发现**：`resihp/launch.py` 的 supervisor（起进程的父进程）唯一依据操作系统报告的子进程
+   退出状态。没有心跳、没有超时猜测、不可能把活着的 rank 判死。每个迭代边界所有存活 rank 在
+   `TCPStore` 上会合（`ControlPlane.observe`），supervisor 收完尸再公布本轮成员表。
+   被杀的 rank 从来没到过会合点 ⇒ 幸存者在**发起下一次训练集合通信之前**就知道它没了。
+3. **NCCL 死对端**：靠上一条从根上避免——任何训练组集合通信都不会在成员已死的情况下发起。
+   陈旧通信域在重配时销毁，且此时必然静默（边界会合已证明没有在途传输）；每个进程组都带有限
+   `timeout`（`control.GROUP_TIMEOUT`），卡住会抛错而不是永久挂起。
+4. **通信域重建**：含死进程的 world 组永久不可用（`new_group` 是它上面的集合操作），所以每次
+   fail-stop **整体销毁 world 并在幸存者上重建**（`dissolve_world` / `form_world`，每个 epoch 一个
+   `PrefixStore` 前缀），再建新训练组。
+5. **plan rank / torch rank 分离**：plan rank 是进程启动时的固定身份，planner、checkpoint、
+   `ExecutionPlan` 只讲这一种；torch rank 是它在当前成员表里的下标，每次重建都变。翻译只在
+   `ControlPlane.torch_rank` 一处；`PipelineRuntime` 的 P2P 对端改走 hop 组组内下标
+   （`_peer_rank` → `dist.get_global_rank`），运行时因此完全不需要知道成员表。
+6. **checkpoint 改为每轮提交**：死进程事后无法贡献分片，唯一还可能持有它那份的 checkpoint 就是
+   它活着时写下的那个。这也是「恢复前状态精确等于故障前 checkpoint」（原则 A 前半）在真 kill 下
+   仍然成立的前提。
+
+### 入口变更（硬性）
+
+`torchrun` **不能**作为入口：elastic agent 见到一个 worker 被信号杀死就会连带杀掉/重启其余
+worker，而 ResiHP 的恢复是幸存者原地重配、不是整个作业重启。唯一入口改为：
+
+```bash
+python3 -m resihp.launch --config configs/train.json --failures configs/failures.json
+```
+
+`resihp.launch` 托管全 run 唯一的 `TCPStore`（放在 launcher 而不是 rank 0，故任何 rank 的死亡都
+带不走 rendezvous）、起 worker、子进程死掉时**不动其余进程**，并汇总退出码（被杀的应为 -9）。
+`resihp.train` 变成它起的 worker（不带 `RANK` 时仍是不依赖 torch 的配置回显）。
+
+### 新增 / 改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `resihp/membership.py` | **新增**：store 键协议、worker 侧 `connect`/`boundary`、父侧 `Supervisor`（托管 store、收尸、公布成员表） |
+| `resihp/launch.py` | **新增**：唯一入口，起 8 个 worker 子进程并汇总退出码 |
+| `resihp/control.py` | 重写：删除 `broadcast_failure` 与始终存活控制组；新增 `observe` / `form_world` / `dissolve_world` / `torch_rank`；`_commit_checkpoint` → 公开的 `commit_checkpoint`；`safe_point(config, plan, failed, lost, ...)` 收「发现的丢失集合」而不是注入的 victim |
+| `resihp/train.py` | 重写为 worker：每轮 commit → `fail_stop` → `observe` → 需要时 `safe_point`；acceptance 行新增 `world_members` |
+| `resihp/parallel/pp.py` | `PipelineRuntime` 新增必填 `rank=`（plan rank，不再 `dist.get_rank()`）；P2P 对端经 hop 组换算 |
+| `resihp/recovery.py` | `control_group` → `world_group`；`PlannedRun` 透传 `rank`；删除「failed rank 仍持有状态」的死分支 |
+| `tests/harness.py` | **新增**：多进程门禁共用的真 kill harness（`run_ranks` / `read_results` / `assert_killed`） |
+| 六个多进程测试文件 | 全部改为真 kill：`mp.spawn` → `Supervisor`，注入 victim → `fail_stop` + `observe`，断言改为「幸存者结果 + 退出码 -9」 |
+
+### 语义变化（需要知情）
+
+- **`no_executable_pp` 不再是 rank 能观察到的一致停止**。planner 只在**所有 replica 全灭**时报它，
+  真 kill 下这等于一个进程都不剩：没有 rank 能观察、协商、正常退出。它变成作业结束本身，
+  验收口径改为「最后一次完成迭代的 checkpoint 完整可重载」
+  （`test_recovery.py::test_losing_every_rank_ends_the_job`）。planner 侧这条不可行原因仍由
+  `test_the_planner_stop_codes_come_out_of_a_real_replan` 锁定。因此分布式停止门禁从 6 条变为 5 条 + 1 条作业结束门禁。
+- **`plan_disagreement` 的注入对象改为幸存者**（4 rank 的 `replicated` 布局，注入 rank 2）：
+  原来注入 rank 1，而 rank 1 正是被杀的那个——死进程没法跟任何人不一致。
+- **随机故障序列不再杀到最后一个 rank**（`while len(live) > 1`），否则序列末尾没有任何进程能留下
+  可断言的结果；两条随机序列的期望结局从 `no_executable_pp` 改为「杀到只剩一个 rank 仍继续训练」。
+- **被杀 rank 不再写结果文件**。`test_end_to_end` 因此改为**每轮重写**自己的结果文件，
+  使被杀 rank 留下它活过的那些轮次的账本（这恰好证明它停在自己死的那一刻）；其余门禁只断言幸存者。
+- 故障表仍可点名 rank 0：store 托管在 launcher，不存在「rank 0 特殊」的角色。
+
+### 本机（无 torch）已做的验证
+
+- `python -m pytest -q`：**125 passed, 12 skipped**，与改动前基线一致。
+- `python -m compileall -q resihp tests`：通过。
+- `grep -rn "broadcast_failure\|_commit_checkpoint\|control_group\|dist.group.WORLD" resihp tests`：
+  仅 `control.py:243` 一处（`form_world` 里取新建的 WORLD 句柄），旧路径引用全清。
+- 纯 planner 实跑核对：截断后的两条随机序列 + `interval_n` / `interval_2n` / `donor_exhaustion`
+  全部不触发 `InfeasiblePlan`，末态 active rank 数分别为 1/1/4/6/1——与新的用例期望一致。
+- `test_acceptance.py::test_no_banned_constructs` 仍全绿（新代码措辞避开 Detector/心跳/速度等禁用词，
+  发现机制的依据只有子进程退出状态，与被禁的 fail-slow Detector 无关）。
+
+### 待目标机执行的门禁
+
+```bash
+python3 -m pytest -q tests/test_control.py tests/test_recovery.py
+python3 -m pytest -q tests/test_combinations.py tests/test_end_to_end.py tests/test_fault_sequences.py
+python3 -m pytest -q          # 全量，含 8 卡 NCCL 门禁
+python3 -m resihp.launch --config configs/train.json --failures configs/failures.json
+```
+
+最后一条应打印 3 行 `{"acceptance": ...}`（rank 0/2/3）与 1 行 `{"launch": ...}`，其中
+`killed_ranks == [1,4,5,6,7]`、这五个进程退出码为 -9、其余为 0。
+
+**已知风险（目标机首跑要盯的两处）**：
+1. `dist.destroy_process_group()` 销毁「成员已死但已静默」的 NCCL 通信域。设计上此时无在途传输，
+   `ncclCommDestroy` 应当本地完成；若目标机上出现挂起，改用 torch 2.5+ 的
+   `torch.distributed.distributed_c10d._abort_process_group()`。
+2. `dist.get_global_rank(group, i)`（`parallel/pp.py`）与 `dist.new_group(..., timeout=)` 的可用性
+   ——两者在 torch 2.8（NGC 25.06）都存在，但本机无 torch，无法实跑确认。

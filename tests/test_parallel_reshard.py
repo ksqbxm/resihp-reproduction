@@ -340,7 +340,7 @@ def _run_boundary(rank, device):
         ),
     )
     runtime = PipelineRuntime(
-        stage, replica_id=0, assignment=assignment, boundary_groups={(0, 1, 2): hop}
+        stage, rank=rank, replica_id=0, assignment=assignment, boundary_groups={(0, 1, 2): hop}
     )
     loss = runtime.train_step(tokens)
 

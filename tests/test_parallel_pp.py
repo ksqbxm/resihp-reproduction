@@ -233,7 +233,7 @@ def _compare_pp(rank, num_stages, device):
     ref_updated = {name: p.detach().clone() for name, p in reference.logical_state_dict().items()}
 
     runtime = PipelineRuntime(
-        stage, replica_id=0, assignment=assignment, boundary_groups=boundary
+        stage, rank=rank, replica_id=0, assignment=assignment, boundary_groups=boundary
     )
     loss = runtime.train_step(tokens)
 
@@ -393,6 +393,7 @@ def _compare_hetero(rank, case, device):
     )
     runtime = PipelineRuntime(
         stage,
+        rank=rank,
         replica_id=0,
         assignment=assignment,
         # One union group for the whole hop -- every rank of both stages joins it,

@@ -28,7 +28,7 @@ Transformer，加上完整的重规划 + 通信组重建 + 状态迁移链路，
 | 做 | 不做 |
 |---|---|
 | 纠错恢复：重规划 → 建群 → 状态迁移 → 继续训练 | Detector、心跳、硬件测速、fail-slow、时间预测、性能优化 |
-| fail-stop：失效 rank 永久逻辑下线 | 多卡同轮批量失效、跨轮迁移/抢占 |
+| fail-stop：失效 rank 的进程被真正 `SIGKILL` | 多卡同轮批量失效、跨轮迁移/抢占 |
 | 原生 PyTorch + NCCL/Gloo | Megatron；安装/升级/修改 Torch、CUDA、NCCL |
 | FP32、固定随机 token、AdamW | 混合精度、多优化器 |
 
@@ -131,7 +131,7 @@ print("NCCL version:", torch.cuda.nccl.version())
 PY
 ```
 
-正常应为 `CUDA available: True` / `GPU count: 8`。本项目同时用两个后端：**Gloo** 跑 CPU 测试和始终存活的控制面，
+正常应为 `CUDA available: True` / `GPU count: 8`。本项目同时用两个后端：**Gloo** 跑 CPU 测试和每个 epoch 的 world 组，
 **NCCL** 跑真实 GPU 训练通信（TP / PP / DP 三类组）。
 
 跑多卡任务前先 `nvidia-smi` 确认目标卡空闲，或用 `CUDA_VISIBLE_DEVICES` 指定——历史上「NCCL 卡死」的真实原因是显存被别的进程占了。
@@ -177,10 +177,12 @@ resihp/
 │   ├── pp.py      PipelineRuntime：全项目唯一运行时，1F1B 调度
 │   ├── dp.py      跨 replica 路由与梯度合并
 │   └── reshard.py TP 重切（donor 收集 / checkpoint 兜底 / 重 chunk）
-├── control.py     控制面、九步安全点、一致停止
+├── membership.py  store 协议 + Supervisor：托管 TCPStore、收尸、公布每轮成员表
+├── control.py     控制面、安全点、world 重建、plan/torch rank 翻译、一致停止
 ├── recovery.py    唯一恢复链路（执行 plan 的 state_routes）
 ├── verify.py      原则 A 的两个契约，唯一定义
-└── train.py       唯一入口
+├── train.py       worker：一个 rank 的训练控制循环（含 SIGKILL 注入）
+└── launch.py      唯一入口：起 worker、托管 store、子进程死掉时不动其余进程
 ```
 
 **分层纪律**：`planner/` 是纯函数（同输入必同输出、可单进程穷举测试），`parallel/` 才碰通信。
@@ -222,23 +224,35 @@ python -m pytest -q tests/test_reference.py tests/test_checkpoint.py
 活跃/失效 ranks、每个 DP replica 每个 PP stage 的 TP 成员、每 stage 的连续 layer 区间、
 每个 micro-batch·stage 的执行 rank、状态迁移路由（`state_routes`）、计划版本与规范化 digest。
 
-**两个进程组始终并存**：
+**故障是真的 kill**：被点名的 rank 在完成本轮、写完 checkpoint 之后 `SIGKILL` 自己，
+进程当场消失，没有清理、没有告别通信、显存和通信域随进程一起没了。由此带来三件事：
 
 | 组 | 后端 | 生命周期 |
 |---|---|---|
-| 控制组 | Gloo（WORLD） | **全程存活**，失效 rank 也留在里面，所以故障广播、停止协商、恢复收集永不死锁 |
-| 训练组 | GPU=NCCL / CPU=Gloo | 每次故障全体同步销毁重建：每 stage 一个 TP 组、每个流水跳一个两 rank 组、一个覆盖全部在岗 rank 的 DP 组 |
+| world 组 | Gloo | 一个 epoch 一个：控制类集合通信（停止协商、checkpoint 收集、恢复收集）跑在它上面。含死进程的那个**永久不可用**（`new_group` 是它上面的集合操作），所以每次 fail-stop 整体销毁、在幸存者上重建 |
+| 训练组 | GPU=NCCL / CPU=Gloo | 每次故障全体同步销毁重建：每 stage 一个 TP 组、每个流水跳一个并集组、一个覆盖全部在岗 rank 的 DP 组 |
+| store | `TCPStore` | 托管在 **launcher**（不是 rank 0）里，全程存活：它是唯一一条死进程堵不住的通道 |
 
-故障是**用排除来模拟**的：进程不杀掉，只是被踢出训练组、不再做训练工作，但仍留在控制组。
-这样确定性故障表才完全可测。
+**谁发现故障**：launcher。它是起进程的父进程，唯一依据是操作系统报告的子进程退出状态——
+没有心跳、没有超时猜测、不可能误判活着的 rank。每轮迭代边界上所有存活 rank 在 store 上会合
+（`ControlPlane.observe`），launcher 收完尸再公布本轮成员表；被杀的 rank 从来没到过会合点，
+所以幸存者是在**发起下一次训练集合通信之前**就知道它没了——NCCL 永远不会拿到死对端。
 
-九步安全点（`ControlPlane.safe_point`）：
+**plan rank 与 torch rank**：plan rank 是进程启动时的固定身份（planner、checkpoint、
+`ExecutionPlan` 只讲这一种）；torch rank 是它在当前成员表里的下标，每次重建都变。翻译只在
+`ControlPlane.torch_rank` 一处发生；`PipelineRuntime` 的 P2P 对端则走 hop 组的组内下标换算。
+
+安全点（`ControlPlane.safe_point`）：
 
 ```
-1 完成并提交当前迭代     2 原子保存 checkpoint      3 广播 fail-stop 事件
-4 标记该 rank 永久失效   5 TP→PP→DP 重规划           6 统一顺序释放旧组、建新组
-7 恢复/迁移/重切状态     8 校验计划与状态摘要一致      9 从下一迭代继续
+1 完成当前迭代           2 原子保存 checkpoint（每轮都做）  3 边界会合，读回成员表
+4 标记该 rank 永久失效   5 TP→PP→DP 重规划                  6 释放旧组与旧 world、
+                                                              在幸存者上重建 world、建新训练组
+7 恢复/迁移/重切状态     8 校验计划与状态摘要一致            9 从下一迭代继续
 ```
+
+第 2 步为什么每轮都做：死进程事后没法贡献任何分片，唯一还能持有它那份的 checkpoint，
+就是它**活着时**写下的那个——「恢复前状态精确等于故障前 checkpoint」这条验收才有意义。
 
 ```bash
 python -m pytest -q tests/test_plan.py tests/test_control.py
@@ -321,9 +335,14 @@ fail-stop → 读 checkpoint / 从健康 replica 收集 → 恢复完整逻辑�
 运行时不再有第二套路由策略，只保留计划做不了的安全检查：donor 集合真不完整才落 checkpoint、
 route 声明的名字必须真的到货、stage 该有的名字必须被覆盖——三者都抛错走一致停止。
 
-**一致停止**：六条停止条件，任何一条被任何 rank 观察到，**所有 rank 抛同一个 `ConsistentStop`**。
-协商跑在始终存活的控制组上，原因取自 gather 到的列表而不是本地视角，而且发生在**建任何组之前**。
-所以不会有人半路继续、不会留半完成的计划或组，故障前 checkpoint 原封不动。
+**一致停止**：六条停止条件，任何一条被任何幸存 rank 观察到，**所有幸存 rank 抛同一个
+`ConsistentStop`**。协商跑在**刚重建好的 world 组**上（旧的那个含死进程，一次集合通信都跑不了），
+原因取自 gather 到的列表而不是本地视角，而且发生在**建任何训练组之前**。所以不会有人半路继续、
+不会留半完成的计划或组，故障前 checkpoint 原封不动。
+
+其中 `no_executable_pp`（所有 replica 全灭）在真 kill 下等于一个进程都不剩：没有 rank 能观察它、
+协商它、正常退出。它因此不再是 rank 观察到的停止，而是作业结束本身——launcher 汇总退出码，
+最后一次完成迭代的 checkpoint 留在盘上可重载。planner 侧这条不可行原因仍由纯函数测试锁定。
 
 | 停止码 | 含义 |
 |---|---|
@@ -363,10 +382,15 @@ python -m pytest -q tests/test_memory.py
 ### 4.1 唯一入口
 
 ```bash
-torchrun --standalone --nproc_per_node=8 -m resihp.train --config configs/train.json --failures configs/failures.json
+python3 -m resihp.launch --config configs/train.json --failures configs/failures.json
 ```
 
-不带 `RANK` 环境变量直接跑，它退化成一个不依赖 torch 的配置回显，方便单独检查 CLI 和配置文件：
+入口不是 `torchrun`：elastic agent 见到一个 worker 被信号杀死就会连带杀掉/重启其余 worker，
+而这里要的是幸存者原地重配。`resihp.launch` 托管 store、按 world size 起 worker、子进程死掉时
+不动其余进程，并汇总每个进程的退出码（被杀的应为 -9）。`resihp.train` 是它起的 **worker**。
+
+`resihp.train` 不带 `RANK` 环境变量直接跑，它退化成一个不依赖 torch 的配置回显，
+方便单独检查 CLI 和配置文件：
 
 ```bash
 python -m resihp.train --config configs/train.json --failures configs/failures.json
@@ -451,11 +475,12 @@ rank 7 = `[1..6]`、rank 0/2/3 = `[1..8]`。
 |---|---|---|
 | `test_config.py` / `test_memory.py` | 配置校验、显存公式（含手算逐项核对与「刚好满足 / 超一字节」边界） | 无 |
 | `test_planner_{tp,pp,dp}.py` / `test_plan.py` | 三个 planner 纯函数 + ExecutionPlan 不变量 | 无 |
-| `test_acceptance.py` | 禁用构造全仓扫描 + 默认排程真的动三个维度 + torchrun 验收 | 后者需 8 GPU |
+| `test_acceptance.py` | 禁用构造全仓扫描 + 默认排程真的动三个维度 + launcher 验收（含被杀进程退出码） | 后者需 8 GPU |
 | `test_entrypoint.py` | 唯一入口可解析 | 无 |
 | `test_reference.py` / `test_checkpoint.py` | 参考训练可重复、checkpoint 原子性 | torch |
 | `test_parallel_{tp,pp,dp,reshard}.py` | 真实分片前反向、1F1B、跨 replica、TP 重切与异构边界 | torch（Gloo/NCCL 双跑） |
-| `test_control.py` / `test_recovery.py` | 九步安全点、恢复路径、六条一致停止 | torch，8 进程 |
+| `test_control.py` / `test_recovery.py` | 安全点与真 kill、恢复路径、五条 rank 可观察的一致停止 + 全灭即作业结束 | torch，8 进程 |
+| `harness.py` | 多进程门禁共用的 supervisor（托管 store、收尸、公布成员表），不是测试 | torch |
 | `test_combinations.py` | 七项两两组合，全部执行真实前反向 | torch，Gloo/NCCL 各一遍 |
 | `test_end_to_end.py` | 完整 3D `TP2×PP2×DP2` 八进程端到端 | torch，Gloo/NCCL 各一遍 |
 | `test_fault_sequences.py` | 固定 seed 随机故障序列、反复注入、donor 耗尽 | torch，Gloo/NCCL 各一遍 |
@@ -469,15 +494,17 @@ python -m pytest -q tests/test_acceptance.py -v
 ```
 
 ```bash
-torchrun --standalone --nproc_per_node=8 -m resihp.train --config configs/train.json --failures configs/failures.json
+python3 -m resihp.launch --config configs/train.json --failures configs/failures.json
 ```
 
 ```bash
 python -m pytest -q
 ```
 
-第二条是人工验收：屏幕上应出现 8 行 `{"acceptance": ...}`，`trained_iterations` 逐 rank 等于 4.5 节那张表，
-八行的 `plan_digests` 完全相同（各 6 项），且不出现 `{"stopped": ...}`。
+第二条是人工验收：屏幕上应出现 **3 行** `{"acceptance": ...}`（rank 0/2/3，`trained_iterations`
+均为 `[1..8]`，三行 `plan_digests` 完全相同、各 6 项），外加一行 `{"launch": ...}`，其中
+`killed_ranks == [1,4,5,6,7]`、这五个进程退出码为 -9、其余为 0，且不出现 `{"stopped": ...}`。
+被杀的 rank 一个字都不会打印——那正是它们真的死了。
 跑之前先清掉 `checkpoint.pt`，跑完它应存在且没有 `checkpoint.pt.tmp` 残留。
 
 ### 5.3 当前状态

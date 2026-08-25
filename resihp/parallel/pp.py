@@ -105,21 +105,23 @@ class PipelineRuntime:
     the executor ranks of every ``(micro_batch, stage)``. ``boundary_groups`` maps the
     sorted union of two adjacent stages' ranks to the process group every chunk of that
     hop rides on, and ``group`` is the group spanning every rank the plan places -- the
-    DP gradient combine rides there. Ranks are **global** throughout, because that is
-    what the assignment names.
+    DP gradient combine rides there. Ranks are **plan ranks** throughout, because that
+    is what the assignment names: the stable identity a rank keeps for the whole run,
+    not its index in the current world, which changes every time a fail-stop re-forms
+    it. :meth:`_peer_rank` is the one place the two meet.
 
     :meth:`train_step` runs the schedule, combines gradients across DP replicas, and
     applies one AdamW WeightUpdate; :attr:`schedule` records the primitives it issued,
     in order, tagged with the micro-batch each acted on.
     """
 
-    def __init__(self, stage, *, replica_id, assignment, boundary_groups=None, group=None):
+    def __init__(self, stage, *, rank, replica_id, assignment, boundary_groups=None, group=None):
         self.stage = stage
         self.replica_id = int(replica_id)
         self.assignment = assignment
         self.group = group
         self.boundary_groups = dict(boundary_groups or {})
-        self.rank = dist.get_rank()
+        self.rank = int(rank)
         self.routes = executor_route(assignment, self.rank)
         self.micro_batches = [route["micro_batch"] for route in self.routes]
         self.micro_total = global_micro_count(assignment)
@@ -196,9 +198,25 @@ class PipelineRuntime:
     # rank is on: :func:`scatter_routing` is then the one table both sides read, so the
     # forward chunk and its gradient always agree on which rank pair they belong to.
 
-    def _hop_group(self, up_members, down_members):
-        """The union process group every chunk of this hop rides on."""
-        return self.boundary_groups[tuple(sorted(set(up_members) | set(down_members)))]
+    def _hop(self, up_members, down_members):
+        """This hop's members, and the union process group every one of its chunks rides.
+
+        The member tuple is sorted, which is the order the group was built in, so a
+        member's position in it is its rank *inside* that group.
+        """
+        key = tuple(sorted(set(up_members) | set(down_members)))
+        return key, self.boundary_groups[key]
+
+    def _peer_rank(self, hop, group, peer):
+        """The torch rank a P2P op must name for the plan rank ``peer``.
+
+        A fail-stop kills a process and the survivors re-form the world, so a rank's
+        torch rank is only its index in the current membership while its plan rank is
+        fixed. Going through the hop group -- position in the hop, then that group's
+        own translation -- keeps this correct after any number of re-formations without
+        the runtime having to know the membership at all.
+        """
+        return dist.get_global_rank(group, hop.index(peer))
 
     def _my_chunks(self, up_members, down_members):
         """``(chunk index, peer rank)`` for every chunk of this hop this rank carries.
@@ -234,12 +252,15 @@ class PipelineRuntime:
         The chunk index is global to the hop, because this rank holds the whole
         replicated tensor and must put the receiver's own slice on the wire.
         """
-        group = self._hop_group(up_members, down_members)
+        hop, group = self._hop(up_members, down_members)
         flat = tensor.detach().reshape(-1)
         width = flat.numel() // max(len(up_members), len(down_members))
         return [
             dist.P2POp(
-                dist.isend, flat[index * width : (index + 1) * width].contiguous(), peer, group
+                dist.isend,
+                flat[index * width : (index + 1) * width].contiguous(),
+                self._peer_rank(hop, group, peer),
+                group,
             )
             for index, peer in self._my_chunks(up_members, down_members)
         ]
@@ -251,12 +272,17 @@ class PipelineRuntime:
         this rank's contiguous share of the flat tensor -- the shape
         :meth:`_reconstruct` all-gathers.
         """
-        group = self._hop_group(up_members, down_members)
+        hop, group = self._hop(up_members, down_members)
         mine = self._my_chunks(up_members, down_members)
         width = math.prod(shape) // max(len(up_members), len(down_members))
         slab = torch.empty(len(mine) * width, device=device)
         ops = [
-            dist.P2POp(dist.irecv, slab[slot * width : (slot + 1) * width], peer, group)
+            dist.P2POp(
+                dist.irecv,
+                slab[slot * width : (slot + 1) * width],
+                self._peer_rank(hop, group, peer),
+                group,
+            )
             for slot, (_index, peer) in enumerate(mine)
         ]
         return slab, ops

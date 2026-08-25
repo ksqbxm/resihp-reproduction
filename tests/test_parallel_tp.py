@@ -241,13 +241,11 @@ def test_indivisible_degree_is_rejected():
         _require_divisible(CONFIG, VOCAB, 3)  # 4 heads / 16 dim / 32 vocab not divisible by 3
 
 
-def _commit_worker(rank, world_size, result_dir, port):
+def _commit_worker(rank, env, result_dir):
     """Safe-point step 2 over a real (single-rank) plan, on real planned state."""
     import os
 
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE=str(world_size)
-    )
+    os.environ.update(env)
     from dataclasses import replace
 
     import torch.distributed as dist
@@ -258,10 +256,9 @@ def _commit_worker(rank, world_size, result_dir, port):
     from resihp.recovery import initial_run
     from resihp.reference import ReferenceRun
 
-    dist.init_process_group(backend="gloo")
     config = replace(CONFIG, tp=1, pp=1, dp=1)
-    control = ControlPlane(
-        rank, world_size, dist.group.WORLD, "gloo", vocab_size=VOCAB, sequence_length=SEQLEN
+    control = ControlPlane.initialize(
+        training_backend="gloo", vocab_size=VOCAB, sequence_length=SEQLEN
     )
     plan = build_plan(config, step=0, version=0)
     control.build_training_groups(plan)
@@ -280,7 +277,7 @@ def _commit_worker(rank, world_size, result_dir, port):
         checkpoint_path=path,
     )
     control.training_step()
-    control._commit_checkpoint(plan)  # gathers the shards into one logical checkpoint
+    control.commit_checkpoint(plan)  # gathers the shards into one logical checkpoint
     assert path.exists()
 
     fresh = ReferenceRun(config, vocab_size=VOCAB, sequence_length=SEQLEN)
@@ -295,6 +292,6 @@ def test_control_plane_commits_real_state(tmp_path):
     Recovery, the state digest, and the stop conditions that read this file are
     exercised in ``tests/test_recovery.py``; this pins the commit call point only.
     """
-    import torch.multiprocessing as mp
+    from harness import assert_killed, run_ranks
 
-    mp.spawn(_commit_worker, args=(1, str(tmp_path), _free_port()), nprocs=1, join=True)
+    assert_killed(run_ranks(_commit_worker, 1, str(tmp_path)), (), tmp_path, "commit")

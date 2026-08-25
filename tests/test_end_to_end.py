@@ -16,10 +16,13 @@ replicas run *different* PP layerings at *different* TP degrees.
 What the gate locks (the bullet's own checklist):
 
 * **no collective-order error, no deadlock** -- a mismatched collective order under
-  Gloo/NCCL either hangs or raises; every rank is required to finish and write its
-  result before a hard timeout, and a blocked rank dumps its own stack into the
-  failure message rather than hanging the suite.
-* **a failed rank never trains again** -- the iterations each rank actually executed.
+  Gloo/NCCL either hangs or raises; every surviving rank is required to finish and
+  write its result before a hard timeout, and a blocked rank dumps its own stack into
+  the failure message rather than hanging the suite.
+* **a failed rank is really dead** -- ranks 1 and 5 send themselves ``SIGKILL`` at
+  their safe points and exit ``-9``; each rank rewrites its result file after every
+  iteration, so a killed rank leaves behind exactly the iterations it lived through
+  and nothing after them.
 * **exactly one new plan per failure** -- versions ``[1, 2]``, strictly increasing,
   with every rank agreeing on each event's digest.
 * **before resume, the state is exactly the checkpoint** -- principle A's first half:
@@ -38,9 +41,10 @@ What the gate locks (the bullet's own checklist):
 
 The gate runs on CPU/**Gloo** (the eight-process configuration plan section 四.D
 names) and on GPU/**NCCL** with real device tensors and real NCCL training groups;
-the world group stays Gloo on both, because it is the control plane's always-alive
-control group (plan 3.2). The NCCL gate needs eight GPUs -- one rank per device --
-and skips when there are fewer.
+the world group stays Gloo on both, and is dissolved and re-formed over the survivors
+at each fail-stop, because the one the dead rank belonged to can never be used again.
+The NCCL gate needs eight GPUs -- one rank per device -- and skips when there are
+fewer.
 
 Tolerance: TP all-reduce and micro-batch splitting reorder FP32 accumulation relative
 to the reference's single full-batch pass, so the numeric comparison is the
@@ -51,8 +55,6 @@ checkpoint ones, where no arithmetic is involved.
 import faulthandler
 import json
 import os
-import socket
-import time
 from pathlib import Path
 
 import pytest
@@ -62,12 +64,14 @@ torch = pytest.importorskip("torch")
 import torch.distributed as dist
 from torch.nn import functional as F
 
+from harness import assert_killed, run_ranks
 from resihp.checkpoint import load_anchor
 from resihp.config import TrainConfig
 from resihp.control import ControlPlane
 from resihp.plan import build_plan
 from resihp.planner.pp import peak_in_flight
 from resihp.recovery import initial_run, stage_of
+from resihp.train import fail_stop
 from resihp import verify
 
 
@@ -123,23 +127,17 @@ EXPECTED_PLANS = [
 ]
 #: Which plan version each iteration ran under (iteration 1 is index 0).
 PLAN_BY_ITERATION = [0, 0, 1, 1, 2, 2]
-#: The iterations each rank executes: rank 1 stops after event 1, rank 5 after event 2.
+#: The ranks the schedule really kills, and when they stop existing.
+KILLED = sorted(FAILURES.values())
+#: The iterations each rank executes: rank 1 dies after event 1, rank 5 after event 2.
 EXPECTED_TRAINED = {
     1: [1, 2],
     5: [1, 2, 3, 4],
     **{rank: [1, 2, 3, 4, 5, 6] for rank in (0, 2, 3, 4, 6, 7)},
 }
 
-#: A rank stuck in a collective would hang the suite forever; fail the gate instead.
-JOIN_TIMEOUT = 600.0
 #: A blocked rank is invisible from outside, so each dumps its own stack after this long.
 STACK_DUMP_AFTER = 120.0
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _batch(index, device):
@@ -219,11 +217,11 @@ def _segment_end(iteration: int) -> int:
     return min(later) if later else CONFIG.iterations
 
 
-def _run_end_to_end(rank, world_size, device, backend, result_dir):
-    """One rank's whole run: six iterations across two fail-stop safe points."""
+def _run_end_to_end(rank, device, backend, result_dir):
+    """One rank's whole run: six iterations across two real fail-stops."""
     checkpoint = result_dir / "ckpt.pt"
-    control = ControlPlane(
-        rank, world_size, dist.group.WORLD, backend, vocab_size=VOCAB, sequence_length=SEQLEN
+    control = ControlPlane.initialize(
+        training_backend=backend, vocab_size=VOCAB, sequence_length=SEQLEN
     )
     plan = build_plan(CONFIG, step=0, version=0)
     control.build_training_groups(plan)
@@ -252,6 +250,23 @@ def _run_end_to_end(rank, world_size, device, backend, result_dir):
     plans = [_plan_record(plan)]
     iterations, events = [], []
     failed: tuple[int, ...] = ()
+    # The result is written after every iteration rather than once at the end. A rank
+    # that is about to be killed has no chance to report anything afterwards, so this
+    # is the only way its own account of the iterations it *did* run survives it --
+    # and that account is what proves it stopped exactly when it died.
+    result = {
+        "rank": rank,
+        "plans": plans,
+        "events": events,
+        "iterations": iterations,
+        "all_names": all_names,
+    }
+    partial = Path(result_dir, f"result_{rank}.json")
+
+    def flush():
+        partial.write_text(json.dumps(result))
+
+    flush()
     for step in range(CONFIG.iterations):
         iteration = step + 1
         record = {"iteration": iteration, "trained": False}
@@ -274,17 +289,20 @@ def _run_end_to_end(rank, world_size, device, backend, result_dir):
             wanted = reference[iteration - base]
             record.update(_compare_shards(control.training_run.stage, wanted))
         iterations.append(record)
+        flush()
 
-        failed_rank = FAILURES.get(iteration)
-        if failed_rank is None:
+        control.commit_checkpoint(plan)  # step 2, while the scheduled rank still lives
+        fail_stop(FAILURES, rank, iteration)  # and here it stops living
+        lost = control.observe()
+        if not lost:
             continue
-        plan, failed = control.safe_point(CONFIG, plan, failed, failed_rank, next_step=iteration)
+        plan, failed = control.safe_point(CONFIG, plan, failed, lost, next_step=iteration)
         anchor, completed = load_anchor(checkpoint)
         plans.append(_plan_record(plan))
         events.append(
             {
                 "iteration": iteration,
-                "failed_rank": failed_rank,
+                "failed_rank": lost[0],
                 "failed": list(failed),
                 "completed": completed,
                 "matches_checkpoint": _matches_anchor(control.training_run, plan, rank, checkpoint),
@@ -295,25 +313,22 @@ def _run_end_to_end(rank, world_size, device, backend, result_dir):
             anchor, device, start=completed, count=_segment_end(iteration) - iteration
         )
         base = iteration + 1
+        flush()
 
     if control.training_run is not None:
         # Recovery rebuilds the stage, so the device has to be re-checked afterwards:
         # this is where it lands, not where it was asked to go.
         on_gpu &= bool(next(control.training_run.stage.parameters()).is_cuda)
 
-    result = {
-        "rank": rank,
-        "plans": plans,
-        "events": events,
-        "iterations": iterations,
-        "final_failed": list(plan.failed_ranks),
-        "final_live": list(plan.live_ranks),
-        "all_names": all_names,
-        "backend": None if control.tp_group is None else dist.get_backend(control.tp_group),
-        "is_cuda": on_gpu,
-    }
+    result.update(
+        final_failed=list(plan.failed_ranks),
+        final_live=list(plan.live_ranks),
+        backend=None if control.tp_group is None else dist.get_backend(control.tp_group),
+        is_cuda=on_gpu,
+    )
     control.shutdown()
     result["initialized"] = dist.is_initialized()
+    flush()
     return result
 
 
@@ -321,13 +336,26 @@ def _run_end_to_end(rank, world_size, device, backend, result_dir):
 
 
 def _iteration(results, iteration):
-    """Every rank's record for one iteration, indexed by rank."""
-    return [result["iterations"][iteration - 1] for result in results]
+    """Every rank's record for one iteration -- from the ranks that reached it.
+
+    A killed rank's file stops at the iteration it died in, so past that point it
+    contributes nothing, which is exactly what "it is gone" means here.
+    """
+    return [
+        result["iterations"][iteration - 1]
+        for result in results
+        if len(result["iterations"]) >= iteration
+    ]
+
+
+def _survivors(results):
+    """The ranks still running at the end -- the only ones with a full account."""
+    return [result for result in results if result["rank"] not in KILLED]
 
 
 def _assert_one_plan_per_failure(results, label):
     """Each event yields exactly one new version, and every rank agrees on it."""
-    for result in results:
+    for result in _survivors(results):
         assert [entry["version"] for entry in result["plans"]] == [0, 1, 2], result["rank"]
         assert [entry["iteration"] for entry in result["events"]] == sorted(FAILURES)
         assert [entry["failed_rank"] for entry in result["events"]] == [
@@ -335,8 +363,14 @@ def _assert_one_plan_per_failure(results, label):
         ]
         assert result["final_failed"] == [1, 5], result["rank"]
         assert result["final_live"] == [0, 2, 3, 4, 6, 7], result["rank"]
+    # Including the killed ranks, up to the point they were killed: a victim recorded
+    # the plans it acted on before it died, and those must agree with everyone else's.
     for version in range(3):
-        digests = {result["plans"][version]["digest"] for result in results}
+        digests = {
+            result["plans"][version]["digest"]
+            for result in results
+            if len(result["plans"]) > version
+        }
         assert len(digests) == 1, (label, version, digests)
 
 
@@ -418,7 +452,10 @@ def _assert_micro_batch_stage_executed_once(results, label):
 
 
 def _assert_failed_ranks_stop_training(results, label):
-    """A rank marked failed leaves the training path permanently."""
+    """A killed rank stops at its own death, and never appears again.
+
+    Its record ends where its process did; every rank after that point is a survivor.
+    """
     for result in results:
         trained = [record["iteration"] for record in result["iterations"] if record["trained"]]
         assert trained == EXPECTED_TRAINED[result["rank"]], (label, result["rank"], trained)
@@ -495,9 +532,13 @@ def _assert_matches_reference_after_resume(results, label):
 
 
 def _assert_no_residual_state(results, label):
-    """No process group survives the run, and the model was really pipelined."""
+    """No process group survives the run, and the model was really pipelined.
+
+    Only the survivors can answer the first half: a killed process left no group
+    behind because it left nothing behind at all.
+    """
     every = set(results[0]["all_names"])
-    for result in results:
+    for result in _survivors(results):
         assert result["initialized"] is False, (label, result["rank"])
         for record in result["iterations"]:
             if record["trained"]:
@@ -519,11 +560,9 @@ def _assert_end_to_end(results, label):
 # --- process entry point ----------------------------------------------------------
 
 
-def _entry(rank, world_size, backend, result_dir, port):
-    """One spawned rank: Gloo world, training groups on ``backend``, then the scenario."""
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE=str(world_size)
-    )
+def _entry(rank, env, backend, result_dir):
+    """One spawned rank: join the world from the store, then run the scenario."""
+    os.environ.update(env)
     # Kept open for the process's lifetime: faulthandler writes into it from a timer.
     stack_file = Path(result_dir, f"stack_{rank}.txt").open("w")
     faulthandler.dump_traceback_later(STACK_DUMP_AFTER, repeat=True, file=stack_file)
@@ -533,37 +572,23 @@ def _entry(rank, world_size, backend, result_dir, port):
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
         assert torch.cuda.current_device() == rank
-    # The world group is Gloo on both backends -- it is the control plane's
-    # always-alive group (plan 3.2); only the training groups switch to NCCL.
-    dist.init_process_group(backend="gloo")
-    result = _run_end_to_end(rank, world_size, device, backend, Path(result_dir))
+    # The world group is Gloo on both backends -- it carries the object collectives and
+    # is re-formed on every fail-stop; only the training groups switch to NCCL.
+    _run_end_to_end(rank, device, backend, Path(result_dir))
     faulthandler.cancel_dump_traceback_later()
-    Path(result_dir, f"result_{rank}.json").write_text(json.dumps(result))
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
 def _spawn(backend, tmp_path):
-    """Spawn the eight ranks and require *all* of them to exit before the timeout."""
-    import torch.multiprocessing as mp
+    """Run the eight ranks for real; return every rank's account, killed ones included.
 
-    context = mp.spawn(
-        _entry,
-        args=(WORLD_SIZE, backend, str(tmp_path), _free_port()),
-        nprocs=WORLD_SIZE,
-        join=False,
-    )
-    deadline = time.monotonic() + JOIN_TIMEOUT
-    while not context.join(timeout=5):
-        if time.monotonic() > deadline:
-            for process in context.processes:
-                process.terminate()
-            stacks = "\n".join(
-                f"--- rank {peer} ---\n{Path(tmp_path, f'stack_{peer}.txt').read_text()}"
-                for peer in range(WORLD_SIZE)
-                if Path(tmp_path, f"stack_{peer}.txt").exists()
-            )
-            pytest.fail(f"end-to-end/{backend}: a rank is blocked and did not exit\n{stacks}")
+    The killed ranks' files stop at their last completed iteration -- see
+    :func:`_run_end_to_end` -- so the whole run is still covered rank by rank, while
+    the exit codes are what prove the two ranks were killed rather than excluded.
+    """
+    exit_codes = run_ranks(_entry, WORLD_SIZE, backend, str(tmp_path))
+    assert_killed(exit_codes, KILLED, tmp_path, f"end-to-end/{backend}")
     return [
         json.loads(Path(tmp_path, f"result_{rank}.json").read_text()) for rank in range(WORLD_SIZE)
     ]
@@ -589,9 +614,11 @@ def test_end_to_end_three_d_cuda_nccl(tmp_path):
     """The same scenario on real GPU tensors and real NCCL training groups."""
     _skip_if_few_gpus(WORLD_SIZE)
     results = _spawn("nccl", tmp_path)
-    for result in results:
+    # Only the survivors report a device and a backend: those fields are written on the
+    # way out, and a killed rank has no way out.
+    for result in _survivors(results):
         assert result["is_cuda"], result["rank"]
     # An idle rank holds no training group; every rank that holds one is on NCCL.
-    backends = {result["backend"] for result in results} - {None}
-    assert backends == {"nccl"}, [result["backend"] for result in results]
+    backends = {result["backend"] for result in _survivors(results)} - {None}
+    assert backends == {"nccl"}, [result["backend"] for result in _survivors(results)]
     _assert_end_to_end(results, "end-to-end NCCL")

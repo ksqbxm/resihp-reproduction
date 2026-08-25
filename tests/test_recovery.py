@@ -8,8 +8,11 @@ plan's own ``state_routes``: recovery makes no routing decision of its own, so a
 is fetched when the plan routed it, the boundary tensors when the plan routed them, and
 a replica nothing happened to fetches nothing at all.
 
-**Recovery** -- the single path of plan 3.6 driven through the real nine-step safe
-point, with the run executing through the plan's own micro-batch assignment on the 1F1B
+**Recovery** -- the single path of plan 3.6 driven through the real safe point, opened
+by a real kill: every victim below sends itself ``SIGKILL``, so its shards are gone
+with its process and have to come back from a peer replica or from the checkpoint
+written while it was still alive. A victim writes no result, so the results are keyed
+by rank. The run executes through the plan's own micro-batch assignment on the 1F1B
 ``PipelineRuntime``, over stages cut to the plan's ``layer_range`` and sharded to its TP
 degree (T10's ``TensorParallelStage``):
 
@@ -39,14 +42,16 @@ same single root cause, no new plan published, no group left over from the stopp
 plan, no residual process group, the pre-failure checkpoint still reloadable, and
 everyone exiting before the timeout rather than blocking in a collective.
 
-Every stop condition is reached through the real ``safe_point`` -> ``build_plan``
-path; ``STOP_SCENARIOS`` says how. Only ``plan_disagreement`` injects a fault, because
-deterministic replanning cannot disagree with itself -- and what is under test there is
-the control plane's reaction, not the disagreement.
+Every stop condition a surviving rank can observe is reached through the real
+``safe_point`` -> ``build_plan`` path; ``STOP_SCENARIOS`` says how. Only
+``plan_disagreement`` injects a fault, because deterministic replanning cannot disagree
+with itself -- and what is under test there is the control plane's reaction, not the
+disagreement. ``no_executable_pp`` is the one condition no rank can report under a real
+kill, because it means every process is dead; it has its own gate.
 
 Every distributed gate runs on CPU/**Gloo** and on GPU/**NCCL** with real device
-tensors and real NCCL training groups (the control group stays Gloo on both, as it
-must). NCCL gates skip only when there are fewer GPUs than the case needs.
+tensors and real NCCL training groups (the world group stays Gloo on both, as it must).
+NCCL gates skip only when there are fewer GPUs than the case needs.
 """
 
 import faulthandler
@@ -54,14 +59,13 @@ import hashlib
 import importlib.util
 import json
 import os
-import socket
-import time
 from pathlib import Path
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
+from harness import assert_killed, read_results, run_ranks
 from resihp.checkpoint import CheckpointError, load_anchor
 from resihp.config import TrainConfig
 from resihp.control import STOP_CODES, ConsistentStop, ControlPlane
@@ -97,20 +101,31 @@ ABSORB = dict(PIPELINE, num_layers=4, tp=1, pp=2, dp=1)
 RESEAT = dict(PIPELINE, num_layers=2, tp=4, pp=1, dp=1)
 VOCAB = 32
 SEQLEN = 8
-#: Victims per scenario, applied one rank at a time (principle B).
-VICTIMS = {"pipeline": (1,), "replicated": (1, 3), "reseat": (0, 1)}
+#: Victims per scenario, applied one rank at a time (principle B). ``pair`` kills both
+#: of its ranks, which is the end of the job rather than a recovery.
+VICTIMS = {"pipeline": (1,), "replicated": (1, 3), "reseat": (0, 1), "pair": (1, 0)}
 #: ``code -> (layout, victims, analytic budget as (tp_degree, stage_layers) or None)``.
 #: The budget is one the pristine layout fits and the post-failure layout does not.
+#:
+#: ``no_executable_pp`` is not here, and cannot be: the planner raises it only when
+#: *every* replica is gone, and a fail-stop that kills the last process leaves nobody
+#: to observe a stop, publish a plan, or exit consistently. Under real kills that
+#: condition is the end of the job, so it has its own gate
+#: (:func:`test_losing_every_rank_ends_the_job`) rather than a rank-observed one; the
+#: planner code itself is still locked by
+#: :func:`test_the_planner_stop_codes_come_out_of_a_real_replan`.
 STOP_SCENARIOS = {
     "no_feasible_tp": ("pair", (1,), (2, 2)),
-    "no_executable_pp": ("pair", (1, 0), None),
     "no_feasible_dp_target": ("absorb", (1,), (1, 3)),
     "checkpoint_unusable": ("pair", (1,), None),
-    "plan_disagreement": ("pair", (1,), None),
+    # Four ranks, so that the rank made to diverge is a *survivor*: a disagreement
+    # needs two live ranks that replanned differently.
+    "plan_disagreement": ("replicated", (1,), None),
     "state_mismatch": ("pair", (1,), None),
 }
-#: A rank stuck in a collective would hang the suite forever; fail the gate instead.
-JOIN_TIMEOUT = 180.0
+#: Which rank ``plan_disagreement`` makes replan differently -- never a victim.
+DIVERGING_RANK = 2
+
 #: A blocked rank is invisible from outside, so each one dumps its own Python stack
 #: after this long. A hang then names the exact operation every rank is sitting in.
 STACK_DUMP_AFTER = 60.0
@@ -154,12 +169,6 @@ def _scenario(code):
     kind, victims, budget = STOP_SCENARIOS[code]
     config = _config(kind)
     return config, victims, None if budget is None else _budget(config, *budget)
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _layers_in(names):
@@ -378,17 +387,18 @@ def _attach(control, plan, rank, device, checkpoint):
     )
 
 
-def _run_recovery(rank, world_size, device, kind, backend, result_dir):
-    """Drive real safe points and report how each rank came out of them."""
+def _run_recovery(rank, device, kind, backend, result_dir):
+    """Drive real safe points -- each opened by a real kill -- and report the outcome."""
     import torch.distributed as dist
 
     from resihp.checkpoint import load_checkpoint
     from resihp.reference import ReferenceRun
+    from resihp.train import fail_stop
 
     config = _config(kind)
     checkpoint = result_dir / "ckpt.pt"
-    control = ControlPlane(
-        rank, world_size, dist.group.WORLD, backend, vocab_size=VOCAB, sequence_length=SEQLEN
+    control = ControlPlane.initialize(
+        training_backend=backend, vocab_size=VOCAB, sequence_length=SEQLEN
     )
     plan = build_plan(config, step=0, version=0)
     control.build_training_groups(plan)
@@ -405,7 +415,13 @@ def _run_recovery(rank, world_size, device, kind, backend, result_dir):
 
     failed: tuple[int, ...] = ()
     for event, victim in enumerate(VICTIMS[kind], start=1):
-        plan, failed = control.safe_point(config, plan, failed, victim, next_step=event)
+        # Step 2 first, while the victim is still alive: it is the last checkpoint that
+        # can hold the shards nobody else has.
+        control.commit_checkpoint(plan)
+        fail_stop({event: victim}, rank, event)  # the victim's process ends here
+        plan, failed = control.safe_point(
+            config, plan, failed, control.observe(), next_step=event
+        )
         assert plan.version == event
         result["events"].append(_snapshot(control, plan, rank))
         result["losses"].append(control.training_step())  # keep training after recovery
@@ -414,11 +430,12 @@ def _run_recovery(rank, world_size, device, kind, backend, result_dir):
     result["failed"] = list(failed)
     control.shutdown()
     result["initialized"] = dist.is_initialized()
-    if rank == 0:
-        completed, version = load_checkpoint(
-            checkpoint, ReferenceRun(config, vocab_size=VOCAB, sequence_length=SEQLEN)
-        )
-        result["checkpoint"] = [completed, version]
+    # Every surviving rank reloads it: which ranks are left is decided by the schedule,
+    # so no single rank can be the designated reporter any more.
+    completed, version = load_checkpoint(
+        checkpoint, ReferenceRun(config, vocab_size=VOCAB, sequence_length=SEQLEN)
+    )
+    result["checkpoint"] = [completed, version]
     return result
 
 
@@ -439,11 +456,13 @@ class _FaultInjector(ControlPlane):
 
     kind = ""
     corrupted = None
+    injected = False
 
-    def _commit_checkpoint(self, plan):
-        super()._commit_checkpoint(plan)
-        if self.rank != plan.active_ranks[0]:
+    def commit_checkpoint(self, plan):
+        super().commit_checkpoint(plan)
+        if self.rank != plan.active_ranks[0] or self.injected:
             return
+        self.injected = True  # the commit now runs every iteration; inject once
         if self.kind == "checkpoint_unusable":
             # Corrupt the payload the commit just wrote. The file still loads, so what
             # rejects it is the stored digest. Corrupting rather than deleting also
@@ -463,13 +482,14 @@ class _FaultInjector(ControlPlane):
 
 
 def _diverge_one_rank(rank):
-    """Make rank 1 replan to a different -- and perfectly valid -- plan than the rest.
+    """Make one survivor replan to a different -- and perfectly valid -- plan.
 
     Deterministic replanning cannot disagree with itself, so this one condition has to
     be injected. What is under test is the control plane's reaction to a disagreement,
-    not the disagreement itself.
+    not the disagreement itself. The rank chosen is one the schedule never kills: a
+    dead process cannot disagree with anybody.
     """
-    if rank != 1:
+    if rank != DIVERGING_RANK:
         return
     import resihp.control as control_module
 
@@ -479,23 +499,21 @@ def _diverge_one_rank(rank):
     )
 
 
-def _run_stop(rank, world_size, device, code, backend, result_dir):
+def _run_stop(rank, device, code, backend, result_dir):
     """Walk a scenario's failures until one stops the run; report the aftermath."""
     import torch.distributed as dist
 
     from resihp.checkpoint import load_checkpoint
     from resihp.reference import ReferenceRun
+    from resihp.train import fail_stop
 
     config, victims, budget = _scenario(code)
     checkpoint = result_dir / "ckpt.pt"
     if code == "plan_disagreement":
         _diverge_one_rank(rank)
 
-    control = _FaultInjector(
-        rank,
-        world_size,
-        dist.group.WORLD,
-        backend,
+    control = _FaultInjector.initialize(
+        training_backend=backend,
         vocab_size=VOCAB,
         sequence_length=SEQLEN,
         memory_budget=budget,
@@ -518,8 +536,12 @@ def _run_stop(rank, world_size, device, code, backend, result_dir):
     }
     failed: tuple[int, ...] = ()
     for event, victim in enumerate(victims, start=1):
+        control.commit_checkpoint(plan)  # step 2, and where the fault is injected
+        fail_stop({event: victim}, rank, event)  # the victim's process ends here
         try:
-            plan, failed = control.safe_point(config, plan, failed, victim, next_step=event)
+            plan, failed = control.safe_point(
+                config, plan, failed, control.observe(), next_step=event
+            )
         except ConsistentStop as stop:
             result["stopped"] = stop.reason.code
             result["message"] = stop.reason.message
@@ -554,13 +576,15 @@ def _run_stop(rank, world_size, device, code, backend, result_dir):
     return result
 
 
-# --- backend wrappers (``mp.spawn`` needs module-level targets) --------------------
+# --- process entry point ----------------------------------------------------------
+
+#: ``multiprocessing`` pickles the entry point by name, so the runner travels as a key.
+RUNNERS = {"recovery": _run_recovery, "stop": _run_stop}
 
 
-def _worker(runner, rank, world_size, kind, result_dir, port, backend):
-    os.environ.update(
-        MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE=str(world_size)
-    )
+def _worker(rank, env, runner, kind, backend, result_dir):
+    """One spawned rank: join the world from the store, then run the scenario."""
+    os.environ.update(env)
     import torch.distributed as dist
 
     # Kept open for the process's lifetime: faulthandler writes into it from a timer.
@@ -572,55 +596,21 @@ def _worker(runner, rank, world_size, kind, result_dir, port, backend):
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
         assert torch.cuda.current_device() == rank
-    # The control group is Gloo on both backends -- it must survive every failure and
-    # carry object collectives; only the training groups switch to NCCL.
-    dist.init_process_group(backend="gloo")
-    result = runner(rank, world_size, device, kind, backend, Path(result_dir))
+    # The world group is Gloo on both backends -- it carries object collectives and is
+    # re-formed on every fail-stop; only the training groups switch to NCCL.
+    result = RUNNERS[runner](rank, device, kind, backend, Path(result_dir))
     faulthandler.cancel_dump_traceback_later()
     Path(result_dir, f"result_{rank}.json").write_text(json.dumps(result))
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
-def _gloo_recovery(rank, world_size, kind, result_dir, port):
-    _worker(_run_recovery, rank, world_size, kind, result_dir, port, "gloo")
-
-
-def _nccl_recovery(rank, world_size, kind, result_dir, port):
-    _worker(_run_recovery, rank, world_size, kind, result_dir, port, "nccl")
-
-
-def _gloo_stop(rank, world_size, kind, result_dir, port):
-    _worker(_run_stop, rank, world_size, kind, result_dir, port, "gloo")
-
-
-def _nccl_stop(rank, world_size, kind, result_dir, port):
-    _worker(_run_stop, rank, world_size, kind, result_dir, port, "nccl")
-
-
-def _spawn(target, world_size, kind, tmp_path):
-    """Spawn the ranks and require *all* of them to exit before the timeout."""
-    import torch.multiprocessing as mp
-
-    context = mp.spawn(
-        target, args=(world_size, kind, str(tmp_path), _free_port()), nprocs=world_size, join=False
-    )
-    deadline = time.monotonic() + JOIN_TIMEOUT
-    while not context.join(timeout=5):
-        if time.monotonic() > deadline:
-            for process in context.processes:
-                process.terminate()
-            stacks = "\n".join(
-                f"--- rank {peer} ---\n{Path(tmp_path, f'stack_{peer}.txt').read_text()}"
-                for peer in range(world_size)
-                if Path(tmp_path, f"stack_{peer}.txt").exists()
-            )
-            pytest.fail(
-                f"{kind}: not every rank exited before the timeout (a rank is blocked)\n{stacks}"
-            )
-    return [
-        json.loads(Path(tmp_path, f"result_{rank}.json").read_text()) for rank in range(world_size)
-    ]
+def _spawn(runner, kind, backend, tmp_path, *, world_size, killed):
+    """Run the scenario for real; return the survivors' results, keyed by rank."""
+    exit_codes = run_ranks(_worker, world_size, runner, kind, backend, str(tmp_path))
+    label = f"{kind}/{backend}"
+    assert_killed(exit_codes, killed, tmp_path, label)
+    return read_results(tmp_path, [r for r in range(world_size) if r not in set(killed)])
 
 
 def _skip_if_few_gpus(count):
@@ -634,14 +624,19 @@ def _skip_if_few_gpus(count):
 
 
 def _assert_recovery(results, *, kind, label):
-    for rank, result in enumerate(results):
+    # A victim is a dead process: it has no result at all, and the harness has already
+    # matched the survivors against the schedule.
+    assert sorted(results) == [
+        rank for rank in range(_config(kind).world_size) if rank not in VICTIMS[kind]
+    ], sorted(results)
+    for rank, result in sorted(results.items()):
         for event in result["events"]:
             # Principle A: exactly the checkpoint under the new plan, and only the
             # names the new plan says this stage owns.
             assert event["matches_checkpoint"], (label, rank, event)
         assert result["initialized"] is False, (label, rank, result)
 
-    every_name = set(results[0]["all_names"])
+    every_name = set(next(iter(results.values()))["all_names"])
     if kind == "pipeline":
         shrunk, grown = results[0]["events"][0], results[2]["events"][0]
         assert (shrunk["degree"], shrunk["layers"]) == (1, [0, 1]), shrunk
@@ -654,23 +649,26 @@ def _assert_recovery(results, *, kind, label):
         # No rank holds the whole model; the two stages tile it exactly.
         assert set(shrunk["owned"]) | set(grown["owned"]) == every_name
         assert not set(shrunk["owned"]) & set(grown["owned"])
-        assert results[1]["events"][0]["degree"] is None  # the dead rank owns nothing
         assert results[3]["events"][0]["owned"] == grown["owned"]  # its TP peer agrees
         assert results[2]["losses"][0] is not None  # the last stage produces the loss
         assert results[0]["losses"][0] is None
     elif kind == "replicated":
-        degrees = [[event["degree"] for event in result["events"]] for result in results]
+        degrees = {
+            rank: [event["degree"] for event in result["events"]]
+            for rank, result in results.items()
+        }
         assert degrees[0] == [1, 1], degrees  # replica 0 halved at the first event
         assert degrees[2] == [2, 1], degrees  # replica 1 only at the second
-        assert degrees[1] == [None, None] and degrees[3] == [2, None], degrees
         # The untouched replica moves no state at all at the first event.
         assert results[2]["events"][0]["acquired"] == [], results[2]
         assert results[0]["events"][0]["acquired"] != [], results[0]
         for rank in (0, 2):
             assert set(results[rank]["events"][-1]["owned"]) == every_name  # PP1
     else:  # reseat
-        degrees = [[event["degree"] for event in result["events"]] for result in results]
-        assert degrees[1] == [2, None], degrees  # rank 1 is seated, then fails
+        degrees = {
+            rank: [event["degree"] for event in result["events"]]
+            for rank, result in results.items()
+        }
         assert degrees[2] == [2, 2], degrees  # rank 2 stays at the same degree
         # A healthy rank the first plan left idle is picked back up by the second.
         assert degrees[3] == [None, 2], degrees
@@ -680,16 +678,19 @@ def _assert_recovery(results, *, kind, label):
             assert last["acquired"] == last["owned"], (rank, last)
         # And everyone resumes from the same iteration -- including the rank that had
         # no cursor of its own to carry forward.
-        assert len({r["cursor"] for r in results if r["cursor"] is not None}) == 1, results
-    assert results[0]["checkpoint"] is not None  # the last checkpoint still reloads
+        cursors = {r["cursor"] for r in results.values() if r["cursor"] is not None}
+        assert len(cursors) == 1, cursors
+    for result in results.values():  # the last checkpoint still reloads, on every rank
+        assert result["checkpoint"] is not None, (label, result)
 
 
 def _assert_consistent_stop(results, code, label, tmp_path):
     events = len(STOP_SCENARIOS[code][1])
-    assert {result["stopped"] for result in results} == {code}, (label, results)
-    # One agreed root cause, identical on every rank -- not each rank's local view.
-    assert len({result["message"] for result in results}) == 1, (label, results)
-    for result in results:
+    assert {result["stopped"] for result in results.values()} == {code}, (label, results)
+    # One agreed root cause, identical on every *surviving* rank -- not each rank's
+    # local view. The victims are dead processes and report nothing at all.
+    assert len({result["message"] for result in results.values()}) == 1, (label, results)
+    for result in results.values():
         # The message points at this condition only -- no second guess, no fallback.
         # (The temp path is stripped first: pytest names it after the test itself.)
         message = result["message"].replace(str(tmp_path), "")
@@ -720,16 +721,68 @@ def _assert_consistent_stop(results, code, label, tmp_path):
 # --- Gloo gates (always run where torch is installed) -----------------------------
 
 
+def _recovery_results(kind, backend, tmp_path):
+    return _spawn(
+        "recovery",
+        kind,
+        backend,
+        tmp_path,
+        world_size=_config(kind).world_size,
+        killed=VICTIMS[kind],
+    )
+
+
+def _stop_results(code, backend, tmp_path):
+    config, victims, _budget = _scenario(code)
+    return _spawn(
+        "stop", code, backend, tmp_path, world_size=config.world_size, killed=victims
+    )
+
+
 @requires_torch
 @pytest.mark.parametrize("kind", ["pipeline", "replicated", "reseat"])
 def test_recovery_gloo(tmp_path, kind):
-    _assert_recovery(_spawn(_gloo_recovery, 4, kind, tmp_path), kind=kind, label=f"{kind} Gloo")
+    results = _recovery_results(kind, "gloo", tmp_path)
+    _assert_recovery(results, kind=kind, label=f"{kind} Gloo")
 
 
 @requires_torch
-@pytest.mark.parametrize("code", STOP_CODES)
+@pytest.mark.parametrize("code", sorted(STOP_SCENARIOS))
 def test_consistent_stop_gloo(tmp_path, code):
-    _assert_consistent_stop(_spawn(_gloo_stop, 2, code, tmp_path), code, f"{code} Gloo", tmp_path)
+    _assert_consistent_stop(
+        _stop_results(code, "gloo", tmp_path), code, f"{code} Gloo", tmp_path
+    )
+
+
+@requires_torch
+def test_losing_every_rank_ends_the_job(tmp_path):
+    """The last rank's death ends the job -- and leaves the checkpoint intact.
+
+    ``no_executable_pp`` is the planner's name for "no replica survived", and under a
+    real fail-stop that state has nobody left to observe it: there is no rank to agree
+    with, no plan to publish, and no process to exit cleanly. What the run owes in that
+    case is what it owes in every other: the last completed iteration is on disk, whole
+    and reloadable, so the job can be restarted from it. Both ranks here are killed,
+    the second one after it has already recovered from the first, so the file under
+    test was written by a topology that a fail-stop had already reconfigured.
+    """
+    from resihp.checkpoint import load_checkpoint
+    from resihp.reference import ReferenceRun
+
+    config = _config("pair")
+    exit_codes = run_ranks(
+        _worker, config.world_size, "recovery", "pair", "gloo", str(tmp_path)
+    )
+    assert_killed(exit_codes, VICTIMS["pair"], tmp_path, "pair")
+
+    completed, version = load_checkpoint(
+        Path(tmp_path, "ckpt.pt"),
+        ReferenceRun(config, vocab_size=VOCAB, sequence_length=SEQLEN),
+    )
+    # Two iterations completed and one plan version was published before the last
+    # rank died, and the file that survives is the one committed after both.
+    assert (completed, version) == (2, 1), (completed, version)
+    assert not Path(str(Path(tmp_path, "ckpt.pt")) + ".tmp").exists()
 
 
 # --- NCCL gates (real GPU tensors and real NCCL training groups) ------------------
@@ -738,18 +791,18 @@ def test_consistent_stop_gloo(tmp_path, code):
 @requires_torch
 @pytest.mark.parametrize("kind", ["pipeline", "replicated", "reseat"])
 def test_recovery_cuda_nccl(tmp_path, kind):
-    _skip_if_few_gpus(4)
-    results = _spawn(_nccl_recovery, 4, kind, tmp_path)
-    for result in results:
+    _skip_if_few_gpus(_config(kind).world_size)
+    results = _recovery_results(kind, "nccl", tmp_path)
+    for result in results.values():
         assert result["is_cuda"] and result["backend"] == "nccl", result
     _assert_recovery(results, kind=kind, label=f"{kind} NCCL")
 
 
 @requires_torch
-@pytest.mark.parametrize("code", STOP_CODES)
+@pytest.mark.parametrize("code", sorted(STOP_SCENARIOS))
 def test_consistent_stop_cuda_nccl(tmp_path, code):
-    _skip_if_few_gpus(2)
-    results = _spawn(_nccl_stop, 2, code, tmp_path)
-    for result in results:
+    _skip_if_few_gpus(_scenario(code)[0].world_size)
+    results = _stop_results(code, "nccl", tmp_path)
+    for result in results.values():
         assert result["is_cuda"] and result["backend"] == "nccl", result
     _assert_consistent_stop(results, code, f"{code} NCCL", tmp_path)

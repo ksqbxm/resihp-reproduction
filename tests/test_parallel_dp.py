@@ -140,8 +140,6 @@ def test_a_micro_batch_split_mid_pipeline_is_rejected_not_executed():
     downstream peers; ``assert_invariants`` already forbids such a plan, and the runtime
     says so at construction instead of deadlocking on the first fused exchange.
     """
-    from unittest.mock import patch
-
     from resihp.parallel.pp import PipelineRuntime
 
     class _StubStage:
@@ -152,14 +150,13 @@ def test_a_micro_batch_split_mid_pipeline_is_rejected_not_executed():
         def parameters(self):
             return [torch.nn.Parameter(torch.zeros(1))]
 
-    with patch("resihp.parallel.pp.dist.get_rank", return_value=0):
-        with pytest.raises(ValueError, match="differing neighbours"):
-            PipelineRuntime(_StubStage(), replica_id=0, assignment=_assignment(_CROSS_SPEC))
+    with pytest.raises(ValueError, match="differing neighbours"):
+        PipelineRuntime(_StubStage(), rank=0, replica_id=0, assignment=_assignment(_CROSS_SPEC))
 
-        # The same rank under the rerouted assignment has one fixed downstream peer.
-        runtime = PipelineRuntime(
-            _StubStage(), replica_id=0, assignment=_assignment(_REROUTED_SPEC)
-        )
+    # The same rank under the rerouted assignment has one fixed downstream peer.
+    runtime = PipelineRuntime(
+        _StubStage(), rank=0, replica_id=0, assignment=_assignment(_REROUTED_SPEC)
+    )
     assert runtime.downstream == (1,)
     assert runtime.micro_batches == [0, 1, 3]
     assert (runtime.stage_index, runtime.num_stages) == (0, 2)
@@ -260,11 +257,17 @@ def _boundaries(pairs, rank):
     return groups
 
 
-def _runtime_result(stage, *, replica_id, assignment, tokens, ref_grads, ref_updated, boundaries):
+def _runtime_result(
+    stage, *, rank, replica_id, assignment, tokens, ref_grads, ref_updated, boundaries
+):
     from resihp.parallel.pp import PipelineRuntime
 
     runtime = PipelineRuntime(
-        stage, replica_id=replica_id, assignment=assignment, boundary_groups=boundaries
+        stage,
+        rank=rank,
+        replica_id=replica_id,
+        assignment=assignment,
+        boundary_groups=boundaries,
     )
     loss = runtime.train_step(tokens)
 
@@ -339,6 +342,7 @@ def _run_dp_normalization(rank, world_size, device):
     assignment = _assignment([(0, 0, 0, (0,)), (1, 0, 0, (0,)), (2, 0, 0, (0,)), (3, 0, 1, (1,))])
     result = _runtime_result(
         stage,
+        rank=rank,
         replica_id=rank,
         assignment=assignment,
         tokens=tokens,
@@ -375,6 +379,7 @@ def _run_cross_replica(rank, world_size, device):
     assignment = _assignment(_REROUTED_SPEC)
     result = _runtime_result(
         stage,
+        rank=rank,
         replica_id=replica,
         assignment=assignment,
         tokens=tokens,
@@ -416,6 +421,7 @@ def _run_pp_heterogeneous(rank, world_size, device):
     ])
     result = _runtime_result(
         stage,
+        rank=rank,
         replica_id=replica,
         assignment=assignment,
         tokens=tokens,

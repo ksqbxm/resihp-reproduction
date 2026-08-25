@@ -205,6 +205,7 @@ class PlannedRun:
         self.stage.train()
         self.runtime = PipelineRuntime(
             self.stage,
+            rank=rank,
             replica_id=stage_plan.replica_id,
             assignment=dp_assignment(plan),
             boundary_groups=boundary_groups,
@@ -351,6 +352,13 @@ def commit_checkpoint(
     Every process in ``group`` joins the gather -- a rank holding no state contributes
     nothing -- so the union of the stages and replicas is the whole model. Only
     ``writer`` puts the single canonical file on disk (plan 3.6).
+
+    The control plane runs this at the end of *every* iteration, not only when a
+    fail-stop is about to happen. A killed process cannot contribute to anything
+    afterwards, so the only checkpoint that can still hold the dead rank's shards is
+    one written while it was alive -- and that is what makes "the state before resume
+    is exactly the pre-failure checkpoint" true of a real kill rather than of a rank
+    that was merely excluded.
     """
     full = reshard_tp_state(
         {} if run is None else run.local_state(),
@@ -378,7 +386,7 @@ def recover(
     vocab_size,
     sequence_length,
     checkpoint_path,
-    control_group,
+    world_group,
     tp_group,
     executor_group,
     boundary_groups=None,
@@ -396,13 +404,13 @@ def recover(
     safe-point step 8's state digest -- identical on every rank by construction.
 
     Returns ``(run, digest)``; ``run`` is ``None`` for a rank the new plan places on no
-    stage. Every rank calls this: the collectives inside are how a dead rank's shard
-    reaches the peers that must rebuild it.
+    stage. Every *surviving* rank calls this, and only those: the failed rank is a dead
+    process, so what it held is genuinely gone and has to be rebuilt from a healthy
+    peer replica or from the checkpoint written while it was still alive.
     """
     anchor, completed_steps = load_anchor(checkpoint_path)
     stage = stage_of(plan, rank)
-    holds_state = run is not None and rank not in set(plan.failed_ranks)
-    local = run.local_state() if holds_state else {}
+    local = {} if run is None else run.local_state()
 
     fallback = _gather_degree(previous)
     routes = routes_for(plan, rank) if stage is not None else ()
@@ -419,7 +427,7 @@ def recover(
                 old_size=degree,
                 new_size=1 if stage is None else stage.tp_degree,
                 new_rank=0 if stage is None else stage.tp_members.index(rank),
-                group=control_group,
+                group=world_group,
                 checkpoint=anchor,
                 verify=False,  # verified below, on what actually landed
             )
@@ -460,7 +468,7 @@ def recover(
         old_size=_gather_degree(plan),
         new_size=_FULL_DEGREE,
         new_rank=0,
-        group=control_group,
+        group=world_group,
         checkpoint=anchor,
         verify=True,
     )

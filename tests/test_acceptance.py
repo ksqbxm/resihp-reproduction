@@ -5,19 +5,21 @@ Two gates, deliberately independent:
 * :func:`test_no_banned_constructs` -- plan section 六's last completion criterion
   ("代码中不存在 Detector、pᵢ、速度/降速分支、standby、Algorithm 1、旧入口或前向兼容
   逻辑"). It imports no torch, so it runs on every machine, every time.
-* :func:`test_torchrun_nccl_acceptance` -- plan section 五 step 6: the single
+* :func:`test_launcher_nccl_acceptance` -- plan section 五 step 6: the single
   documented command, launched for real under NCCL on eight GPUs, required to take
-  **at least two consecutive fail-stops and keep training**.
+  **at least two consecutive fail-stops and keep training**. The fail-stops are real
+  kills, so the evidence includes the killed ranks' exit codes: ``-9``, reported by
+  the operating system.
 
 The acceptance gate does not re-derive what T16/T17 already lock (per-tensor equality
-with the checkpoint, agreement with the new-configuration reference). Those run inside
-``mp.spawn``, against hand-built topologies. This one asks the different question that
-only the real launcher can answer: *does the command in the plan document, with the
-configs shipped in the repo, actually survive its failure schedule?* So it checks the
-outside-visible facts -- exit status, which iterations each rank truly executed, which
-plan versions and digests every rank acted on, and the checkpoint left on disk -- and
-checks them against the **pure planner's** own output for the same configs, so a run
-that silently trained the wrong ranks cannot pass.
+with the checkpoint, agreement with the new-configuration reference). Those run against
+hand-built topologies. This one asks the different question that only the real launcher
+can answer: *does the command in the plan document, with the configs shipped in the
+repo, actually survive its failure schedule?* So it checks the outside-visible facts --
+exit status, which processes died and how, which iterations each surviving rank truly
+executed, which plan versions and digests every rank acted on, and the checkpoint left
+on disk -- and checks them against the **pure planner's** own output for the same
+configs, so a run that silently trained the wrong ranks cannot pass.
 """
 
 import json
@@ -220,28 +222,30 @@ def _skip_unless_gpus(count):
         pytest.skip(f"needs {count} GPU(s), found {torch.cuda.device_count()}")
 
 
-def _launch(world_size):
+def _launch():
     """Run the plan's acceptance command and return its completed process.
 
-    ``python -m torch.distributed.run`` *is* ``torchrun`` -- the console script is a
-    thin wrapper around this module -- invoked through ``sys.executable`` so the job
-    provably runs in the interpreter under test rather than whichever ``torchrun``
-    happens to be first on ``PATH``. Everything after ``--standalone`` is the
-    documented argv, verbatim, from the repository root, so the relative config paths
-    are exercised too.
+    ``python -m resihp.launch`` is the documented argv, verbatim, run from the
+    repository root through ``sys.executable`` -- so the job provably runs in the
+    interpreter under test, and the relative config paths are exercised too.
+    ``torchrun`` cannot host this run: its agent kills the surviving workers the
+    moment one of them dies from a signal, which is the very thing the schedule does
+    on purpose (see :mod:`resihp.launch`).
+
+    The launcher gets the shorter deadline of the two, so that a stuck job is cleaned
+    up by the supervisor that owns the processes rather than by killing the launcher
+    and leaving eight orphans holding GPUs.
     """
     command = [
         sys.executable,
         "-m",
-        "torch.distributed.run",
-        "--standalone",
-        f"--nproc_per_node={world_size}",
-        "-m",
-        "resihp.train",
+        "resihp.launch",
         "--config",
         CONFIG_PATH,
         "--failures",
         FAILURES_PATH,
+        "--timeout",
+        str(RUN_TIMEOUT - 60),
     ]
     process = subprocess.Popen(
         command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
@@ -249,21 +253,29 @@ def _launch(world_size):
     try:
         stdout, stderr = process.communicate(timeout=RUN_TIMEOUT)
     except subprocess.TimeoutExpired:
-        # SIGTERM, not kill: the elastic agent forwards it to its workers, so a hung
-        # job does not leave eight processes holding GPUs on the acceptance machine.
-        process.terminate()
+        process.kill()
         stdout, stderr = process.communicate(timeout=60)
         pytest.fail(f"the acceptance run did not finish in {RUN_TIMEOUT}s\n{stdout}\n{stderr}")
     return stdout, stderr, process.returncode
 
 
+def _launch_record(stdout):
+    """The launcher's own summary line: which processes died, and how."""
+    decoder = json.JSONDecoder()
+    for line in stdout.splitlines():
+        start = line.find('{"launch"')
+        if start >= 0:
+            return decoder.raw_decode(line[start:])[0]["launch"]
+    raise AssertionError(f"the launcher printed no summary\n{stdout}")
+
+
 def _acceptance_records(stdout):
-    """One record per rank, parsed out of the launcher's merged stdout.
+    """One record per surviving rank, parsed out of the merged stdout.
 
     ``raw_decode`` rather than a line regex: eight ranks write into one pipe, so a
-    line may carry a launcher prefix before the object and, in the worst case, another
-    rank's text after it. Decoding from the opening brace takes exactly one value and
-    ignores whatever follows.
+    line may carry another rank's text after the object. Decoding from the opening
+    brace takes exactly one value and ignores whatever follows. A killed rank prints
+    nothing here -- it never reaches the end of the run.
     """
     records = {}
     decoder = json.JSONDecoder()
@@ -280,22 +292,25 @@ def _acceptance_records(stdout):
 # --- gate ---------------------------------------------------------------------------
 
 
-def test_torchrun_nccl_acceptance():
-    """The documented command under NCCL: two fail-stops, then training carries on.
+def test_launcher_nccl_acceptance():
+    """The documented command under NCCL: two real kills, then training carries on.
 
     Every assertion is on evidence the job itself emitted, cross-checked against the
     pure planner:
 
     * the launcher exits 0 and no rank printed a consistent stop -- the run reached
       the end rather than ending on a structured root cause;
-    * every rank ran on a CUDA device with NCCL training groups, so this is the real
-      GPU path and not a CPU run that happened to pass;
-    * each rank acted on plan versions ``0..N`` with digests identical across ranks
+    * exactly the scheduled ranks died, and died on ``SIGKILL`` (exit ``-9``), while
+      every other process exited cleanly: the fail-stop is a dead process, not a name
+      struck off a list, and the survivors kept running anyway;
+    * every surviving rank ran on a CUDA device with NCCL training groups, so this is
+      the real GPU path and not a CPU run that happened to pass;
+    * each of them acted on plan versions ``0..N`` with digests identical across ranks
       and equal to the planner's -- one new plan per fail-stop, strictly increasing,
-      unanimous, and free of any runtime input;
+      unanimous, and free of any runtime input -- and finished in a world holding
+      exactly the surviving ranks, which is the rebuild having really happened;
     * the iterations each rank *actually executed* equal the active sets of those
-      plans -- a failed rank stops at its event and never returns, survivors continue
-      through the end, which together are "≥2 次连续 fail-stop 并继续训练";
+      plans, which together with the exit codes is "≥2 次连续 fail-stop 并继续训练";
     * the one canonical checkpoint is on disk with no ``.tmp`` beside it.
     """
     loaded = load_config(ROOT / CONFIG_PATH, ROOT / FAILURES_PATH)
@@ -314,15 +329,26 @@ def test_torchrun_nccl_acceptance():
     checkpoint.unlink(missing_ok=True)
     checkpoint.with_name(checkpoint.name + ".tmp").unlink(missing_ok=True)
 
-    stdout, stderr, code = _launch(config.world_size)
+    stdout, stderr, code = _launch()
     assert code == 0, f"exit {code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     assert '"stopped"' not in stdout, f"the run ended on a consistent stop\n{stdout}"
 
+    expected_failed = sorted(event.failed_rank for event in events)
+    survivors = [rank for rank in range(config.world_size) if rank not in expected_failed]
+
+    # The kills were kills: the operating system reports signal 9 for exactly the
+    # scheduled ranks, and a clean exit for every other process.
+    launched = _launch_record(stdout)
+    assert launched["killed_ranks"] == expected_failed, launched
+    assert launched["scheduled_kills"] == expected_failed, launched
+    assert {int(rank): code for rank, code in launched["exit_codes"].items()} == {
+        rank: (-9 if rank in expected_failed else 0) for rank in range(config.world_size)
+    }, launched
+
     records = _acceptance_records(stdout)
-    assert sorted(records) == list(range(config.world_size)), f"{sorted(records)}\n{stdout}"
+    assert sorted(records) == survivors, f"{sorted(records)}\n{stdout}"
 
     plans = _expected_plans(config, events)
-    expected_failed = sorted(event.failed_rank for event in events)
     for rank, record in sorted(records.items()):
         where = f"rank {rank}"
         assert record["device"] == "cuda", f"{where}: ran on {record['device']}"
@@ -330,6 +356,7 @@ def test_torchrun_nccl_acceptance():
         assert record["plan_versions"] == list(range(len(plans))), f"{where}: {record}"
         assert record["plan_digests"] == [plan.digest for plan in plans], where
         assert record["failed_ranks"] == expected_failed, f"{where}: {record['failed_ranks']}"
+        assert record["world_members"] == survivors, f"{where}: {record['world_members']}"
         assert record["trained_iterations"] == _expected_trained(plans, events, config, rank), (
             f"{where}: executed {record['trained_iterations']}"
         )
